@@ -1,0 +1,40 @@
+# cargo-mutants: NOT run in CI (each mutant costs a full single-threaded
+# test run; the whole crate is hours). Run manually after touching
+# pure-logic modules — see AGENTS.md for the exact invocations.
+#
+# IMPORTANT: the trailing `-- -- --test-threads=1 <filter>` scopes BOTH
+# the baseline and every mutant run to the module under test; without it
+# a run is 100× slower.
+#
+# Known EQUIVALENT mutants (behavior-identical, unkillable by any test —
+# verified individually, suppress with -E at run time):
+#   similarity.rs  `\^ in trigram_hashes`   — the three bit fields never
+#     overlap, so OR ≡ XOR.
+#   similarity.rs  `&& in jaccard_similarity` — with an empty side both
+#     the guard and the set math produce 0.0.
+#   connection_learner.rs  `+ with *` in similarity_so_far — the extra
+#     self-pair (similarity 1.0) is invisible to min-aggregation.
+#   connection_learner.rs  `< with <=` — assigns the same value.
+#   connection_learner.rs  config() Box::leak — equivalent for every
+#     real-config caller.
+
+[test_runner]
+extra_args = ["--", "--test-threads=1"]
+
+[general]
+timeout_secs = 300
+
+[exclude]
+# Feature-gated test simulator, irrelevant to mutation scores.
+bin = ["serial-sim"]
+# REAL network git clones + REAL server subprocesses coupled to the
+# global /tmp/sermcp/locks state — flaky inside the mutants
+# scratch tree and unrelated to the pure-logic modules. Normal
+# `cargo test` still runs them.
+test = [
+    "different_projects_never_steal_same_serial_endpoint",
+    "second_server_degrades_to_read_only_observer",
+    "startup_removes_legacy_pid_files_only_in_own_project",
+    "startup_sweeps_dead_pid_inventory_tmp_files",
+    "session_lock_is_new_format_and_unlinked_on_clean_exit",
+]

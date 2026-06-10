@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # tracing-perfetto-sdk-schema compiles perfetto_trace.proto via
+      # prost-build at build time, which requires a protoc binary.
+      - name: Install protoc
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq protobuf-compiler
+      # ── Lint gates (fail the PR before tests run) ─────────────────
+      - name: Format gate
+        working-directory: sermcp
+        run: cargo fmt --check
+      - name: Clippy gate (deny all warnings)
+        working-directory: sermcp
+        run: cargo clippy --locked --all-targets -- -D warnings
+      # ── Tests ─────────────────────────────────────────────────────
+      - name: Test
+        working-directory: sermcp
+        run: cargo test --locked --lib -- --test-threads=1
+      - name: Smoke tests
+        working-directory: sermcp
+        run: cargo test --locked --test smoke -- --test-threads=1
+      # ── Static (musl) build gate ─────────────────────────────────
+      - name: Static musl build
+        working-directory: sermcp
+        run: |
+          rustup target add x86_64-unknown-linux-musl
+          cargo musl
+      - name: Verify static Git installation
+        run: |
+          cargo install --git "file://$GITHUB_WORKSPACE" --locked \
+            --target x86_64-unknown-linux-musl \
+            --target-dir "$GITHUB_WORKSPACE/sermcp/target" \
+            --root "$RUNNER_TEMP/sermcp-install" --force
+          for bin in sermcp dutabo; do
+            executable="$RUNNER_TEMP/sermcp-install/bin/$bin"
+            readelf -l "$executable" > "$RUNNER_TEMP/$bin.headers"
+            readelf -d "$executable" > "$RUNNER_TEMP/$bin.dynamic"
+            if grep -q INTERP "$RUNNER_TEMP/$bin.headers" || \
+               grep -q NEEDED "$RUNNER_TEMP/$bin.dynamic"; then
+              echo "Dynamic dependency found in $bin" >&2
+              exit 1
+            fi
+            "$executable" --help > /dev/null
+          done
+      - name: Build
+        working-directory: sermcp
+        run: cargo build --release --locked

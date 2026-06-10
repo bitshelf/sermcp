@@ -1,0 +1,173 @@
+[package]
+name = "sermcp"
+version = "0.4.2"
+edition = "2024"
+rust-version = "1.98"
+description = "MCP server for embedded Linux serial console debugging via ser2net"
+# All binaries are declared explicitly below; disable auto-discovery so
+# src/bin/tui_init.rs (a module of the dutabo binary, not a binary itself)
+# is not picked up as a separate bin target.
+autobins = false
+
+[[bin]]
+name = "sermcp"
+path = "src/main.rs"
+
+[[bin]]
+name = "dutabo"
+path = "src/bin/dutabo.rs"
+
+# Test-only simulation binary: a fake embedded serial console used by
+# tests/dutabo_tests.rs (mod serial_sim). Declared explicitly because
+# autobins is off; cargo test builds it and sets CARGO_BIN_EXE_serial-sim.
+# required-features keeps it out of `cargo install` and default builds.
+[[bin]]
+name = "serial-sim"
+path = "src/bin/serial-sim.rs"
+required-features = ["serial-sim"]
+
+[dependencies]
+tempfile = "3"
+toml = "1.1"
+rmcp = { version = "3.2.0", features = [
+    "server",
+    "macros",
+    "transport-io",
+    "transport-streamable-http-server",
+    # Server→client elicitation for the pre-flash agent review gate
+    # (mcp_handler.rs `flash_review_gate`).
+    "elicitation",
+] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "io-std", "sync", "time", "signal", "fs", "process"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+serde = { version = "1", features = ["derive"] }
+# preserve_order: the `dutabo init` .mcp.json reconciler round-trips the
+# file through serde_json::Value and must keep existing key order verbatim.
+serde_json = { version = "1", features = ["preserve_order"] }
+schemars = { version = "1", features = ["derive"] }
+regex = "1"
+fancy-regex = "0.19"
+# ANSI stripping for serial/boot logs (src/ansi_strip.rs). Depends on vte
+# directly instead of the abandoned strip-ansi-escapes wrapper (last release
+# 2025-01, repo dormant since): vte is maintained by the Alacritty project.
+vte = "0.15"
+thiserror = "2"
+# JSONC (.target.jsonc + .mcp.json) parsing. ONLY the `serde` feature (0 of
+# 8 features are default): struct deserialization via parse_to_serde_value
+# needs it; cst and preserve_order (jsonc's own) are unused — key order for
+# the .mcp.json Value round-trip comes from serde_json's preserve_order.
+jsonc-parser = { version = "0.33.1", features = ["serde"] }
+# The `dutabo init` TUI — binary-only usage: the binary implements the
+# `init::PromptIO` trait with this; the lib's wizard core (src/init.rs) stays
+# TUI-free, so the MCP server binary never drives a TTY.
+ratatui = "0.30"
+crossterm = "0.29"
+md-5 = "0.11"
+notify = "8"
+rand = "0.10"
+chrono = "0.4"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Perfetto protobuf export (src/trace_perfetto.rs, env-gated by
+# SERMCP_TRACE=<path>): NativeLayer encodes packets in Rust. Disabling
+# the default `sdk` feature is mandatory: it keeps the Perfetto C++ SDK and its
+# compiler toolchain out of this build.
+tracing-perfetto-sdk-layer = { version = "0.13.1", default-features = false, features = ["tokio"] }
+strsim = "0.11"
+libc = "0.2"
+# `all` enables TcpKeepalive::with_retries (TCP_KEEPCNT), replacing the
+# previous unsafe libc::setsockopt fallback in console.rs.
+socket2 = { version = "0.6", features = ["all"] }
+dut-ctrl = { path = "dut-ctrl", default-features = false }
+axum = { version = "0.8", features = ["json", "ws"] }
+# `Mcp-Name`/`Mcp-Param-*` sentinel decoding in the /mcp guard middleware
+# (mcp_http.rs `decode_header_value`).
+base64 = "0.23"
+# Default TLS features are OFF: dutabo only talks to the MCP server over
+# plaintext http://127.0.0.1:<port> (never https), so the rustls → aws-lc-rs
+# → aws-lc-sys chain (vendored C, needs CC=clang on this host's GCC 9.4) is
+# pure build cost with zero runtime use. Re-enable TLS features only when a
+# real https:// endpoint is added.
+reqwest = { version = "0.13", default-features = false, features = ["json"] }
+tokio-tungstenite = "0.30"
+futures-util = "0.3"
+# VT/ANSI terminal emulation core for the `dutabo serial` interactive
+# display path (src/serial_term/): Term/Grid/damage from the Alacritty
+# project — never re-implement terminal semantics locally. No default
+# features: the optional `serde` (de)serialization of terminal types is
+# unused. The vte dependency unifies with the one above (same 0.15 line).
+alacritty_terminal = { version = "0.26", default-features = false }
+
+[features]
+default = ["ch340"]
+ch340 = ["dut-ctrl/ch340"]
+# Direct DUT probing from the `dutabo init` TEST button is DEBUG-ONLY.
+# Production must route every DUT test through the MCP server; this feature
+# restores the original direct relay/serial probes as a fallback when the MCP
+# server is unreachable. Enable for local debugging:
+#   cargo run --bin dutabo --features direct-dut-probe -- init
+direct-dut-probe = []
+# Opt-in gate for the serial-sim [[bin]] above: keeps the test simulator out
+# of `cargo install` and default builds. Local usage:
+#   cargo run --bin serial-sim --features serial-sim -- --port 9999
+serial-sim = []
+
+[build-dependencies]
+toml = "1.1"
+
+[dev-dependencies]
+tempfile = "3"
+prost = "0.14"
+tracing-perfetto-sdk-schema = "0.13.1"
+# Property-based tests for the pure text-similarity pipeline
+# (connection_learner): idempotence, symmetry, determinism.
+proptest = "1"
+# In-process rmcp client for the end-to-end pre-flash review gate test
+# (mcp_handler tests: serve_server + serve_client over tokio::io::duplex).
+# Features merge with the main dependency during test builds only.
+rmcp = { version = "3.2.0", features = ["client"] }
+
+# cargo-binstall support: the release workflow publishes exactly this
+# default pkg-url shape —
+#   {repo}/releases/download/v{version}/sermcp_{version}_{target}.tar.gz
+# — with both binaries at the tarball root. The crate is not on
+# crates.io, so install with:
+#   cargo binstall --git https://github.com/bitshelf/sermcp sermcp
+[package.metadata.binstall]
+pkg-fmt = "tgz"
+
+[package.metadata.learn]
+cycles = 3
+compare_lines = 50
+similarity_threshold = 0.93
+relay_broken_threshold = 0.10
+reset_pulse_ms = 500
+capture_timeout_secs = 30.0
+learner_stage_threshold = 0.45
+learner_crash_threshold = 0.50
+crash_patterns = [
+    "Kernel panic",
+    "BUG:",
+    "Oops:",
+    "Unable to handle kernel",
+    "Segmentation fault",
+    "---[ end trace",
+    "panic - not syncing",
+]
+
+[profile.release]
+opt-level = "s"
+lto = "thin"
+strip = true
+
+[lints.rust]
+dead_code = "deny"
+unused_mut = "deny"
+unused_imports = "deny"
+unused_variables = "deny"
+
+[patch.crates-io]
+# Upstream 0.13.1 leaves `cxx` unconditional even with its `sdk` feature off,
+# causing link-cplusplus to compile dummy.cc. The vendored patch only makes
+# that unused dependency feature-gated; NativeLayer source remains upstream.
+tracing-perfetto-sdk-layer = { path = "vendor/tracing-perfetto-sdk-layer" }

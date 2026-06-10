@@ -1,0 +1,186 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## Commands
+
+```bash
+# Build (from sermcp/)
+cargo build --release --locked
+
+# Run tests (single-threaded — they use shared OS resources)
+cargo test --lib -- --test-threads=1
+
+# Format Rust code (MANDATORY after every Agent Rust edit, from sermcp/)
+cargo fmt
+
+# Formatting gate (MANDATORY before reporting completion)
+cargo fmt --check
+
+# Install both binaries (sermcp + dutabo) to ~/.cargo/bin as STATIC musl
+# binaries (no dependency on the system libc/glibc). `cargo musl` is the
+# alias in sermcp/.cargo/config.toml → build --release --locked
+# --target x86_64-unknown-linux-musl with +crt-static; the resulting
+# binaries live under target/x86_64-unknown-linux-musl/release/.
+#
+# NOTE: do NOT use `cargo install --path sermcp` — it builds the host
+# (glibc) target and produces dynamically-linked binaries that require
+# /lib64/ld-linux-x86-64.so.2.
+cargo musl
+cp target/x86_64-unknown-linux-musl/release/sermcp \
+   target/x86_64-unknown-linux-musl/release/dutabo ~/.cargo/bin/
+
+# Run the MCP server locally (stdio mode, for Claude Code spawning)
+cargo run --release
+
+# Run in HTTP mode for dutabo CLI access
+cargo run --release -- --http [HOST:PORT]
+
+# Dry-run: validate config without connecting
+cargo run --release -- --dry-run
+
+# Verbose debug logging to stderr (shows tracing spans)
+cargo run --release -- --log-to-stderr --verbose
+
+# Lint (deny all warnings, matching Cargo.toml [lints.rust])
+cargo check
+cargo clippy --release -- -D warnings
+
+# Code coverage (requires cargo-tarpaulin)
+cargo tarpaulin --out Html --timeout 300
+
+# Mutation testing (MANUAL ONLY — never in CI; each mutant costs a full
+# single-threaded test run). Run after touching pure-logic modules —
+# the trailing `-- -- --test-threads=1 <filter>` scope BOTH the baseline
+# and every mutant run to that module's tests (sermcp/cargo-mutants.toml
+# documents this):
+#   cargo mutants --file src/similarity.rs -- -- --test-threads=1 similarity
+#   cargo mutants --file src/connection_learner.rs -- -- --test-threads=1 learner
+# Known equivalent mutants (behavior-identical, unkillable by any
+# test — list in sermcp/cargo-mutants.toml) are suppressed with -E:
+#   cargo mutants --file src/similarity.rs \
+#     -E '\^ in trigram_hashes' -E '&& in jaccard_similarity' \
+#     -- -- --test-threads=1 similarity
+
+# Dependency security audit (requires cargo-audit)
+cargo audit
+
+# Dependency security audit (requires cargo-audit)
+cargo audit
+
+# dutabo CLI
+cargo run --release --bin dutabo -- list
+cargo run --release --bin dutabo -- state --dut <alias>
+cargo run --release --bin dutabo -- serial --dut <alias>
+
+# Health check (HTTP mode)
+curl http://localhost:3000/health
+
+# Smoke test via HTTP
+curl -s -X POST http://localhost:3000/mcp \
+  -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"serial_get_state","arguments":{}}}'
+
+# Hardware diagnostics
+bash scripts/diagnose.sh
+```
+
+## Mandatory Rust Formatting Workflow
+
+Every Agent that creates or modifies any Rust source file in `sermcp/` must run
+`cargo fmt` from `sermcp/` after its final code edit. Before reporting the task
+complete, the same Agent must run `cargo fmt --check` and treat any diff or
+command failure as an unfinished task. Do not defer formatting to a later Agent
+or rely only on `cargo check`/`cargo clippy`; those commands do not enforce
+rustfmt output.
+
+## Comment Style (all source files)
+
+- **No dates in code comments.** Never write change-annotation dates like
+  `(2026-09-01: ...)`, `(user decision 2026-08-18)`, or `2026-08-20 rework`.
+  Git history and `git blame` carry when and why — a date in a comment starts
+  rotting the day it is written and misleads every later reader. The ONLY
+  exceptions are identifiers, not annotations: protocol/spec revision names
+  (e.g. `MCP 2025-03-26 spec`, `PROTOCOL_VERSION = "2024-11-05"`) and
+  third-party data copied verbatim (U-Boot banner fixtures, crate release
+  versions).
+- **Comments are English only** — in Rust, Python, JS, and shell alike.
+  Test fixture *string data* that simulates user-authored files may keep its
+  original language; everything the maintainers write is English.
+
+## Architecture
+
+### Two Binaries, One Library
+
+The crate `sermcp` (sermcp/) produces two binaries from the same library crate (`lib.rs` re-exports all modules):
+
+- **`sermcp`** (`main.rs`) — MCP server with two transport modes:
+  - **stdio**: JSON-RPC 2.0 over stdin/stdout (default, Claude Code spawns it)
+  - **HTTP**: axum-based Streamable HTTP server on `127.0.0.1:3000` (MCP 2025 spec; POST `/mcp`, GET `/health`, WebSocket `/serial/ws` for dutabo relay)
+- **`dutabo`** (`bin/dutabo.rs`) — CLI for direct DUT interaction. State/reset/flash commands go through the HTTP MCP. The `serial` subcommand pauses the engine, takes over with raw `nc`, then resumes.
+
+### Central Engine (`serial_engine.rs`)
+
+`SerialEngine` is the orchestrator owning every subsystem. All MCP tools and dutabo commands go through it. Key fields:
+
+| Subsystem | Module | Role |
+|-----------|--------|------|
+| `console: SerialConsoleDriver` | `console.rs` | Raw TCP I/O to ser2net, read/write with tokio epoll |
+| `detector: BootStageDetector` | `boot_detector.rs` | Dual-mode: hard regex (SPL, U-Boot, kernel panic) + strsim-based `StageLearner` from reference log |
+| `state: StateManager` | `state_manager.rs` | Hysteresis-debounced state machine: `stopped → connecting → active/booting/uboot/crashed/DUT-off/disconnected/dutabo`. Three-tier: internal, MCP API (filtered), statusline file |
+| `logs: LogManager` | `log_manager.rs` | Per-power-cycle rotation, ring buffer + dedicated writer thread. `serial.current.log` (regular file, current cycle), `boot-NNN.log` (archives), `serial.full.log` (continuous) |
+| `commands: CommandQueue` | `command_queue.rs` | labgrid-inspired marker-echo pattern for reliable output capture. Random 10-char marker bookends command output; 8MB in-memory buffer, spill-to-disk on overflow |
+| `relay: RelayManager` | `relay_manager.rs` | Power/reset/maskrom control via `dut_ctrl::PowerControl` trait |
+| `reconnect: ReconnectManager` | `reconnect.rs` | Exponential backoff 1s→2s→4s→8s→16s→30s cap, auto-reset after 60s stable. Backoff sleep is deferred via `reconnect_after` to avoid holding the engine Mutex. |
+
+The engine is wrapped in `SharedEngine = Arc<Mutex<SerialEngine>>`. In HTTP mode, the read loop and watchdog run as tokio background tasks. The Mutex is NOT held during backoff reconnect sleeps — `reconnect_after` defers the wait to the caller.
+
+### Command Execution Flow
+
+```
+MCP tool call "serial_send_command"
+  → engine.lock().await
+  → commands.queue(command, timeout, tx)
+  → console.write_all(marker_wrapped_cmd)
+  → read loop scans output for begin/end markers
+  → strips ANSI, markers, and command echo
+  → sends result via oneshot channel
+  → MCP returns JSON response
+  → engine unlock
+```
+
+### Boot Stage Detection (Dual-Mode)
+
+1. **Regex mode** (default): Compiled regexes for known SoC stages — SPL, TPL, BL31, OPTEE, DDR init, U-Boot, autoboot countdown, kernel, login prompt, panic/oops. Each stage can trigger an action (rotate log, send Ctrl-C for U-Boot interrupt).
+
+2. **StageLearner** (adaptive): Learns per-board fingerprints from a reference boot log via `serial_load_reference`. Uses 3-gram Jaccard (0.6) + Jaro-Winkler (0.4) similarity to classify lines without SOC-specific regex. Thresholds are configurable: `.target.toml` `[dut.monitor]` `learner_stage_threshold` (default 0.45) and `learner_crash_threshold` (default 0.50), falling back to `Cargo.toml` `[package.metadata.learn]`.
+
+### Config: `.target.jsonc`
+
+The ONLY config format is `.target.jsonc` (`[[dev_hosts]]` with nested `duts[]`; a top-level section is the global fallback). Legacy single-board `[dev_host]` and flat `.target.conf` parsing were removed — unknown keys fail loudly via `deny_unknown_fields`. The `TARGET_CONF` env var (legacy name, live feature) overrides the config path and is how the Python hooks pin a project's `.target.jsonc` when spawning MCP servers.
+
+### Locking Strategy
+
+Two levels:
+1. **Project singleton**: `.dut-serial/mcp.pid` prevents multiple MCP processes in the same project
+2. **Host:port mutex**: FNV1A-hash-based lock files in `/tmp/sermcp/locks/` with O_EXCL atomic creation + zombie cleanup
+
+### Power Control (`dut-ctrl` sub-crate)
+
+Trait-based abstraction: `PowerControl` trait → `Ch340RelayControl` (4-byte TCP protocol with read-back verify), `SoftwareRebootControl` (serial `reboot`), future: `SnmpPduControl`, `ButtonSimControl`.
+
+### Disconnected State Handling
+
+When a serial read error occurs (`Connection closed by ser2net`):
+1. **Fast retry**: immediate reconnect with 2s timeout. If successful → user never sees `disconnected`.
+2. **Ping-pong guard**: if fast retry was attempted <10s ago, skip it → straight to backoff.
+3. **Deferred backoff**: sleep happens outside the engine Mutex via `reconnect_after`.
+
+### Python Hooks (`hooks/claude/`)
+
+- `session-start.py` — detects project, auto-starts HTTP MCP on MD5-hash-based port (3001–3099)
+- `statusline.py` — reads MCP-written cache files; falls back to `target-state` with DUT alias
+- `pre-tool-use.py` — blocks raw `nc`/`tio`/`screen` serial access AND `dutabo serial` for Agent
+- `user-prompt-submit.py` — multi-DUT alerts, auto-restart MCP
+- `session-stop.py` — cleanup
+- `lib.py` — shared: project discovery, `format_serial_state` (with DUT alias support)

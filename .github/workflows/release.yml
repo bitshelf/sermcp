@@ -1,0 +1,154 @@
+# GitHub Actions release pipeline — the artifact layout is kept IDENTICAL to
+# .gitcode/workflows/release.yml so both mirrors download the same way:
+# `sermcp_<tag>_<target>.tar.gz` (tag keeps its `v`, the name cargo-binstall
+# resolves by default), bare `sermcp-<target>` / `dutabo-<target>` binaries for
+# direct downloads, and a merged SHA256SUMS.
+#
+# Both targets are static musl builds, so every artifact runs on any glibc
+# (x86_64 musl is cargo-binstall's default artifact). The aarch64 link is
+# driven by gcc-aarch64-linux-gnu, but the crt and libc still come from rust's
+# self-contained musl — see sermcp/.cargo/config.toml.
+#
+# GitHub will only schedule this file while it is registered as an active
+# workflow of the default branch; a workflow that was registered and then had
+# its file removed sits in state `deleted` (visible via
+# `GET /repos/:owner/:repo/actions/workflows/release.yml`) and silently ignores
+# tag pushes. Editing this file and pushing it to the default branch registers
+# it again.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl,aarch64-unknown-linux-musl
+
+      - name: Install protoc and the aarch64 link driver
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          # protoc: tracing-perfetto-sdk-schema compiles perfetto_trace.proto
+          # via prost-build at build time. gcc-aarch64-linux-gnu: drives the
+          # arm64 link only (see sermcp/.cargo/config.toml).
+          sudo apt-get install -y -qq protobuf-compiler gcc-aarch64-linux-gnu
+          protoc --version
+          # Optional, only used by the smoke test below.
+          sudo apt-get install -y -qq qemu-user-static \
+            || echo "qemu-user-static unavailable, arm64 smoke test will be skipped"
+
+      - name: Resolve release version
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME}"
+          case "${version}" in
+            v[0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "unexpected release version: '${version}'" >&2; exit 1 ;;
+          esac
+          echo "RELEASE_VERSION=${version}" >> "$GITHUB_ENV"
+          echo "release version: ${version}"
+
+      # ── x86_64: the artifact cargo-binstall resolves by default. ────
+      - name: Build (x86_64 musl, static)
+        working-directory: sermcp
+        run: cargo musl
+
+      - name: Build (aarch64 musl, static)
+        working-directory: sermcp
+        run: cargo build --release --locked --target aarch64-unknown-linux-musl
+
+      - name: Verify builds have no dynamic dependencies
+        working-directory: sermcp
+        run: |
+          set -euo pipefail
+          for target in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
+            for bin in sermcp dutabo; do
+              exe="target/${target}/release/${bin}"
+              if readelf -l "${exe}" | grep -q INTERP || readelf -d "${exe}" | grep -q NEEDED; then
+                echo "dynamic dependency found in ${target}/${bin}" >&2
+                exit 1
+              fi
+            done
+          done
+
+      # Executing is the only check that catches a musl/glibc mismatch that
+      # readelf cannot see. arm64 needs qemu-user-static (installed above).
+      - name: Smoke test binaries
+        working-directory: sermcp
+        run: |
+          set -euo pipefail
+          for bin in sermcp dutabo; do
+            "target/x86_64-unknown-linux-musl/release/${bin}" --help > /dev/null
+            if command -v qemu-aarch64-static > /dev/null; then
+              qemu-aarch64-static "target/aarch64-unknown-linux-musl/release/${bin}" --help > /dev/null
+            else
+              echo "no qemu-aarch64-static, skipping ${bin} arm64 execution test"
+            fi
+          done
+
+      - name: Package
+        working-directory: sermcp
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          for target in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
+            release_dir="target/${target}/release"
+            tarball="sermcp_${RELEASE_VERSION}_${target}.tar.gz"
+            tar -czf "dist/${tarball}" -C "${release_dir}" sermcp dutabo
+            cp "${release_dir}/sermcp" "dist/sermcp-${target}"
+            cp "${release_dir}/dutabo" "dist/dutabo-${target}"
+            # Listed explicitly: a `./*` glob here would race the redirect that
+            # creates the checksum file itself.
+            (
+              cd dist
+              sha256sum "${tarball}" "sermcp-${target}" "dutabo-${target}" \
+                > "SHA256SUMS-${target}"
+            )
+          done
+          ls -lh dist
+
+      - name: Verify checksums
+        working-directory: sermcp
+        run: |
+          set -euo pipefail
+          cd dist
+          for sum in SHA256SUMS-*; do
+            sha256sum -c "${sum}"
+          done
+          rm -f SHA256SUMS-*
+          # Explicit list, not ./*: the redirect creates SHA256SUMS before the
+          # glob would expand on a re-run, which would fold it into itself.
+          sha256sum sermcp_* sermcp-* dutabo-* > SHA256SUMS
+          ls -lh
+          cat SHA256SUMS
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          name: sermcp ${{ github.ref_name }}
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          body: |
+            sermcp ${{ github.ref_name }}
+
+            由 GitHub Actions 自动构建。两个架构都是静态 musl，不依赖目标机的 glibc。
+            下载后建议先校验完整性：
+
+            ```sh
+            sha256sum -c SHA256SUMS
+            ```
+
+            | 文件 | 说明 |
+            |------|------|
+            | `sermcp_${{ github.ref_name }}_x86_64-unknown-linux-musl.tar.gz` | x86_64 静态 musl，含 sermcp + dutabo |
+            | `sermcp_${{ github.ref_name }}_aarch64-unknown-linux-musl.tar.gz` | aarch64 静态 musl，含 sermcp + dutabo |
+            | `sermcp-<target>` / `dutabo-<target>` | 免解压的裸二进制 |
+            | `SHA256SUMS` | 全部文件的校验和 |
+          files: sermcp/dist/*

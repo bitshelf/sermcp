@@ -1,0 +1,8 @@
+# Static musl builds via rust's SELF-CONTAINED musl (rustup ships the
+# full musl libc/crt): the default `cc` only drives ld, no host glibc
+# leaks in. Do NOT set linker=musl-gcc — Ubuntu's musl-tools 1.1.24 crt
+# mixed with rust's self-contained libc.a produces binaries that
+# segfault at startup (verified: plain C musl-gcc works, the mixed Rust
+# build does not).
+[target.x86_64-unknown-linux-musl]
+rustflags = ["-C", "target-feature=+crt-static"]

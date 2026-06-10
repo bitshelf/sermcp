@@ -1,0 +1,169 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "dutabo Embedded Debug Target Configuration",
+  "description": "Schema for .target.jsonc control is filled with dev_ctrl; flash completes loader_cmd/list_devices_cmd which the runtime parses.",
+  "type": "object",
+  "additionalProperties": false,
+
+  "properties": {
+    "dev_hosts": { "type": "array", "items": { "$ref": "#/$defs/dev_host" } },
+    "serial": { "$ref": "#/$defs/serial" },
+    "target": { "$ref": "#/$defs/target" },
+    "relay": { "$ref": "#/$defs/relay" },
+    "monitor": { "$ref": "#/$defs/monitor" },
+    "uboot": { "$ref": "#/$defs/uboot" },
+    "flash": { "$ref": "#/$defs/flash" },
+    "control": { "$ref": "#/$defs/control" },
+    "loader": { "type": "string", "minLength": 1, "description": "Boot loader type: uboot (current) or uefi (not yet implemented)." }
+  },
+
+  "required": ["dev_hosts"],
+
+  "$defs": {
+    "dut_name": { "type": "string", "minLength": 1, "description": "Unique DUT name — global uniqueness across all DUTs (the .dut-serial/<dut_name> identity) must be checked by application validation." },
+    "non_empty_string": { "type": "string", "minLength": 1 },
+    "port": {
+      "description": "TCP/ser2net port number or device path. 0 and \"0\" are invalid unset sentinels.",
+      "oneOf": [
+        { "type": "integer", "minimum": 1, "maximum": 65535 },
+        { "type": "string", "minLength": 1, "not": { "const": "0" } }
+      ]
+    },
+    "positive_integer_or_string": {
+      "oneOf": [
+        { "type": "integer", "minimum": 1 },
+        { "type": "string", "pattern": "^[1-9][0-9]*$" }
+      ]
+    },
+    "inherit_ms": { "description": "0 means inherit; otherwise a non-negative millisecond value.", "type": "integer", "minimum": 0 },
+    "power_off_ms": {
+      "description": "0 means inherit; otherwise must be at least 3000 ms.",
+      "oneOf": [ { "const": 0 }, { "type": "integer", "minimum": 3000 } ]
+    },
+    "dev_host": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "ip": { "type": "string", "minLength": 1, "description": "Development host address used by SSH and remote serial/relay access." },
+        "host_name": { "type": "string", "description": "Optional display name; falls back to the host ip when absent or empty. Never a lookup key." },
+        "user": { "type": "string", "description": "SSH username." },
+        "pass": { "type": "string", "description": "SSH password. Empty string is allowed." },
+        "duts": { "type": "array", "items": { "$ref": "#/$defs/dut" } }
+      },
+      "required": ["ip", "duts"]
+    },
+    "dut": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "dut_name": { "$ref": "#/$defs/dut_name" },
+        "serial": { "$ref": "#/$defs/serial" },
+        "target": { "$ref": "#/$defs/target" },
+        "relay": { "$ref": "#/$defs/relay" },
+        "monitor": { "$ref": "#/$defs/monitor" },
+        "uboot": { "$ref": "#/$defs/uboot" },
+        "flash": { "$ref": "#/$defs/flash" },
+        "control": { "$ref": "#/$defs/control" },
+        "loader": { "type": "string", "minLength": 1, "description": "Boot loader type: uboot (current) or uefi (not yet implemented)." }
+      },
+      "required": ["dut_name"]
+    },
+    "serial": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "port": { "$ref": "#/$defs/port" },
+        "baudrate": { "$ref": "#/$defs/positive_integer_or_string", "description": "Serial baudrate. Built-in default is 115200 when unset." },
+        "rfc2217": { "type": "boolean", "description": "Enable RFC2217 mode for ser2net." }
+      }
+    },
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "login_user": { "type": "string", "description": "Target login username. Empty disables boot-to-shell detection." },
+        "login_pass": { "type": "string", "description": "Target login password." },
+        "login_prompt": { "type": "string", "description": "Regex used to recognize the target login prompt. Empty uses the built-in login matcher." }
+      }
+    },
+    "relay": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": { "type": "string", "enum": ["ch340", "ch340-relay", "none", "disabled"] },
+        "ip": { "type": "string", "description": "Relay host address. Empty string explicitly falls back to the parent development host IP." },
+        "port": { "$ref": "#/$defs/port" },
+        "reset_ch": { "type": "integer", "minimum": 0 },
+        "maskrom_ch": { "type": "integer", "minimum": 0 },
+        "recovery_ch": { "type": "integer", "minimum": 0 },
+        "power_ch": { "type": "integer", "minimum": 0 },
+        "reset_time_ms": { "$ref": "#/$defs/inherit_ms" },
+        "power_off_time_ms": { "$ref": "#/$defs/power_off_ms" }
+      }
+    },
+    "monitor": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "hang_timeout": { "type": "integer", "minimum": 1, "description": "Hang detection timeout in seconds." },
+        "boot_window_secs": { "type": "integer", "minimum": 1, "description": "Max seconds a booting state may last; on expiry the state moves to active even without boot-complete console evidence (default 30)." },
+        "learner_stage_threshold": { "type": "number", "minimum": 0.0, "maximum": 1.0 },
+        "crash_keywords": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "description": "Crash keyword substrings, not regular expressions."
+        },
+        "learner_crash_threshold": { "type": "number", "minimum": 0.0, "maximum": 1.0 },
+        "reference_log": { "type": "string", "minLength": 1 },
+        "max_log_file_size": { "type": "integer", "minimum": 1 },
+        "max_archived_logs": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "uboot": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "interrupt_strategy": { "enum": ["flood", "pattern"] },
+        "pattern": { "type": "string", "minLength": 1, "description": "Regex that triggers one interrupt byte when interrupt_strategy is pattern." },
+        "interrupt_char": {
+          "description": "Strict interrupt-byte specification: one ASCII character, ctrl_c/^C, esc, space, f1..f12 (leading ESC byte), 0xNN, or decimal byte value.",
+          "oneOf": [
+            { "type": "integer", "minimum": 0, "maximum": 255 },
+            { "type": "string", "minLength": 1 }
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "interrupt_strategy": { "const": "pattern" } }, "required": ["interrupt_strategy"] },
+          "then": { "required": ["pattern"] }
+        }
+      ]
+    },
+    "flash": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "kernel_image_cmd": { "type": "string", "minLength": 1 },
+        "upload_dir": { "type": "string", "minLength": 1 },
+        "full_image_cmd": { "type": "string", "minLength": 1 },
+        "tool": { "type": "string", "minLength": 1 },
+        "loader_bin": { "type": "string", "minLength": 1 },
+        "loader_cmd": { "type": "string", "minLength": 1, "description": "Flash loader command (still parsed by the runtime; hidden from the wizard)." },
+        "list_devices_cmd": { "type": "string", "minLength": 1, "description": "Command listing flashable devices before flashing (hidden from the wizard)." }
+      }
+    },
+    "control": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "dev_ctrl": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "description": "Power-control backend selector: ch340-relay (built-in ch340 relay) or none (usb-relay and the external dev-ctl program backend were removed)."
+        }
+      }
+    }
+  }
+}
