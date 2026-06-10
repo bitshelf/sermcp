@@ -1,0 +1,13 @@
+DDR Version 1.08 20230501
+U-Boot SPL 2024.01
+BL31: v2.10.0
+OP-TEE: revision 4.1
+U-Boot 2024.01 (Jan 01 2025 - 00:00:00 +0000)
+Hit any key to stop autoboot:  0
+Starting kernel ...
+Linux version 6.1.0 (gcc 12.2.0)
+init: starting service
+login:
+root@rk3576:~#
+Kernel panic - not syncing: No working init found
+---[ end trace 0000000000000000 ]---
