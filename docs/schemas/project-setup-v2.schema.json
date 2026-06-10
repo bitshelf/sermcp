@@ -1,0 +1,86 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "dutabo init project setup overlay",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "version": {
+      "const": 2
+    },
+    "defaults": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "platform": {
+          "type": "string"
+        },
+        "workflow": {
+          "type": "string"
+        },
+        "client": {
+          "enum": [
+            "All",
+            "Codex",
+            "Claude Code",
+            "pi.dev",
+            "DeepSeek harness"
+          ]
+        }
+      }
+    },
+    "platforms": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "minProperties": 1,
+        "additionalProperties": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "skills": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9-]+$"
+              }
+            },
+            "source": {
+              "anyOf": [
+                {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "path": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "git": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "ref": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    }
+                  },
+                  "description": "Exactly one of path or git; ref only for git. Relative paths resolve beside the overlay."
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "description": "Existing workflows inherit omitted fields; new workflows require skills."
+        }
+      }
+    }
+  }
+}

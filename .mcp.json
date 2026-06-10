@@ -1,0 +1,44 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$comment": "Project-level MCP config (portable): commit to Git; secrets must use ${VAR} references, see .env.example",
+  "mcpServers": {
+    "github": {
+      "$comment": "GitHub integration - requires GITHUB_PERSONAL_ACCESS_TOKEN (fine-grained PAT, see .env.example)",
+      "command": "github-mcp-server",
+      "args": [
+        "stdio"
+      ],
+      "env": {
+        "GITHUB_PERSONAL_ACCESS_TOKEN": "${GITHUB_PERSONAL_ACCESS_TOKEN}"
+      }
+    },
+    "fetch": {
+      "$comment": "Fetch URLs to Markdown - official reference server (PyPI), no key required",
+      "command": "uvx",
+      "args": [
+        "--with",
+        "mcp<2.0.0",
+        "mcp-server-fetch"
+      ]
+    },
+    "git": {
+      "$comment": "Git repository read/write - official reference server (PyPI), no key required",
+      "command": "uvx",
+      "args": [
+        "--with",
+        "mcp>=1.7.0,<2.0.0",
+        "mcp-server-git"
+      ]
+    },
+    "deepwiki": {
+      "$comment": "AI documentation lookup for GitHub repos - remote service, no auth",
+      "type": "http",
+      "url": "https://mcp.deepwiki.com/mcp"
+    },
+    "context7": {
+      "$comment": "Latest technical documentation search - remote service, no auth",
+      "type": "http",
+      "url": "https://mcp.context7.com/mcp"
+    }
+  }
+}

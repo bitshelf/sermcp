@@ -1,0 +1,101 @@
+// .target.jsonc — Embedded Debug Target Configuration (JSONC)
+// Copy to project root. // comments and trailing commas are valid.
+// Create/update via `dutabo init` — it preserves your comments.
+//
+// Structure: dev_hosts[] each NESTS its duts[]. A DUT inherits its parent
+// host's ip/user/pass — names are display-only; the host ip is the linking key.
+// Top-level sections (serial/target/uboot/relay/monitor/flash/control) are
+// GLOBAL fallbacks: a DUT value overrides; otherwise the global value wins.
+//   commented out = not set (built-in default)
+//   port 0 / "0"  = unset sentinel (validation error, as before)
+//   ""            = explicitly empty -> falls back to parent dev host ip (relay.ip only)
+// Unknown keys are rejected at parse time (typos fail loudly).
+// The agent must NOT modify this file — read only. Edit via `dutabo init`.
+
+{
+  "dev_hosts": [
+    {
+      "ip": "192.168.1.105",               // REQUIRED — ssh / ser2net host
+      "host_name": "lab-pc",              // optional display name — falls back to the host ip when absent
+      "user": "linaro",                    // ssh user (shown as user@ip in dutabo list)
+      "pass": "",                          // ssh password (optional, plaintext as before)
+      "duts": [
+        {
+          "dut_name": "rk3576",            // REQUIRED — unique across ALL DUTs
+          "serial": {
+            "port": 2002,                  // ser2net port OR device path "/dev/ttyUSB0"; number or string
+            "baudrate": 1500000,           // number or string (default 1500000)
+            "rfc2217": false,              // true for telnet(rfc2217) ser2net ports (dynamic baud)
+          },
+          "target": {
+            "login_user": "root",          // empty = boot-to-shell detection disabled (warn)
+            "login_pass": "",
+            "login_prompt": "",            // regex; empty = built-in "login:" matcher
+          },
+          "uboot": {
+            "interrupt_char": "ctrl_c",    // ctrl_c | ^C | esc | space | F1..F12 | 0xNN | ASCII char
+            "interrupt_strategy": "flood", // flood | pattern
+            // "pattern": "Hit any key",    // required for pattern strategy; regex
+          },
+          "relay": {
+            "type": "ch340",               // ch340 | ch340-relay | usb-relay | external | external-dev-ctl | dev-ctl | none | disabled
+            "port": 2000,
+            "reset_ch": 1,                 // aliases reset_channel/maskrom_channel/recovery_channel/power_channel also accepted
+            "maskrom_ch": 2,
+            "recovery_ch": 3,
+            "power_ch": 0,                 // 0 = inherit global (zero-guarded insertion)
+            "reset_time_ms": 500,          // 0 = inherit
+            "power_off_time_ms": 3000,     // clamped to >= 3000; 0 = inherit global
+          },
+          "monitor": {
+            "hang_timeout": 60,
+            "hang_hysteresis": 3,
+            "max_archived_logs": 10,
+            "max_log_file_size": 100,
+            "reference_log": ".dut-serial/rk3576/reference-boot.log",
+            "learner_stage_threshold": 0.45,
+            "learner_crash_threshold": 0.50,
+            "crash_keywords": ["Kernel panic", "BUG:", "Oops:"],   // substrings, not regex
+          },
+          "flash": {
+            "tool": "upgrade_tool",
+            "upload_dir": "/tmp",
+            "full_image_cmd": "uf {image}",
+            "kernel_image_cmd": "di -k {image}",
+          },
+        },
+        {
+          "dut_name": "rk3576-2",
+          "serial": { "port": "2003" },    // number or string both accepted
+          "target": { "login_user": "ubuntu" },
+          "relay": { "type": "usb-relay", "port": 2011, "reset_ch": 1 },
+          "flash": { "tool": "upgrade_tool", "upload_dir": "/tmp", "full_image_cmd": "uf {image}" },
+        },
+      ],
+    },
+    {
+      "ip": "192.168.1.106",
+      "user": "lab",
+      "duts": [
+        {
+          "dut_name": "rk3588",
+          "serial": { "port": 2004 },
+          "relay": { "type": "external" },
+          "control": { "dev_ctl": "lab-pc-ctl --reset 1" },
+        },
+      ],
+    },
+  ],
+
+  // Global fallbacks (optional) — apply to every DUT that does not override:
+  // "serial":  { "port": 2000, "baudrate": 1500000, "rfc2217": false },
+  // "target":  { "login_user": "root", "login_prompt": "" },
+  // "uboot":   { "interrupt_char": "ctrl_c", "interrupt_strategy": "flood" },
+  // "relay":   { "type": "ch340", "reset_ch": 1, "power_off_time_ms": 3000 },
+  // "monitor": { "hang_timeout": 60, "max_archived_logs": 10, "crash_keywords": ["Kernel panic"] },
+  // "flash":   { "tool": "upgrade_tool", "upload_dir": "/tmp" },
+  // "control": { "dev_ctl": "" },
+  // "reference_log": "",       // back-compat top-level key (overrides monitor.reference_log)
+  // "dut_dir": ".dut-serial",  // back-compat top-level key
+  "lock_dir": "/tmp/sermcp/locks"   // top-level ONLY — never valid inside a dut
+}
