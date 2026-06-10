@@ -1,0 +1,29 @@
+[package]
+name = "dut-ctrl"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "DUT hardware button control — reset, recovery, maskrom via CH340, PDU, GPIO, software reboot (plugin registry)"
+
+[features]
+default = ["ch340"]
+ch340 = []
+
+[dependencies]
+# `rt` is needed for the pulse cancellation guard (Handle::try_current).
+tokio = { version = "1", features = ["rt", "net", "time", "io-util"] }
+tracing = "0.1"
+# `async_trait` makes PowerControl dyn-compatible (boxed futures), which the
+# plugin registry needs: `Box<dyn PowerControl>`.
+async-trait = "0.1"
+
+[dev-dependencies]
+# `test-util` enables `#[tokio::test(start_paused = true)]` deterministic timing;
+# `sync` is needed by the cancellation test's oneshot handshake.
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util", "sync"] }
+
+[build-dependencies]
+toml = "1.1"
+
+[package.metadata.learn]
+min_reset_ms = 3000
