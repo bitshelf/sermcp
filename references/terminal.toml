@@ -1,0 +1,21 @@
+# terminal.toml — serial terminal behavior preferences
+# Copy to ~/.config/dutabo/terminal.toml (or point the DUTABO_TERMINAL
+# environment variable at it to keep it elsewhere).
+# Shared by `dutabo serial` and the embedded terminal of `dutabo init`.
+# Unknown keys are rejected at parse time (typos fail loudly); a malformed
+# file keeps the built-in defaults and the terminal reports the error.
+
+[scroll]
+# Real-time ser2net tracking:
+#   true (default) — while the view is at the bottom it stays glued to the
+#                    live output; once scrolled UP it stays anchored to the
+#                    same content while output keeps arriving
+#                    (Xshell-style scroll lock).
+#   false          — a scrolled-up view rides along with the new output.
+follow_output = true
+
+# Whether typing pulls the view back to the bottom (the live line).
+#   false (default, Xshell-like) — typing never moves the view;
+#                                  Home/End/PgUp/PgDn scroll manually at any time.
+#   true                         — any keystroke jumps back to the bottom.
+jump_on_input = false
