@@ -1,0 +1,12 @@
+[workspace]
+members = ["sermcp"]
+default-members = ["sermcp"]
+resolver = "3"
+
+[patch.crates-io]
+tracing-perfetto-sdk-layer = { path = "sermcp/vendor/tracing-perfetto-sdk-layer" }
+
+[profile.release]
+opt-level = "s"
+lto = "thin"
+strip = true

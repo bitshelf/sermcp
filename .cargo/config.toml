@@ -1,0 +1,18 @@
+# Cargo 1.94 `include`: environment-specific config files load from here,
+# keeping the default (glibc) workflow untouched while the static musl
+# build gets its own file below.
+include = ["musl.toml"]
+
+[alias]
+# Static, zero-libc build of both binaries.
+musl = "build --release --locked --target x86_64-unknown-linux-musl"
+
+# aarch64 release builds: rustc's default linker for this target is plain `cc`,
+# i.e. the host gcc, which cannot link aarch64 objects — the cross driver has
+# to be named explicitly. It only *drives* the link: the crt and libc come from
+# rust's self-contained musl, so the result is static like the x86_64 musl
+# build (verified with readelf: no INTERP, no NEEDED). Both release pipelines
+# install gcc-aarch64-linux-gnu, so the same name works locally, on GitHub
+# runners and on GitCode runners.
+[target.aarch64-unknown-linux-musl]
+linker = "aarch64-linux-gnu-gcc"
