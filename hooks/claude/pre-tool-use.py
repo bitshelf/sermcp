@@ -237,21 +237,167 @@ def _deny(reason: str) -> None:
 # starting. The lifecycle belongs to the agent host (.mcp.json stdio
 # spawn) and the session hooks — never to a stray background process.
 # `dutabo` stays allowed (it talks to the HTTP endpoint).
-_SERMCP_SPAWN = re.compile(r"(^|[;&|]\s*|\bsudo\s+)(?:\S*/)?sermcp\b(?:\s|$)")
+#
+# Wrapper parsing is a guard against accidental launches, not a shell sandbox.
+# Runtime endpoint locks remain authoritative when commands are constructed dynamically.
+
+_ENV_ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+# Wrapper options that consume the NEXT token as their argument.
+_ARG_OPTIONS = {
+    "env": {"-u", "--unset", "-C", "--chdir"},
+    "sudo": {"-u", "-g", "-p", "-C", "-D", "-h", "-r", "-t"},
+    "timeout": {"-k", "-s", "--signal", "--kill-after"},
+    "nice": {"-n", "--adjustment"},
+    "stdbuf": {"-o", "-e", "-i"},
+}
+_PLAIN_WRAPPERS = {"nohup", "setsid", "exec", "command"}
+_ARG_WRAPPERS = {"sudo", "env", "timeout", "nice", "stdbuf"}
+# Read-only invocations that never connect, lock, or serve.
+_INSPECT_ONLY_FLAGS = {"--help", "-h", "--version", "-V", "--dry-run"}
 
 
-def _sermcp_spawn_reason(command: str):
-    if _SERMCP_SPAWN.search(command):
-        return (
-            "[BLOCKED] Do not start the sermcp MCP server yourself — a "
-            "background server holds the project lock and the owner slot "
-            "indefinitely and breaks every later MCP connection of this "
-            "session. The server is managed automatically: use the MCP "
-            "tools (serial_get_state, serial_exec, ...), or `dutabo` for "
-            "CLI access. To restart a wedged server run: "
-            "kill $(cat .dut-serial/mcp.pid)"
-        )
+def _strip_wrappers(tokens: list) -> list:
+    """Drop leading wrapper tokens (`nohup`, `env VAR=...`, `sudo -u x`,
+    `timeout 30`, `nice -n 5`, bare `VAR=v` prefixes, ...) so the first
+    remaining token is the real command."""
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        if _ENV_ASSIGN.match(tok):
+            i += 1
+            continue
+        wrapper = Path(tok).name
+        if wrapper in _PLAIN_WRAPPERS:
+            i += 1
+            while i < len(tokens) and tokens[i].startswith("-"):
+                if wrapper == "command" and tokens[i] in {"-v", "-V"}:
+                    return []
+                if wrapper == "exec" and tokens[i] == "-a":
+                    i += 1
+                i += 1
+            continue
+        if wrapper in _ARG_WRAPPERS:
+            i += 1
+            # Skip the wrapper's own flags (and their separate arguments).
+            while i < len(tokens) and tokens[i].startswith("-"):
+                if tokens[i] in _ARG_OPTIONS[wrapper] and i + 1 < len(tokens):
+                    i += 1
+                i += 1
+            # `timeout <dur>` / `nice <adj>` take one bare numeric token.
+            if wrapper in ("timeout", "nice") and i < len(tokens) and re.match(
+                r"^\+?-?\d", tokens[i]
+            ):
+                i += 1
+            continue
+        break
+    return tokens[i:]
+
+
+def _first_sermcp_argv(command: str, depth: int = 0):
+    """Return the first unsafe launch, checking every shell command position.
+
+    Quote-aware tokenization avoids treating quoted prose as shell syntax.
+    Shell wrappers are inspected recursively; arbitrary shell expansion is
+    deliberately outside this best-effort hook's guarantees.
+    """
+    import shlex
+
+    if depth > 8:
+        return None
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|()\n")
+        lexer.whitespace = " \t\r"
+        tokens = list(lexer)
+    except ValueError:
+        return None
+    segments, current = [], []
+    for token in tokens:
+        if token and all(c in ";&|()\n" for c in token):
+            segments.append(current)
+            current = []
+        else:
+            current.append(token)
+    segments.append(current)
+    for segment in segments:
+        rest = _strip_wrappers(segment)
+        if not rest:
+            continue
+        binary = Path(rest[0]).name
+        if binary in {"sh", "bash", "dash", "zsh"}:
+            for i, arg in enumerate(rest[1:], 1):
+                if arg.startswith("-") and "c" in arg and i + 1 < len(rest):
+                    nested = _first_sermcp_argv(rest[i + 1], depth + 1)
+                    if nested:
+                        return nested
+                    break
+        if binary == "cargo" and len(rest) > 1 and rest[1] == "run":
+            # Cargo's help does not execute a binary; explicit dutabo is a client.
+            if "--help" in rest[2:] and "--" not in rest:
+                continue
+            if "--bin" not in rest or rest[rest.index("--bin") + 1:][:1] == ["sermcp"]:
+                args = rest[rest.index("--") + 1:] if "--" in rest else []
+                if not any(flag in _INSPECT_ONLY_FLAGS for flag in args):
+                    return ["sermcp", *args]
+        if binary == "sermcp" and not any(flag in _INSPECT_ONLY_FLAGS for flag in rest[1:]):
+            return rest
     return None
+
+
+def _sermcp_spawn_reason(command: str, project_dir: str = ""):
+    argv = _first_sermcp_argv(command)
+    if argv is None:
+        return None
+    if any(flag in _INSPECT_ONLY_FLAGS for flag in argv[1:]):
+        return None
+
+    reason = (
+        "[BLOCKED] Do not start the sermcp MCP server yourself — a "
+        "background server holds the project lock and the owner slot "
+        "indefinitely and breaks every later MCP connection of this "
+        "session. The server is managed automatically: use the MCP "
+        "tools (serial_get_state, serial_exec, ...), or `dutabo` for "
+        "CLI access. To restart a wedged server run: "
+        "kill $(cat .dut-serial/mcp.pid)"
+    )
+
+    # Detached HTTP must retain an exit mechanism owned by the session.
+    args = argv[1:]
+    for idx, flag in enumerate(args):
+        if flag == "--idle-timeout=0" or (
+            flag == "--idle-timeout"
+            and idx + 1 < len(args)
+            and args[idx + 1].strip() == "0"
+        ):
+            reason += (
+                " --idle-timeout 0 is FORBIDDEN: it disables the idle "
+                "self-exit; hosts without SessionEnd need verified "
+                "session-process supervision to reclaim the endpoint. If a "
+                "longer-lived server is truly needed, ask the USER to "
+                "start it manually."
+            )
+            break
+
+    # A foreign TARGET_CONF can contend for another project's hardware.
+    if project_dir:
+        proj = Path(project_dir).resolve()
+        for token in argv[1:] + re.findall(r"TARGET_CONF=\S+", command):
+            value = token.split("=", 1)[1] if token.startswith("TARGET_CONF=") else ""
+            if not value:
+                continue
+            conf = Path(value).resolve()
+            try:
+                conf.relative_to(proj)
+            except ValueError:
+                reason += (
+                    f" TARGET_CONF={value} belongs to ANOTHER project: "
+                    "an engine started here will fight that project's "
+                    "engine for the same physical serial port and violate "
+                    "project exclusivity. Start it in "
+                    "its own project session, or ask the USER to do it."
+                )
+                break
+
+    return reason
 
 
 def main():
@@ -274,7 +420,8 @@ def main():
         print(json.dumps({"continue": True}))
         sys.exit(0)
 
-    project_dir = find_project_root(allow_lock_fallback=False)
+    cwd = hook_input.get("cwd")
+    project_dir = find_project_root(allow_lock_fallback=False, start=Path(cwd) if isinstance(cwd, str) and cwd else None)
     if not project_dir:
         print(json.dumps({"continue": True}))
         sys.exit(0)
@@ -311,7 +458,7 @@ def main():
 
     # ── DENY: spawning the MCP server binary directly ──
     # See _sermcp_spawn_reason for the rationale.
-    reason = _sermcp_spawn_reason(command)
+    reason = _sermcp_spawn_reason(command, project_dir)
     if reason:
         _deny(reason)
         sys.exit(0)
@@ -463,7 +610,9 @@ def _selftest() -> int:
 
     # ── sermcp spawn block: the agent must never background the server
     #    binary itself (a stray server pins the project lock and the owner
-    #    slot forever). Mentions and inspect-only uses stay allowed.
+    #    slot forever). Wrapper-hidden spawns (nohup/env/setsid/timeout/
+    #    stdbuf/VAR=v) are blocked too.
+    #    Mentions and inspect-only uses stay allowed.
     check(
         "bare sermcp spawn is blocked",
         _sermcp_spawn_reason("sermcp --http 127.0.0.1:3005 &") is not None,
@@ -481,6 +630,79 @@ def _selftest() -> int:
         _sermcp_spawn_reason("sudo sermcp --http") is not None,
     )
     check(
+        "sudo -u <user> sermcp is blocked",
+        _sermcp_spawn_reason("sudo -u loh sermcp --http") is not None,
+    )
+    check(
+        "nohup sermcp is blocked",
+        _sermcp_spawn_reason(
+            "nohup sermcp --http 127.0.0.1:3083 > /tmp/s.out 2>&1 &"
+        ) is not None,
+    )
+    check(
+        "VAR=v sermcp env-prefix spawn is blocked",
+        _sermcp_spawn_reason("RUST_LOG=debug sermcp --http 127.0.0.1:3001 &") is not None,
+    )
+    check(
+        "setsid sermcp is blocked",
+        _sermcp_spawn_reason("setsid sermcp --http 127.0.0.1:3001") is not None,
+    )
+    check(
+        "timeout-wrapped sermcp is blocked",
+        _sermcp_spawn_reason("timeout 30 sermcp --http 127.0.0.1:3001") is not None,
+    )
+    check(
+        "stdbuf-wrapped sermcp is blocked",
+        _sermcp_spawn_reason("stdbuf -oL sermcp --http 127.0.0.1:3001") is not None,
+    )
+    check(
+        "sermcp inside $(...) is blocked",
+        _sermcp_spawn_reason("echo started $(nohup sermcp &)") is not None,
+    )
+    check(
+        "cross-project detached launch is blocked (nohup env TARGET_CONF)",
+        _sermcp_spawn_reason(
+            "cd /proj/a && nohup env TARGET_CONF=/proj/b/.target.jsonc "
+            "sermcp --http 127.0.0.1:3083 --idle-timeout 0 "
+            "> /tmp/s.out 2>&1 & sleep 6; curl -s http://127.0.0.1:3083/health"
+        ) is not None,
+    )
+
+    # Graded reasons on the incident command.
+    incident = (
+        "nohup env TARGET_CONF=/proj/b/.target.jsonc sermcp --http "
+        "127.0.0.1:3083 --idle-timeout 0"
+    )
+    r = _sermcp_spawn_reason(incident, "/proj/a")
+    check(
+        "incident deny names the idle-timeout ban",
+        r is not None and "--idle-timeout 0 is FORBIDDEN" in r,
+        f"got {r!r}",
+    )
+    check(
+        "incident deny names the cross-project hazard",
+        r is not None and "ANOTHER project" in r,
+        f"got {r!r}",
+    )
+    r = _sermcp_spawn_reason(
+        "sermcp --http 127.0.0.1:3005 --idle-timeout=0", "/proj/a"
+    )
+    check(
+        "--idle-timeout=0 (equals form) also triggers the ban",
+        r is not None and "--idle-timeout 0 is FORBIDDEN" in r,
+        f"got {r!r}",
+    )
+    r = _sermcp_spawn_reason(
+        "nohup env TARGET_CONF=/proj/a/.target.jsonc sermcp --http :3005",
+        "/proj/a",
+    )
+    check(
+        "same-project TARGET_CONF blocks without cross-project wording",
+        r is not None and "ANOTHER project" not in r,
+        f"got {r!r}",
+    )
+
+    check(
         "dutabo stays allowed",
         _sermcp_spawn_reason("dutabo state --dut rk3576") is None,
     )
@@ -492,6 +714,36 @@ def _selftest() -> int:
         "prose mentioning sermcp is not blocked",
         _sermcp_spawn_reason("grep sermcp .mcp.json && cat .dut-serial/mcp.log") is None,
     )
+    check(
+        "inspect-only flags stay allowed (--help)",
+        _sermcp_spawn_reason("sermcp --help") is None,
+    )
+    check(
+        "inspect-only flags stay allowed (--version, absolute path)",
+        _sermcp_spawn_reason("/home/u/.cargo/bin/sermcp --version") is None,
+    )
+    check(
+        "inspect-only flags stay allowed (--dry-run behind env)",
+        _sermcp_spawn_reason("env RUST_LOG=info sermcp --dry-run") is None,
+    )
+    check(
+        "cargo run server launch is denied",
+        _sermcp_spawn_reason("cargo run --release -- --http 127.0.0.1:3000") is not None,
+    )
+    check(
+        "quoted prose is not blocked",
+        _sermcp_spawn_reason("echo 'nohup sermcp --http'") is None,
+    )
+
+    for command in (
+        'sermcp --help; nohup sermcp --http',
+        '"/home/u/bin/sermcp" --http',
+        '/usr/bin/nohup /usr/bin/env A=b sermcp --http',
+        "bash -lc 'nohup sermcp --http &'",
+        'sudo -n sermcp --http',
+    ):
+        check(f"wrapper/quoted/multiple launch denied: {command}", _sermcp_spawn_reason(command) is not None)
+    check("quoted separators remain prose", _sermcp_spawn_reason("echo 'example; sermcp --http'") is None)
 
     return 1 if failed else 0
 
