@@ -1,0 +1,10 @@
+[features]
+hooks = true
+
+# Put this file at <target-project>/.codex/config.toml. Relative paths are
+# resolved from the .codex directory, so ".." is the target project root.
+[mcp_servers.sermcp]
+command = "sermcp"
+cwd = ".."
+startup_timeout_sec = 15
+tool_timeout_sec = 180
