@@ -96,7 +96,7 @@ Python fallback is `python3 hooks/codex/serial-status.py --watch`.
 ## Skills / commands / subagent
 
 Workspace config covers MCP + hooks only. The repo's `skills/`
-(`serial-debug`, `embedded-debug`), `commands/debug-boot.md`, and
+(`embedded-debug`), `commands/debug-boot.md`, and
 `agents/serial-boot-monitor.md` follow plugin-layout conventions, so they
 are discovered when the repo is installed as a ZCode plugin (local-directory
 marketplace; the `.claude-plugin/` manifest is recognized as a compat

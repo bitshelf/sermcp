@@ -1,0 +1,52 @@
+{
+  "mcp": {
+    "servers": {
+      "sermcp": {
+        "type": "stdio",
+        "command": "sermcp",
+        "env": {
+          "RUST_LOG": "info"
+        }
+      }
+    }
+  },
+  "hooks": {
+    "enabled": true,
+    "events": {
+      "SessionStart": [
+        {
+          "hooks": [
+            {
+              "type": "command",
+              "command": "python3 \"$HOME/res/sermcp/hooks/claude/session-start.py\"",
+              "timeout": 30
+            }
+          ]
+        }
+      ],
+      "UserPromptSubmit": [
+        {
+          "hooks": [
+            {
+              "type": "command",
+              "command": "python3 \"$HOME/res/sermcp/hooks/claude/user-prompt-submit.py\"",
+              "timeout": 10
+            }
+          ]
+        }
+      ],
+      "PreToolUse": [
+        {
+          "matcher": "Bash",
+          "hooks": [
+            {
+              "type": "command",
+              "command": "python3 \"$HOME/res/sermcp/hooks/claude/pre-tool-use.py\"",
+              "timeout": 5
+            }
+          ]
+        }
+      ]
+    }
+  }
+}
