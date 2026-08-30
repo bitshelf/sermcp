@@ -1,0 +1,18 @@
+# dsh-dut-statusline bundle patch — mount the plugin row into the profile tree.
+#
+# `dsh plugin --profile dsh-tui add <this-package>` pnpm-installs the package
+# into the profile and the CLI's reconcile step appends it to
+# `dsh.profile.bundles` (this package.json declares `dsh.bundle.patch`). At
+# boot, app-boot applies every bundle's patch list in bundle order over the
+# empty root, so this insert lands AFTER the dsh-tui bundle that provides the
+# `tuiStatus` service. The row-level `inject` also declares the dependency,
+# so ordering is guaranteed even under loader re-arrangement.
+#
+# Override row config from the profile's own cordis.patch.yml:
+#   - id: dut-statusline
+#     config:
+#       tcpTimeoutMs: 300
+- insert:
+    - id: dut-statusline
+      name: 'dsh-dut-statusline'
+      inject: [tuiStatus]
