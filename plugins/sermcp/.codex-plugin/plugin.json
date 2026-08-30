@@ -1,0 +1,40 @@
+{
+  "name": "sermcp",
+  "version": "0.4.1+codex.20260904161202",
+  "description": "Inspect and control embedded devices through a managed serial console.",
+  "author": {
+    "name": "sermcp contributors",
+    "url": "https://github.com/bitshelf/sermcp"
+  },
+  "homepage": "https://github.com/bitshelf/sermcp",
+  "repository": "https://github.com/bitshelf/sermcp",
+  "license": "MIT",
+  "keywords": [
+    "embedded-linux",
+    "serial-console",
+    "dut",
+    "mcp",
+    "debugging"
+  ],
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "Embedded Serial Console",
+    "shortDescription": "Check, control, and troubleshoot embedded devices over serial",
+    "longDescription": "Connects to the embedded device configured by the project's .target.jsonc file. Check whether it is online or booting, read serial and boot messages, run supported commands, restart it, enter U-Boot, and investigate startup failures.",
+    "developerName": "sermcp contributors",
+    "category": "Development Tools",
+    "brandColor": "#0F766E",
+    "composerIcon": "./assets/icon.png",
+    "logo": "./assets/icon.png",
+    "capabilities": [
+      "Read",
+      "Write"
+    ],
+    "defaultPrompt": [
+      "Check whether the configured device is online and show its latest serial output",
+      "Find out why the configured device did not finish booting",
+      "Restart the configured device and tell me when its console is ready"
+    ]
+  }
+}
