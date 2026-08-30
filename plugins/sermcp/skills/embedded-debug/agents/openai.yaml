@@ -1,0 +1,4 @@
+interface:
+  display_name: "Boot Failure Diagnosis"
+  short_description: "Diagnose boot hangs and crashes from serial logs"
+  default_prompt: "Use $embedded-debug to diagnose why the configured device did not finish booting."
