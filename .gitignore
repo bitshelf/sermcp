@@ -9,7 +9,7 @@ __pycache__/
 /.agents/
 /.claude/
 /.dut-serial/
-/.dut-serial/pi-mcp-client.log
+/.dut-serial/pi-extension.log
 /.target.jsonc
 
 /bin/

@@ -1,0 +1,29 @@
+{
+  "name": "sermcp",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Serial debugging for embedded Linux boards — Rust MCP server + pi.dev extensions (native MCP registration + statusline)",
+  "keywords": [
+    "pi-package",
+    "embedded",
+    "serial",
+    "mcp",
+    "dut"
+  ],
+  "pi": {
+    "extensions": [
+      "./pi-extensions/input-layout",
+      "./pi-extensions/sermcp"
+    ],
+    "skills": [
+      "./skills"
+    ],
+    "prompts": [
+      "./.pi/prompts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  }
+}
