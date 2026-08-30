@@ -14,6 +14,10 @@ Use this skill for direct serial-console operations. Use `embedded-debug`
 instead when the main task is diagnosing a boot hang, kernel crash, or changing
 boot-stage detection.
 
+Tool names below are written without a server namespace. MCP clients expose
+them namespaced (for example `mcp__sermcp__serial_exec` in Claude Code and
+pi); call the names your harness advertises.
+
 ## Activation boundary
 
 Search from the current directory upward for `.target.jsonc` before calling a
