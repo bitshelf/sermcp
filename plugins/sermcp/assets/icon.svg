@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-labelledby="title">
+  <title id="title">Sermcp serial console</title>
+  <rect width="512" height="512" rx="112" fill="#0F766E"/>
+  <rect x="92" y="108" width="328" height="248" rx="48" fill="#ECFEFF"/>
+  <circle cx="140" cy="154" r="13" fill="#14B8A6"/>
+  <circle cx="180" cy="154" r="13" fill="#F59E0B"/>
+  <path d="m146 226 54 42-54 42" fill="none" stroke="#0F766E" stroke-width="28" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M238 310h112" fill="none" stroke="#0F766E" stroke-width="28" stroke-linecap="round"/>
+  <path d="M172 356v48M256 356v48M340 356v48" fill="none" stroke="#99F6E4" stroke-width="24" stroke-linecap="round"/>
+</svg>

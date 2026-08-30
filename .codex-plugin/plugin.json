@@ -1,0 +1,22 @@
+{
+  "name": "embedded-debug",
+  "version": "0.3.0",
+  "description": "Serial debugger for embedded Linux boards with boot-log capture, U-Boot control, kernel-crash detection, relay reset, and StageLearner self-learning.",
+  "author": {
+    "name": "loh",
+    "url": "https://github.com/bitshelf/sermcp"
+  },
+  "homepage": "https://github.com/bitshelf/sermcp",
+  "repository": "https://github.com/bitshelf/sermcp",
+  "license": "MIT",
+  "keywords": ["serial", "embedded", "rockchip", "uboot", "mcp", "dut", "debug"],
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "sermcp",
+    "shortDescription": "MCP serial debugger for embedded Linux boards",
+    "developerName": "loh",
+    "category": "Development Tools",
+    "capabilities": ["Read", "Write", "Bash"]
+  }
+}

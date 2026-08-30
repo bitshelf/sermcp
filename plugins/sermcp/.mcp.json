@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "sermcp": {
+      "command": "./scripts/run-sermcp.sh",
+      "startup_timeout_sec": 15,
+      "tool_timeout_sec": 300
+    }
+  }
+}
