@@ -1,0 +1,10 @@
+{
+  "name": "bitshelf-dut",
+  "plugins": [
+    {
+      "name": "embedded-debug",
+      "source": "./",
+      "description": "Serial debugging for embedded Linux boards with the sermcp MCP server: boot-log capture, U-Boot control, relay reset, per-board HTTP services, and the human-operated dutabo CLI"
+    }
+  ]
+}
