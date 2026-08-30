@@ -1,0 +1,23 @@
+{
+  "schema_version": "1",
+  "name": "embedded-debug",
+  "version": "0.4.1",
+  "description": "Serial debugger for embedded Linux boards: boot-log capture, U-Boot control, kernel-crash detection, relay reset, StageLearner self-learning, and RFC 2217 dynamic baud-rate control (serial_set_baud). Provides the sermcp MCP server plus a Senior hook for auto-start, statusline blocking, and raw-serial enforcement.",
+  "author": {
+    "name": "loh",
+    "url": "https://github.com/bitshelf/sermcp"
+  },
+  "homepage": "https://github.com/bitshelf/sermcp",
+  "repository": "https://github.com/bitshelf/sermcp",
+  "license": "MIT",
+  "keywords": ["serial", "embedded", "rockchip", "uboot", "mcp", "dut", "debug"],
+  "mcpServers": {
+    "sermcp": {
+      "type": "stdio",
+      "command": "sermcp",
+      "env": {
+        "RUST_LOG": "info"
+      }
+    }
+  }
+}
