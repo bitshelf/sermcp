@@ -15,8 +15,7 @@ server exists, and caches the result into `.dut-serial/inventory.json`
 Lifecycle contract: the HTTP servers self-terminate after their
 idle timeout (~10min without MCP/WebSocket activity), and session-stop
 terminates them PROMPTLY when the last session leaves. Two mechanisms here:
-  - Liveness is pid-identity (/proc) AND an HTTP /health probe — a pid that
-    is alive but not answering gets SIGTERMed so a fresh server can spawn.
+  - A held project lock prevents the hook from starting another server.
   - Every session (owner AND guest) leaves a marker in
     `.dut-serial/sessions/<session_id>`; session-stop counts them to decide
     when "the last session is out".
@@ -35,20 +34,20 @@ from typing import Optional
 
 from inventory import find_project_root, load_inventory, inventory_is_live
 from lib import (
-    _is_embedded_server,
-    http_health_ok,
+    agent_session_process,
+    detect_endpoint_contention,
     mark_session_alive,
     owner_session_marker_exists,
+    project_locked,
     read_hook_payload,
     resolve_plugin_binary,
     sessions_lock,
     spawn_http_mcp,
-    terminate_pid,
 )
 from owner import claim_owner, owner_is_alive, owner_path
 
 
-def find_projects():
+def find_projects(payload: Optional[dict] = None):
     """Discover the current project via the shared walk-up (TARGET_CONF env
     -> CWD walk-up for .dut-serial/inventory.json -> .target.jsonc).
 
@@ -56,7 +55,8 @@ def find_projects():
     leakage — a session with no config of its own must never discover (and
     then write locks / start servers for) another project.
     """
-    root = find_project_root(allow_lock_fallback=False)
+    cwd = payload.get("cwd") if isinstance(payload, dict) else None
+    root = find_project_root(allow_lock_fallback=False, start=Path(cwd) if isinstance(cwd, str) and cwd else None)
     if root is None:
         return []
     return [root]
@@ -92,204 +92,6 @@ def is_port_in_use(port):
         return True
     except (ConnectionRefusedError, OSError):
         return False
-
-
-def _http_port_of_pid(pid: int) -> int | None:
-    """The --http port of a spawned server, parsed from /proc/<pid>/cmdline.
-
-    None when the process carries no --http flag (the stdio server Claude
-    Code spawns from .mcp.json) — such a process cannot be health-probed
-    and must be treated conservatively (alive), never reaped.
-    """
-    try:
-        args = (Path("/proc") / str(pid) / "cmdline").read_text(errors="replace").split("\0")
-    except (FileNotFoundError, OSError, ValueError):
-        return None
-    for i, arg in enumerate(args):
-        if arg == "--http" and i + 1 < len(args) and ":" in args[i + 1]:
-            try:
-                return int(args[i + 1].rsplit(":", 1)[-1].split("/")[0])
-            except ValueError:
-                return None
-        if arg.startswith("--http=") and ":" in arg:
-            try:
-                return int(arg.split("=", 1)[1].rsplit(":", 1)[-1].split("/")[0])
-            except ValueError:
-                return None
-    return None
-
-
-# A just-spawned server may not have bound its port yet (engine startup,
-# inventory write, listener bind). Reaping inside this window — e.g. a
-# concurrent session-start's health probe — would kill a perfectly healthy
-# server and race the spawning hook into a spawn/reap loop.
-STARTUP_GRACE_SECS = 15.0
-
-
-def _process_age_secs(pid: int) -> float | None:
-    """Age of a pid in seconds from /proc (None when unreadable).
-
-    Field 22 of /proc/<pid>/stat (starttime, clock ticks since boot) sits
-    after the parenthesised comm — split from the LAST ')' exactly like
-    the Rust zombie-state parser in lock_manager.rs."""
-    try:
-        stat = (Path("/proc") / str(pid) / "stat").read_text()
-        fields = stat.rsplit(")", 1)[1].split()
-        ticks = float(fields[19])  # fields[0] is the state char
-        uptime = float(Path("/proc/uptime").read_text().split()[0])
-        return uptime - ticks / os.sysconf("SC_CLK_TCK")
-    except (OSError, ValueError, IndexError):
-        return None
-
-
-def _mcp_pid_is_serving(pid: int, port: int | None = None) -> bool:
-    """Identity + serving check for one candidate MCP pid.
-
-    True when the pid is a verified sermcp process AND either carries no
-    HTTP port to probe (stdio server → assume alive; killing it would rip
-    the server out of Claude Code's hands), is younger than the startup
-    grace window (port may not be bound yet), or /health answers within
-    1s. False when identity fails or the probe fails.
-    """
-    if not _is_embedded_server(pid):
-        return False
-    age = _process_age_secs(pid)
-    if age is not None and age < STARTUP_GRACE_SECS:
-        return True
-    probe_port = port if port is not None else _http_port_of_pid(pid)
-    if probe_port is None:
-        return True
-    return http_health_ok(probe_port, timeout=1.0)
-
-
-def _reap_unhealthy_server(pid: int, pid_file, why: str) -> None:
-    """SIGTERM (3s grace, SIGKILL fallback) a pid that was VERIFIED as one
-    of our MCP processes but stopped serving, then drop its stale pidfile.
-    Reports to stderr so the respawn is visible in the session log."""
-    print(
-        f"[sermcp] stale MCP server pid {pid} ({why}) — "
-        f"terminating and respawning",
-        file=sys.stderr,
-    )
-    terminate_pid(pid, grace_secs=3.0)
-    if pid_file is not None:
-        try:
-            if pid_file.read_text().strip() == str(pid):
-                pid_file.unlink()
-        except OSError:
-            pass
-
-
-def _read_pid_file(pid_file) -> int | None:
-    try:
-        pid = int(pid_file.read_text().strip())
-        return None if pid == os.getpid() else pid
-    except (ValueError, OSError):
-        return None
-
-
-def _drop_stale_pid_file(pid_file, pid: int) -> None:
-    try:
-        if pid_file.read_text().strip() == str(pid):
-            pid_file.unlink()
-    except OSError:
-        pass
-
-
-def mcp_running(project_dir):
-    """Check if a sermcp process is already SERVING this project.
-
-    A pid-existence check is not enough (the process may be wedged or have
-    lost its port): every candidate is identity-checked via /proc and, when
-    it carries an --http port, health-probed (GET /health, 1s). A pid that
-    is alive per /proc but not answering is reaped so a fresh server can
-    spawn. Checks PID files first (fast path), then falls back to /proc
-    scanning.
-    """
-    proj = Path(project_dir)
-    # Fast path: check root and per-DUT PID files (a missing .dut-serial
-    # means nothing is running — degrade to the /proc scan, never raise).
-    try:
-        pid_dirs = [proj / ".dut-serial"] + [
-            d for d in (proj / ".dut-serial").iterdir()
-            if d.is_dir() and (d / "mcp.pid").exists()
-        ]
-    except OSError:
-        pid_dirs = [proj / ".dut-serial"]
-    for pid_dir in pid_dirs:
-        pid_file = pid_dir / "mcp.pid"
-        if pid_file.exists():
-            pid = _read_pid_file(pid_file)
-            if pid is None:
-                continue
-            if _mcp_pid_is_serving(pid):
-                return True
-            if _is_embedded_server(pid):
-                _reap_unhealthy_server(
-                    pid, pid_file, f"port {_http_port_of_pid(pid)} not answering /health"
-                )
-            else:
-                # Dead or recycled pid — the pidfile is stale either way.
-                _drop_stale_pid_file(pid_file, pid)
-    # Fallback: scan /proc for MCP processes with matching cwd
-    try:
-        for entry in Path("/proc").iterdir():
-            if not entry.name.isdigit():
-                continue
-            try:
-                pid = int(entry.name)
-                if pid == os.getpid():
-                    continue
-                if not _is_embedded_server(pid):
-                    continue
-                cwd = os.readlink(f"{entry}/cwd")
-                if Path(cwd).resolve() == proj.resolve():
-                    if _mcp_pid_is_serving(pid):
-                        return True
-                    port = _http_port_of_pid(pid)
-                    if port is not None:
-                        _reap_unhealthy_server(pid, None, f"port {port} not answering /health")
-            except (OSError, FileNotFoundError, ValueError):
-                continue
-    except OSError:
-        pass
-    return False
-
-
-def _kill_stale_mcp_on_port(port, project_dir: str):
-    """Kill a sermcp process listening on the given port.
-
-    Validates the PID is actually a sermcp process (via /proc/comm)
-    AND that its cwd resolves to THIS project before killing — never kills a
-    process serving another project that happens to hold the port.
-    """
-    proj_resolved = str(Path(project_dir).resolve())
-    result = subprocess.run(
-        ["ss", "-tlnpH", f"sport = :{port}"],
-        capture_output=True, text=True
-    )
-    for line in result.stdout.splitlines():
-        if "pid=" not in line:
-            continue
-        old_pid = line.split("pid=")[-1].split(",")[0]
-        try:
-            pid = int(old_pid)
-        except ValueError:
-            continue
-        # Validate before killing.
-        if not _is_embedded_server(pid):
-            continue
-        try:
-            cwd = os.readlink(f"/proc/{pid}/cwd")
-        except OSError:
-            continue
-        if str(Path(cwd).resolve()) != proj_resolved:
-            continue
-        try:
-            os.kill(pid, 15)
-        except OSError:
-            pass
-    time.sleep(0.5)
 
 
 def _plugin_binary() -> str | None:
@@ -370,31 +172,15 @@ def _cache_bootstrap(project_dir: str, bootstrap: dict) -> None:
 
 
 def _ensure_http_mcp(project_dir: str, port: int) -> None:
-    """Ensure an HTTP MCP server is running for this project.
-
-    Starts one if not already running (or if the recorded one stopped
-    serving — mcp_running reaps it). Never kills healthy processes.
-    The MCP self-terminates on idle; session-stop kills it when the last
-    session leaves, so this hook re-spawns on the next session start.
-    """
-    # Already running (identity + /health verified) for this project?
-    if mcp_running(project_dir):
+    """Start a session-bound HTTP server when the project has no owner."""
+    if agent_session_process() is None:
+        print("[sermcp] Cannot identify the Agent session process; use host-managed stdio.", file=sys.stderr)
         return
-
-    # Port in use by something else (stale MCP from another project)?
+    if project_locked(project_dir):
+        return
     if is_port_in_use(port):
-        _kill_stale_mcp_on_port(port, project_dir)
-        if is_port_in_use(port):
-            # Kill failed — port held by a non-MCP process we must not
-            # touch. Say so: a silent return here leaves Claude Code's
-            # HTTP transport failing with no explanation anywhere.
-            print(
-                f"[sermcp] HTTP port {port} is held by an unrelated "
-                "process that will not be touched — refusing to spawn the "
-                "MCP server on it",
-                file=sys.stderr,
-            )
-            return
+        print(f"[sermcp] HTTP port {port} is occupied. Check the project's MCP port.", file=sys.stderr)
+        return
 
     binary = _plugin_binary()
     if not binary:
@@ -505,9 +291,10 @@ def main():
 
     # Session identity from the hook input (Claude Code passes JSON on stdin);
     # the owner record stores it so later sessions can render owner markers.
-    session_id = read_hook_payload().get("session_id")
+    payload = read_hook_payload()
+    session_id = payload.get("session_id")
 
-    projects = find_projects()
+    projects = find_projects(payload)
     if not projects:
         # No .target.jsonc anywhere up the tree — the MCP must not start.
         # Also disarm a stale committed .mcp.json entry so Claude Code
@@ -516,8 +303,15 @@ def main():
         sys.exit(0)
 
     for proj in projects:
+        if (Path(proj) / ".dut-serial" / "stopped").exists():
+            print(f"[sermcp] {proj}: stopped; human dutabo start or dutabo resume enables startup.", file=sys.stderr)
+            continue
         dut_dir = os.path.join(proj, ".dut-serial")
         os.makedirs(dut_dir, exist_ok=True)
+
+        # Surface local endpoint conflicts without terminating foreign owners.
+        for alert in detect_endpoint_contention(proj):
+            print(f"[sermcp] {alert}", file=sys.stderr)
 
         # ── Ownership claim (multi-agent isolation) ──
         # The FIRST agent exclusively owns the MCP lifecycle (start/restart);
@@ -583,7 +377,10 @@ def main():
         # ── Auto-generate .mcp.json (stdio) when the project has a
         #    .target.jsonc but no sermcp entry yet — the template
         #    pins TARGET_CONF to the absolute .target.jsonc path ──
-        mcp_json_path = os.path.join(proj, ".mcp.json")
+        # Path, not os.path.join: the atomic-write branch below calls
+        # .with_name() on it (a str crashes the hook with AttributeError
+        # in any project whose .mcp.json has no sermcp entry yet).
+        mcp_json_path = Path(proj) / ".mcp.json"
         existing_cfg = {}
         if os.path.exists(mcp_json_path):
             try:
@@ -716,7 +513,11 @@ def _selftest() -> int:
             fake_bin = base / "fake-mcp"
             fake_bin.write_text(f"#!/bin/sh\nenv > {env_dump}\n")
             fake_bin.chmod(0o755)
-            spawn_http_mcp(str(proj), 2001, binary=str(fake_bin))
+            from unittest.mock import patch
+            from lib import _session_process_identity
+            with patch.dict(os.environ, {"SERMCP_SESSION_PID": str(os.getpid()),
+                                         "SERMCP_SESSION_START_TICKS": _session_process_identity(os.getpid())[0]}):
+                spawn_http_mcp(str(proj), 2001, binary=str(fake_bin))
             time.sleep(0.3)
             dumped = env_dump.read_text()
             check(
@@ -726,7 +527,7 @@ def _selftest() -> int:
             )
             check(
                 "spawn env carries no DUT selector",
-                "TARGET_DUT_NAME" not in dumped and "TARGET_DUT_ALIAS" not in dumped,
+                "TARGET_DUT_NAME" not in dumped,
                 dumped,
             )
         finally:
@@ -738,107 +539,14 @@ def _selftest() -> int:
             else:
                 os.environ.pop("TARGET_CONF", None)
 
-    # ── P4: the session lock claim — O_EXCL, 4-line format, self-reaping.
-    #    D8/D9 rules: canonicalized hash; live owner → observe; dead owner →
-    #    reap + claim; old-format lock with an existing dir → NEVER touched.
-    import inventory as _inv
-    import hashlib
+    # Session startup must refuse replacement before touching existing processes
+    # when no persistent session identity can be established.
+    from unittest.mock import patch
+    with patch.dict(globals(), {"agent_session_process": lambda: None}), patch.dict(globals(), {"project_locked": lambda _: (_ for _ in ()).throw(AssertionError("must not inspect an existing server"))}):
+        _ensure_http_mcp("/unused/project", 3000)
+        check("unknown session identity refuses HTTP startup before process inspection", True)
 
     _MISSING = object()
-
-    claim = globals().get("claim_session_lock")
-    if claim is None:
-        check(
-            "P4 session lock claim exists (claim_session_lock)",
-            False,
-            "not implemented",
-        )
-    else:
-        with tempfile.TemporaryDirectory() as td:
-            base = Path(td)
-            proj = base / "p4-proj"
-            proj.mkdir()
-            (proj / ".target.jsonc").write_text("{}")
-            scratch = base / "session.lock"
-            real_lp = getattr(_inv, "project_lock_path", None)
-            _inv.project_lock_path = lambda p: str(scratch)
-            try:
-                # 1. O_EXCL claim writes the 4-line format.
-                claim(str(proj), "sess-1", os.getpid())
-                lines = scratch.read_text().splitlines()
-                check(
-                    "P4 claim writes the 4-line lock format",
-                    len(lines) == 4,
-                    scratch.read_text(),
-                )
-                if len(lines) == 4:
-                    check(
-                        "P4 line 0 is the canonical project dir",
-                        lines[0] == str(Path(proj).resolve()),
-                        lines[0],
-                    )
-                    check(
-                        "P4 line 1 is the owner pid",
-                        lines[1] == str(os.getpid()),
-                        lines[1],
-                    )
-                    check(
-                        "P4 line 2 is the session id",
-                        lines[2] == "sess-1",
-                        lines[2],
-                    )
-                    try:
-                        float(lines[3])
-                        ts_ok = True
-                    except ValueError:
-                        ts_ok = False
-                    check("P4 line 3 is a unix timestamp", ts_ok, lines[3])
-
-                # 2. Live owner → observe, file untouched.
-                before = scratch.read_text()
-                claim(str(proj), "sess-2", os.getpid())
-                check(
-                    "P4 live owner → observe (file untouched)",
-                    scratch.read_text() == before,
-                )
-
-                # 3. Dead owner → reap + claim.
-                scratch.write_text("\n".join([
-                    str(Path(proj).resolve()),
-                    "99999999",
-                    "other-sess",
-                    str(int(time.time())),
-                ]))
-                claim(str(proj), "sess-3", os.getpid())
-                lines = scratch.read_text().splitlines()
-                check(
-                    "P4 dead owner is reaped and re-claimed",
-                    len(lines) == 4
-                    and lines[1] == str(os.getpid())
-                    and lines[2] == "sess-3",
-                    scratch.read_text(),
-                )
-
-                # 4. Old-format (path-only) lock with existing dir → NEVER
-                #    touched (D9 — the live-session protection).
-                scratch.write_text(str(proj))
-                claim(str(proj), "sess-4", os.getpid())
-                check(
-                    "P4 old-format lock is never touched",
-                    scratch.read_text() == str(proj),
-                )
-
-                # 5. The claim never writes .session-pid (B3 deleted).
-                check(
-                    "P4 never writes .dut-serial/.session-pid",
-                    not (proj / ".dut-serial" / ".session-pid").exists(),
-                )
-            finally:
-                if real_lp is not None:
-                    _inv.project_lock_path = real_lp
-                else:
-                    del _inv.project_lock_path
-
     # ── P4 discovery: find_projects must resolve from the payload cwd,
     #    never the process CWD (ROOT CAUSE A).
     with tempfile.TemporaryDirectory() as td:
@@ -868,94 +576,6 @@ def _selftest() -> int:
                 os.environ["TARGET_CONF"] = old_conf
             else:
                 os.environ.pop("TARGET_CONF", None)
-
-    # ── P7 (B12): port-kill validation — a sermcp pid whose cwd is
-    #    NOT this project must never be killed (cross-project R1 vector on
-    #    collided ports); a stale same-project server IS killed; a
-    #    non-sermcp pid is never touched.
-    FAKE_PID = 1234567
-
-    class _FakeOs:
-        def __init__(self):
-            self._real = os
-            self.kill_calls = []
-            self.fake_cwd = None
-
-        def __getattr__(self, name):
-            return getattr(self._real, name)
-
-        def readlink(self, path):
-            if path == f"/proc/{FAKE_PID}/cwd":
-                return self.fake_cwd
-            return self._real.readlink(path)
-
-        def kill(self, pid, sig):
-            self.kill_calls.append((pid, sig))
-
-    with tempfile.TemporaryDirectory() as td:
-        base = Path(td)
-        proj = base / "p7-proj"
-        other = base / "p7-other"
-        proj.mkdir()
-        other.mkdir()
-
-        fake = _FakeOs()
-        real_os = globals().get("os")
-        real_run = getattr(globals().get("subprocess"), "run", None)
-        real_sleep = getattr(globals().get("time"), "sleep", None)
-        real_embedded = globals().get("_is_embedded_server")
-        try:
-            globals()["os"] = fake
-            import types
-
-            def _fake_ss_run(*args, **kwargs):
-                return types.SimpleNamespace(
-                    stdout=(
-                        'LISTEN 0 4096 127.0.0.1:3999 0.0.0.0:* '
-                        f'users:((\\"sermcp\\",pid={FAKE_PID},fd=3))'
-                    )
-                )
-
-            subprocess.run = _fake_ss_run
-            time.sleep = lambda _s: None
-
-            globals()["_is_embedded_server"] = lambda pid: True
-            fake.fake_cwd = str(other)
-            _kill_stale_mcp_on_port(3999, str(proj))
-            check(
-                "P7 never kills a sermcp pid whose cwd is another project",
-                fake.kill_calls == [],
-                f"kill calls: {fake.kill_calls!r}",
-            )
-
-            fake.fake_cwd = str(proj)
-            _kill_stale_mcp_on_port(3999, str(proj))
-            check(
-                "P7 kills a stale same-project server on the port",
-                fake.kill_calls == [(FAKE_PID, 15)],
-                f"kill calls: {fake.kill_calls!r}",
-            )
-
-            fake.kill_calls.clear()
-            globals()["_is_embedded_server"] = lambda pid: False
-            fake.fake_cwd = str(proj)
-            _kill_stale_mcp_on_port(3999, str(proj))
-            check(
-                "P7 never kills a non-sermcp pid",
-                fake.kill_calls == [],
-                f"kill calls: {fake.kill_calls!r}",
-            )
-        finally:
-            if real_os is not None:
-                globals()["os"] = real_os
-            if real_run is not None:
-                subprocess.run = real_run
-            if real_sleep is not None:
-                time.sleep = real_sleep
-            if real_embedded is not None:
-                globals()["_is_embedded_server"] = real_embedded
-            else:
-                globals().pop("_is_embedded_server", None)
 
     return 1 if failed else 0
 

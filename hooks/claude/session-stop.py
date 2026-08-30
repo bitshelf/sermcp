@@ -39,6 +39,7 @@ if str(_HOOK_DIR) not in sys.path:
 from inventory import load_inventory
 from lib import (
     _is_embedded_server,
+    persistent_server,
     find_project_dir,
     pid_anchored_to_project,
     read_hook_payload,
@@ -98,6 +99,8 @@ def _terminate_project_servers(project_dir: str) -> list:
     verify both ways."""
     killed = []
     for pid in _candidate_server_pids(project_dir):
+        if persistent_server(pid):
+            continue
         if not _is_embedded_server(pid):
             continue
         if not _pid_anchored_to_project(pid, project_dir):

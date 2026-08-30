@@ -20,15 +20,15 @@ if str(_HOOK_DIR) not in sys.path:
     sys.path.insert(0, str(_HOOK_DIR))
 
 from lib import (
-    _is_embedded_server,
+    agent_session_process,
     check_mcp_alive,
+    detect_endpoint_contention,
     find_project_dir,
     http_health_ok,
-    pid_anchored_to_project,
+    project_locked,
     read_hook_payload,
     spawn_http_mcp,
     resolve_plugin_binary,
-    terminate_pid,
 )
 from inventory import load_inventory
 from owner import load_owner, am_i_owner, owner_is_alive
@@ -65,21 +65,17 @@ def _check_ser2net(host: str, port) -> bool:
 
 
 def _restart_mcp(project_dir: str) -> None:
-    """Restart the project's HTTP MCP server — health-check FIRST.
+    """Restart an unowned HTTP project on its recorded port."""
+    if (Path(project_dir) / ".dut-serial" / "stopped").exists():
+        return
 
-    Order matters:
-      1. resolve the port from inventory.json (`mcp_http_port`) — when no
-         port is known, print a notice and spawn NOTHING (a wrong-port
-         spawn fights the real server for the serial lock);
-      2. GET /health (2s) — a healthy server is NEVER touched, so this is
-         idempotent and quiet when everything is fine;
-      3. targeted kill: only processes verified as sermcp that
-         still hold the port (a wedged server blocking the bind);
-      4. respawn via the shared lib.spawn_http_mcp — the same argv/env as
-         session-start.py, with TARGET_CONF pinned to THIS project.
-    """
-    import subprocess
-
+    try:
+        config = json.loads((Path(project_dir) / ".mcp.json").read_text())
+        if config.get("mcpServers", {}).get("sermcp", {}).get("command"):
+            print("[sermcp] stdio server is managed by the Agent host; reconnect its MCP transport.", file=sys.stderr)
+            return
+    except (OSError, ValueError, TypeError):
+        pass
     mcp_port = _mcp_http_port(project_dir)
     if mcp_port is None:
         print(
@@ -91,7 +87,11 @@ def _restart_mcp(project_dir: str) -> None:
         return
 
     # Healthy → do nothing (never kill a working server).
-    if http_health_ok(mcp_port, timeout=2.0):
+    if project_locked(project_dir) or http_health_ok(mcp_port, timeout=2.0):
+        return
+
+    if agent_session_process() is None:
+        print("[sermcp] Cannot bind HTTP restart to an Agent session; use stdio. Existing processes are untouched.", file=sys.stderr)
         return
 
     binary = resolve_plugin_binary("sermcp")
@@ -102,34 +102,6 @@ def _restart_mcp(project_dir: str) -> None:
             file=sys.stderr,
         )
         return
-
-    # Targeted kill: only sermcp processes that hold the MCP
-    # port AND are anchored to THIS project. The port range (3001–3099) is
-    # narrow and hash-derived, so two projects CAN collide — without the
-    # anchoring check, a prompt here could SIGTERM another project's
-    # wedged-but-recoverable server.
-    try:
-        result = subprocess.run(
-            ["fuser", f"{mcp_port}/tcp"], capture_output=True, text=True, timeout=5
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            for pid_str in result.stdout.strip().split():
-                try:
-                    pid = int(pid_str)
-                    if (
-                        _is_embedded_server(pid)
-                        and pid_anchored_to_project(pid, project_dir)
-                    ):
-                        terminate_pid(
-                            pid,
-                            grace_secs=3.0,
-                            identity_check=lambda p: _is_embedded_server(p)
-                            and pid_anchored_to_project(p, project_dir),
-                        )
-                except (ValueError, OSError, ProcessLookupError):
-                    pass
-    except (subprocess.TimeoutExpired, OSError):
-        pass
 
     spawn_http_mcp(project_dir, mcp_port, binary=binary)
 
@@ -147,11 +119,13 @@ def _critical_alerts(duts: list) -> list:
 
 def main():
     # Session identity for ownership gating (multi-agent isolation).
-    session_id = read_hook_payload().get("session_id")
+    payload = read_hook_payload()
+    session_id = payload.get("session_id")
 
     # Display path: no /dev/shm cross-project fallback — an agent must never
     # alert about (or restart the MCP of) another project.
-    project_dir = find_project_dir(allow_lock_fallback=False)
+    cwd = payload.get("cwd")
+    project_dir = find_project_dir(allow_lock_fallback=False, start=Path(cwd) if isinstance(cwd, str) and cwd else None)
     if not project_dir:
         print(json.dumps({"continue": True}))
         sys.exit(0)
@@ -195,7 +169,7 @@ def main():
                 if may_restart:
                     _restart_mcp(project_dir)
                     print(json.dumps({
-                        "systemMessage": "[TARGET] ser2net OK, MCP reconnected."
+                        "systemMessage": "[TARGET] MCP server is down; recovery was requested. Reconnect the host-managed MCP transport if it remains unavailable."
                     }))
                 else:
                     print(json.dumps({
@@ -224,6 +198,10 @@ def main():
 
     # ── Live server: alert on critical states from the inventory ─────────
     alerts = _critical_alerts(duts)
+
+    # Audit even a healthy inventory; socket conflicts require attention.
+    contention = detect_endpoint_contention(project_dir)
+
     if alerts:
         crashed = any(d.get("state") == "crashed" for d in duts)
         dut_off = any(d.get("state") == "DUT-off" for d in duts)
@@ -261,9 +239,14 @@ def main():
         elif dut_off:
             alerts.append(
                 "DUT-off — no serial output for extended period. "
-                'Try serial_send_command("echo ping") or serial_reset().'
+                'Try serial_exec("echo ping") or serial_reset().'
             )
+        alerts.extend(contention)
         print(json.dumps({"systemMessage": " | ".join(alerts)}))
+        sys.exit(0)
+
+    if contention:
+        print(json.dumps({"systemMessage": " | ".join(contention)}))
         sys.exit(0)
 
     print(json.dumps({"continue": True}))

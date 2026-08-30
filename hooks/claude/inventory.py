@@ -20,23 +20,24 @@ renders ONLY when BOTH hold —
   1. the recorded mcp_pid is alive AND is actually a sermcp
      process (comm or argv[0] basename via /proc — a recycled pid must
      never make a stale snapshot look live); AND
-  2. when the server declared a heartbeat (`heartbeat_secs`), written_at
+  2. the server declared a heartbeat (`heartbeat_secs`) and written_at
      is fresh (≤ 3 × heartbeat). A killed server leaves no cleanup hook,
      so without freshness the old state would render forever; the
-     heartbeat contract makes written_at reliable.
+     heartbeat contract makes written_at reliable. Snapshots without a
+     heartbeat are display-only and never render as a live server.
   A snapshot failing either check renders NOTHING — never a made-up state.
 
 Schema (mirrors `config::InventoryJson`, schema_version 1):
   schema_version: 1
   written_by: "mcp-server" | "dutabo"
   written_at_unix: <seconds>
-  mcp_pid: <int> | null        # liveness signal — hooks trust this, not time
+  mcp_pid: <int> | null        # identity gate: alive AND a real sermcp process
   mcp_http_port: <int> | null
   heartbeat_secs: <int> | null # server's inventory rewrite interval
   current_dut: <dut_name> | null
   dev_hosts: [{ip, user, host_name}]
   duts: [{dut_name, dev_host_ip, ssh_user, serial_port,
-          dut_dir, mcp_port, state, state_label, state_text, state_plain,
+          dut_dir, state, state_label, state_text, state_plain,
           age_secs: <int>|null, critical: <bool>}]
 """
 
@@ -210,17 +211,17 @@ def _pid_is_mcp_server(pid: int) -> bool:
 def inventory_is_live(inv: dict) -> bool:
     """Whether a live MCP server backs this inventory.
 
-    TWO gates:
+    TWO gates, BOTH required:
       1. Identity: the recorded mcp_pid must be alive AND be a
          sermcp process (recycled-pid protection).
-      2. Freshness: when the server declared a heartbeat interval, the
+      2. Freshness: the server declares a heartbeat interval and the
          snapshot's written_at_unix must be within 3 × heartbeat_secs.
          The server rewrites the inventory on that cadence even when idle,
          so a stale written_at means the server died (kill -9 leaves no
          cleanup hook — without this gate the old state would render
-         forever). Snapshots WITHOUT heartbeat_secs (dutabo list --json,
-         pre-heartbeat servers) fall back to the identity gate alone —
-         os.kill(pid, 0) stays the only trustworthy check for them.
+         forever). A snapshot WITHOUT heartbeat_secs is a display-only
+         snapshot (dutabo list --json, serial_list_duts) or a stale file
+         from a dead server — never treated as a live server.
     """
     pid = inv.get("mcp_pid")
     if not isinstance(pid, int) or pid <= 0:
@@ -232,15 +233,14 @@ def inventory_is_live(inv: dict) -> bool:
     if not _pid_is_mcp_server(pid):
         return False
     heartbeat = inv.get("heartbeat_secs")
-    if isinstance(heartbeat, int) and heartbeat > 0:
-        written_at = inv.get("written_at_unix")
-        if not isinstance(written_at, int):
-            return False
-        import time
+    if not isinstance(heartbeat, int) or heartbeat <= 0:
+        return False
+    written_at = inv.get("written_at_unix")
+    if not isinstance(written_at, int):
+        return False
+    import time
 
-        if time.time() - written_at > 3 * heartbeat:
-            return False
-    return True
+    return time.time() - written_at <= 3 * heartbeat
 
 
 def render_state(dut: dict) -> str:
