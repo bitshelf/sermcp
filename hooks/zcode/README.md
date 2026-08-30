@@ -15,15 +15,25 @@ needs nothing installed.
 
 ## What is wired
 
-This repo ships a workspace-scope [`.zcode/config.json`](../../.zcode/config.json)
-(pick it up by restarting the session; inspect under **Settings → MCP**):
+This repo ships the workspace-scope template
+[`hooks/zcode/config.example.json`](config.example.json) — copy it into the
+TARGET project as `.zcode/config.json` (the sermcp checkout itself does NOT
+ship a `.zcode/config.json`; without the copy, NO hook runs and the guards
+below do not exist for that project):
+
+```bash
+mkdir -p /path/to/project/.zcode
+cp hooks/zcode/config.example.json /path/to/project/.zcode/config.json
+```
+
+Pick the config up by restarting the session; inspect under **Settings → MCP**:
 
 | Piece | Source | What ZCode gets |
 |-------|--------|-----------------|
 | MCP server `sermcp` | `mcp.servers` → stdio `sermcp` | All 28 `serial_*` tools, auto-connected at session start |
-| `SessionStart` | `hooks/claude/session-start.py` | Project detect, owner claim, auto-start per-DUT HTTP MCP |
-| `UserPromptSubmit` | `hooks/claude/user-prompt-submit.py` | Multi-DUT state alerts, owner-only auto-restart |
-| `PreToolUse` (matcher `Bash`) | `hooks/claude/pre-tool-use.py` | Block raw `nc`/`tio`/`screen`/`dutabo serial` from the agent |
+| `SessionStart` | `hooks/claude/session-start.py` | Project detect, owner claim, start one session-bound HTTP MCP when configured, serial-endpoint contention alert |
+| `UserPromptSubmit` | `hooks/claude/user-prompt-submit.py` | Multi-DUT state alerts, owner-only auto-restart, contention alert on the healthy path |
+| `PreToolUse` (matcher `Bash`) | `hooks/claude/pre-tool-use.py` | Block raw `nc`/`tio`/`screen`/`dutabo serial` AND every form of agent-spawned `sermcp` (`nohup`/`env`/`setsid`/`timeout` wrappers included; `--idle-timeout 0` and cross-project `TARGET_CONF` get explicit reasons) |
 
 ## One-time setup (per remote host)
 
@@ -69,16 +79,50 @@ path if this repo is checked out elsewhere.
 
 ### Cleanup without `SessionEnd`
 
-ZCode has no session-end event, and its `Stop` event fires on **every
-response end** — wiring `session-stop.py` there would kill the engine each
-turn, so it is deliberately not wired. Cleanup falls back to two existing
-mechanisms:
+Use host-managed **stdio** by default. The Agent host starts one sermcp
+process for the session and reuses it across tool calls. Closing stdin
+ends the transport; on Linux, sermcp also supervises its original parent
+process using PID plus process start time. That protects against an
+inherited pipe keeping stdin open after the host exits. Cleanup closes
+the serial connection, flushes logs and releases endpoint locks.
 
-1. The detached HTTP MCP self-exits after 10 minutes without HTTP/WS
-   activity (`--idle-timeout` default).
-2. Ownership liveness: `owner.json` records the claiming pid; once it is
-   dead, the next session's claim check takes over. Guests never
-   restart/kill anything.
+HTTP hooks start a server only when they can identify a live Agent session
+process. Known CLI ancestors (`claude`, `codex`, `zcode`) are detected;
+other launchers must provide `SERMCP_SESSION_PID` and
+`SERMCP_SESSION_START_TICKS` from `/proc/<pid>/stat` field 22. These values
+must identify the session process, never the short-lived hook shell.
+Unidentified sessions are refused detached startup; use stdio instead.
+A host process that survives individual chats cannot identify chat exit:
+use stdio EOF or a working SessionEnd integration for that boundary.
+
+Session-process exit or SIGTERM triggers server cleanup. The HTTP idle
+timeout remains an additional fallback; `/health` polls do not renew it.
+`--idle-timeout 0` disables that fallback, emits a warning and appears as
+`idle_timeout_disabled` in `/health`. It does not disable session supervision.
+Do not map ZCode's per-response `Stop` event to session cleanup.
+
+### Project exclusivity and contention alerts
+
+One serial endpoint belongs to one project at a time. Other projects
+must not subscribe or send commands while it is occupied. Endpoint lock
+files deliberately persist: only the kernel flock determines ownership;
+unlinking even an apparently stale file can split the lock across inodes.
+
+PreToolUse blocks accidental direct server launches, including wrappers,
+quoted paths and shell wrappers. This is a best-effort guard, not a shell
+sandbox. Read-only help/version/dry-run commands remain allowed.
+
+The Linux engine audits established client sockets in its current network
+namespace before serial negotiation and periodically while connected.
+A competing connection or lost lock inode closes this instance's console,
+disables automatic reconnect and latches an error in MCP state and `/health`.
+SessionStart and UserPromptSubmit surface those persistent errors and local
+socket observations. They never kill another project's process.
+
+Socket observations cannot detect clients on another host or namespace,
+and cannot prove that serial bytes were lost. Cross-host enforcement needs
+an existing upstream access-control mechanism or a shared authoritative
+resource manager. No ser2net code changes are required by this implementation.
 
 ### Statusline substitute
 
@@ -96,7 +140,7 @@ Python fallback is `python3 hooks/codex/serial-status.py --watch`.
 ## Skills / commands / subagent
 
 Workspace config covers MCP + hooks only. The repo's `skills/`
-(`serial-debug`, `embedded-debug`), `commands/debug-boot.md`, and
+(`embedded-debug`), `commands/debug-boot.md`, and
 `agents/serial-boot-monitor.md` follow plugin-layout conventions, so they
 are discovered when the repo is installed as a ZCode plugin (local-directory
 marketplace; the `.claude-plugin/` manifest is recognized as a compat

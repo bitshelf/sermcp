@@ -21,7 +21,9 @@ if str(_HOOK_DIR) not in sys.path:
 
 from lib import (
     _is_embedded_server,
+    agent_session_process,
     check_mcp_alive,
+    detect_endpoint_contention,
     find_project_dir,
     http_health_ok,
     pid_anchored_to_project,
@@ -80,6 +82,13 @@ def _restart_mcp(project_dir: str) -> None:
     """
     import subprocess
 
+    try:
+        config = json.loads((Path(project_dir) / ".mcp.json").read_text())
+        if config.get("mcpServers", {}).get("sermcp", {}).get("command"):
+            print("[sermcp] stdio server is managed by the Agent host; reconnect its MCP transport.", file=sys.stderr)
+            return
+    except (OSError, ValueError, TypeError):
+        pass
     mcp_port = _mcp_http_port(project_dir)
     if mcp_port is None:
         print(
@@ -92,6 +101,10 @@ def _restart_mcp(project_dir: str) -> None:
 
     # Healthy → do nothing (never kill a working server).
     if http_health_ok(mcp_port, timeout=2.0):
+        return
+
+    if agent_session_process() is None:
+        print("[sermcp] Cannot bind HTTP restart to an Agent session; use stdio. Existing processes are untouched.", file=sys.stderr)
         return
 
     binary = resolve_plugin_binary("sermcp")
@@ -147,11 +160,13 @@ def _critical_alerts(duts: list) -> list:
 
 def main():
     # Session identity for ownership gating (multi-agent isolation).
-    session_id = read_hook_payload().get("session_id")
+    payload = read_hook_payload()
+    session_id = payload.get("session_id")
 
     # Display path: no /dev/shm cross-project fallback — an agent must never
     # alert about (or restart the MCP of) another project.
-    project_dir = find_project_dir(allow_lock_fallback=False)
+    cwd = payload.get("cwd")
+    project_dir = find_project_dir(allow_lock_fallback=False, start=Path(cwd) if isinstance(cwd, str) and cwd else None)
     if not project_dir:
         print(json.dumps({"continue": True}))
         sys.exit(0)
@@ -195,7 +210,7 @@ def main():
                 if may_restart:
                     _restart_mcp(project_dir)
                     print(json.dumps({
-                        "systemMessage": "[TARGET] ser2net OK, MCP reconnected."
+                        "systemMessage": "[TARGET] MCP server is down; recovery was requested. Reconnect the host-managed MCP transport if it remains unavailable."
                     }))
                 else:
                     print(json.dumps({
@@ -224,6 +239,10 @@ def main():
 
     # ── Live server: alert on critical states from the inventory ─────────
     alerts = _critical_alerts(duts)
+
+    # Audit even a healthy inventory; socket conflicts require attention.
+    contention = detect_endpoint_contention(project_dir)
+
     if alerts:
         crashed = any(d.get("state") == "crashed" for d in duts)
         dut_off = any(d.get("state") == "DUT-off" for d in duts)
@@ -263,7 +282,12 @@ def main():
                 "DUT-off — no serial output for extended period. "
                 'Try serial_send_command("echo ping") or serial_reset().'
             )
+        alerts.extend(contention)
         print(json.dumps({"systemMessage": " | ".join(alerts)}))
+        sys.exit(0)
+
+    if contention:
+        print(json.dumps({"systemMessage": " | ".join(contention)}))
         sys.exit(0)
 
     print(json.dumps({"continue": True}))

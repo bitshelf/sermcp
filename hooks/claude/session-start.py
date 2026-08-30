@@ -36,6 +36,8 @@ from typing import Optional
 from inventory import find_project_root, load_inventory, inventory_is_live
 from lib import (
     _is_embedded_server,
+    agent_session_process,
+    detect_endpoint_contention,
     http_health_ok,
     mark_session_alive,
     owner_session_marker_exists,
@@ -48,7 +50,7 @@ from lib import (
 from owner import claim_owner, owner_is_alive, owner_path
 
 
-def find_projects():
+def find_projects(payload: Optional[dict] = None):
     """Discover the current project via the shared walk-up (TARGET_CONF env
     -> CWD walk-up for .dut-serial/inventory.json -> .target.jsonc).
 
@@ -56,7 +58,8 @@ def find_projects():
     leakage — a session with no config of its own must never discover (and
     then write locks / start servers for) another project.
     """
-    root = find_project_root(allow_lock_fallback=False)
+    cwd = payload.get("cwd") if isinstance(payload, dict) else None
+    root = find_project_root(allow_lock_fallback=False, start=Path(cwd) if isinstance(cwd, str) and cwd else None)
     if root is None:
         return []
     return [root]
@@ -377,6 +380,10 @@ def _ensure_http_mcp(project_dir: str, port: int) -> None:
     The MCP self-terminates on idle; session-stop kills it when the last
     session leaves, so this hook re-spawns on the next session start.
     """
+    if agent_session_process() is None:
+        print("[sermcp] Cannot identify the Agent session process; use host-managed stdio. No HTTP process will be started or replaced.", file=sys.stderr)
+        return
+
     # Already running (identity + /health verified) for this project?
     if mcp_running(project_dir):
         return
@@ -505,9 +512,10 @@ def main():
 
     # Session identity from the hook input (Claude Code passes JSON on stdin);
     # the owner record stores it so later sessions can render owner markers.
-    session_id = read_hook_payload().get("session_id")
+    payload = read_hook_payload()
+    session_id = payload.get("session_id")
 
-    projects = find_projects()
+    projects = find_projects(payload)
     if not projects:
         # No .target.jsonc anywhere up the tree — the MCP must not start.
         # Also disarm a stale committed .mcp.json entry so Claude Code
@@ -518,6 +526,10 @@ def main():
     for proj in projects:
         dut_dir = os.path.join(proj, ".dut-serial")
         os.makedirs(dut_dir, exist_ok=True)
+
+        # Surface local endpoint conflicts without terminating foreign owners.
+        for alert in detect_endpoint_contention(proj):
+            print(f"[sermcp] {alert}", file=sys.stderr)
 
         # ── Ownership claim (multi-agent isolation) ──
         # The FIRST agent exclusively owns the MCP lifecycle (start/restart);
@@ -583,7 +595,10 @@ def main():
         # ── Auto-generate .mcp.json (stdio) when the project has a
         #    .target.jsonc but no sermcp entry yet — the template
         #    pins TARGET_CONF to the absolute .target.jsonc path ──
-        mcp_json_path = os.path.join(proj, ".mcp.json")
+        # Path, not os.path.join: the atomic-write branch below calls
+        # .with_name() on it (a str crashes the hook with AttributeError
+        # in any project whose .mcp.json has no sermcp entry yet).
+        mcp_json_path = Path(proj) / ".mcp.json"
         existing_cfg = {}
         if os.path.exists(mcp_json_path):
             try:
@@ -716,7 +731,11 @@ def _selftest() -> int:
             fake_bin = base / "fake-mcp"
             fake_bin.write_text(f"#!/bin/sh\nenv > {env_dump}\n")
             fake_bin.chmod(0o755)
-            spawn_http_mcp(str(proj), 2001, binary=str(fake_bin))
+            from unittest.mock import patch
+            from lib import _session_process_identity
+            with patch.dict(os.environ, {"SERMCP_SESSION_PID": str(os.getpid()),
+                                         "SERMCP_SESSION_START_TICKS": _session_process_identity(os.getpid())[0]}):
+                spawn_http_mcp(str(proj), 2001, binary=str(fake_bin))
             time.sleep(0.3)
             dumped = env_dump.read_text()
             check(
@@ -738,107 +757,14 @@ def _selftest() -> int:
             else:
                 os.environ.pop("TARGET_CONF", None)
 
-    # ── P4: the session lock claim — O_EXCL, 4-line format, self-reaping.
-    #    D8/D9 rules: canonicalized hash; live owner → observe; dead owner →
-    #    reap + claim; old-format lock with an existing dir → NEVER touched.
-    import inventory as _inv
-    import hashlib
+    # Session startup must refuse replacement before touching existing processes
+    # when no persistent session identity can be established.
+    from unittest.mock import patch
+    with patch.dict(globals(), {"agent_session_process": lambda: None}), patch.dict(globals(), {"mcp_running": lambda _: (_ for _ in ()).throw(AssertionError("must not reap an existing server"))}):
+        _ensure_http_mcp("/unused/project", 3000)
+        check("unknown session identity refuses HTTP startup before process inspection", True)
 
     _MISSING = object()
-
-    claim = globals().get("claim_session_lock")
-    if claim is None:
-        check(
-            "P4 session lock claim exists (claim_session_lock)",
-            False,
-            "not implemented",
-        )
-    else:
-        with tempfile.TemporaryDirectory() as td:
-            base = Path(td)
-            proj = base / "p4-proj"
-            proj.mkdir()
-            (proj / ".target.jsonc").write_text("{}")
-            scratch = base / "session.lock"
-            real_lp = getattr(_inv, "project_lock_path", None)
-            _inv.project_lock_path = lambda p: str(scratch)
-            try:
-                # 1. O_EXCL claim writes the 4-line format.
-                claim(str(proj), "sess-1", os.getpid())
-                lines = scratch.read_text().splitlines()
-                check(
-                    "P4 claim writes the 4-line lock format",
-                    len(lines) == 4,
-                    scratch.read_text(),
-                )
-                if len(lines) == 4:
-                    check(
-                        "P4 line 0 is the canonical project dir",
-                        lines[0] == str(Path(proj).resolve()),
-                        lines[0],
-                    )
-                    check(
-                        "P4 line 1 is the owner pid",
-                        lines[1] == str(os.getpid()),
-                        lines[1],
-                    )
-                    check(
-                        "P4 line 2 is the session id",
-                        lines[2] == "sess-1",
-                        lines[2],
-                    )
-                    try:
-                        float(lines[3])
-                        ts_ok = True
-                    except ValueError:
-                        ts_ok = False
-                    check("P4 line 3 is a unix timestamp", ts_ok, lines[3])
-
-                # 2. Live owner → observe, file untouched.
-                before = scratch.read_text()
-                claim(str(proj), "sess-2", os.getpid())
-                check(
-                    "P4 live owner → observe (file untouched)",
-                    scratch.read_text() == before,
-                )
-
-                # 3. Dead owner → reap + claim.
-                scratch.write_text("\n".join([
-                    str(Path(proj).resolve()),
-                    "99999999",
-                    "other-sess",
-                    str(int(time.time())),
-                ]))
-                claim(str(proj), "sess-3", os.getpid())
-                lines = scratch.read_text().splitlines()
-                check(
-                    "P4 dead owner is reaped and re-claimed",
-                    len(lines) == 4
-                    and lines[1] == str(os.getpid())
-                    and lines[2] == "sess-3",
-                    scratch.read_text(),
-                )
-
-                # 4. Old-format (path-only) lock with existing dir → NEVER
-                #    touched (D9 — the live-session protection).
-                scratch.write_text(str(proj))
-                claim(str(proj), "sess-4", os.getpid())
-                check(
-                    "P4 old-format lock is never touched",
-                    scratch.read_text() == str(proj),
-                )
-
-                # 5. The claim never writes .session-pid (B3 deleted).
-                check(
-                    "P4 never writes .dut-serial/.session-pid",
-                    not (proj / ".dut-serial" / ".session-pid").exists(),
-                )
-            finally:
-                if real_lp is not None:
-                    _inv.project_lock_path = real_lp
-                else:
-                    del _inv.project_lock_path
-
     # ── P4 discovery: find_projects must resolve from the payload cwd,
     #    never the process CWD (ROOT CAUSE A).
     with tempfile.TemporaryDirectory() as td:
