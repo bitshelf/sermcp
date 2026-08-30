@@ -1,0 +1,51 @@
+# dsh-dut bundle patch — sermcp 的 dsh server plugin。
+#
+# `dsh plugin --profile dsh-tui add <this-package>` pnpm-installs the package
+# into the profile and the CLI's reconcile step appends it to
+# `dsh.profile.bundles` (this package.json declares `dsh.bundle.patch`). At
+# boot, app-boot applies every bundle's patch list in bundle order over the
+# empty root, so these inserts land AFTER the dsh-tui bundle that provides
+# the `tuiStatus` service and the base bundle that provides `tools`.
+# Stock dsh-tui from npm suffices — no patched dsh-tui build is required
+# (the statusline renders via the official `tuiStatus` seam, prompt-above).
+#
+# 架构（用户约定，勿改）：
+#   - `dut-mcp`（role: mcp）= 当前 MCP 的 SERVER plugin 行：负责
+#     sermcp 服务器进程的生命周期（发现项目、自动拉起/复用、
+#     活性门控、按项目确定性端口），并以 dsh 的 server-plugin 命名契约
+#     `mcp__<serverName>__<tool>` 把全部 `serial_*` 工具注册到 `ctx.tools`
+#     —— 与官方 @deepseek-ai/dsh-mcp-client 行、dsh-tui /mcp 面板同契约。
+#   - `dut-statusline`（role: statusline）= 反应式 client 半边：不驱动
+#     服务器，只反映 MCP 状态 —— fs.watch 服务器原子重写的
+#     inventory.json，状态迁移毫秒级重渲染。
+#
+# 为什么不用官方 @deepseek-ai/dsh-mcp-client 行：该包是 rc 线版本，运行时
+# 依赖钉死在 rc 版 dsh 核心（@deepseek-ai/dsh-tools 等）上；在 alpha 线
+# profile 上 pnpm 会装进第二份不兼容的 dsh 核心，dsh/dsh-tui 一升级就坏
+# —— 正是本 bundle 要规避的升级失效。本桥接只 import node 内置模块 +
+# @modelcontextprotocol/sdk（稳定协议库），dsh/dsh-tui 升级不受影响
+# （详见 README「升级兼容性」）。
+#
+# Neither row does anything outside a configured project (a directory with
+# `.target.jsonc`, discovered by walk-up) — the plugin is dormant in
+# non-project workspaces and activates on `tui/session-switched` into a
+# project.
+#
+# Override from the profile's own cordis.patch.yml by re-inserting the same
+# id with a config (the profile layer wins):
+#   - id: dut-mcp
+#     config:
+#       serverName: dut      # tool namespace: mcp__dut__serial_*
+#       toolPattern: '^serial_(get_|list_)'   # only register read-only tools
+- insert:
+    - id: dut-statusline
+      name: 'dsh-dut'
+      inject: [tuiStatus]
+      config:
+        role: statusline
+
+    - id: dut-mcp
+      name: 'dsh-dut'
+      inject: [tools]
+      config:
+        role: mcp
