@@ -17,6 +17,10 @@ crash, disappearing serial output, or incorrect boot-stage detection. Use
 `serial-debug` for a routine status check, command, restart, U-Boot operation,
 button action, or flash plan.
 
+Tool names below are written without a server namespace. MCP clients expose
+them namespaced (for example `mcp__sermcp__serial_get_state` in Claude Code
+and pi); call the names your harness advertises.
+
 ## Activation and evidence
 
 Search from the current directory upward for `.target.jsonc`. If it is absent,
