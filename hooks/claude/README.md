@@ -8,7 +8,7 @@ Serial console monitoring hooks — auto-start MCP server + real-time statusline
 |------|---------|----------|
 | `session-start.py` | Session start | Detect `.target.jsonc` → `dutabo list --json` bootstrap → one project MCP |
 | `statusline.py` | 1s refresh | Render `.dut-serial/inventory.json` `state_text` verbatim (never execs) |
-| `pre-tool-use.py` | Before Bash | Intercept raw serial access → prompt MCP (fail-closed without inventory) |
+| `pre-tool-use.py` | Before Bash | Enforce serial access and lifecycle policy (persistent starts and agent stops allowed; bare stop/resume human-only) |
 | `user-prompt-submit.py` | Before prompt | Alert on DUT-off/disconnected/crashed |
 | `session-stop.py` | Session stop | Kill saved session PID, clean sentinels + locks |
 | `lib.py` | Shared | find_project_dir, check_mcp_alive |
@@ -35,3 +35,10 @@ is read-only. Occupancy is the state that session acts on, not a cosmetic
 mask: `serial_get_state` reports it as the primary `state` with the device
 state alongside in `device_state`, and the inventory keeps the raw device
 states.
+
+See [the shared lifecycle policy](../lifecycle-policy.md).
+
+Agent persistent startup uses `dutabo start --agent`; plain `dutabo start`
+is human-only and still clears a previous stop without requiring resume.
+Agent stopping uses `dutabo stop --agent` (no startup-policy change); plain
+`dutabo stop` is human-only and persists the stop inhibit.

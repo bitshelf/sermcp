@@ -71,8 +71,7 @@ def _reap_git_cache_lock(lock_dir) -> bool:
     The writer stamps its pid in `owner.pid` inside the lock dir. A lock
     with a LIVE writer is never touched (regardless of age); one whose
     writer died is reclaimed immediately — no waiting out the freshness
-    window. Legacy lock dirs without an owner.pid stay to the age-based
-    fallback (returned False).
+    window. Unverifiable owners are not reclaimed.
     """
     owner_file = Path(lock_dir) / "owner.pid"
     try:
@@ -97,12 +96,7 @@ def _refresh_git_cache_async() -> None:
     lock_dir = cache + ".lock"
     if os.path.isdir(lock_dir):
         if not _reap_git_cache_lock(lock_dir):
-            try:
-                if time.time() - os.path.getmtime(lock_dir) < 15:
-                    return
-                os.rmdir(lock_dir)
-            except OSError:
-                return
+            return
     try:
         os.mkdir(lock_dir)
         # Stamp the writer so a later invocation can reclaim this lock the
@@ -417,6 +411,8 @@ def _selftest() -> int:
             "schema_version": 1,
             "written_by": "mcp-server",
             "mcp_pid": os.getpid(),
+            "heartbeat_secs": 30,
+            "written_at_unix": int(time.time()),
             "duts": duts,
         }
         inv_path = inv_dir / "inventory.json"
@@ -509,6 +505,8 @@ def _selftest() -> int:
             "schema_version": 1,
             "written_by": "mcp-server",
             "mcp_pid": os.getpid(),
+            "heartbeat_secs": 30,
+            "written_at_unix": int(time.time()),
             "duts": [{
                 "dut_name": dut_name,
                 "state": "active",
