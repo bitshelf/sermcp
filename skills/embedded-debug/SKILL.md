@@ -17,6 +17,10 @@ crash, disappearing serial output, or incorrect boot-stage detection. Use
 `serial-debug` for a routine status check, command, restart, U-Boot operation,
 button action, or flash plan.
 
+Tool names below are written without a server namespace. MCP clients expose
+them namespaced (for example `mcp__sermcp__serial_get_state` in Claude Code
+and pi); call the names your harness advertises.
+
 ## Activation and evidence
 
 Search from the current directory upward for `.target.jsonc`. If it is absent,
@@ -66,8 +70,8 @@ For a clean reset-and-monitor run:
    `serial_get_state`.
 
 For U-Boot diagnosis, call `serial_enter_uboot({"restart":"auto"})`, verify
-that the returned state is U-Boot, then use `serial_uboot_command`. Never use
-`serial_send_command` at the U-Boot prompt.
+that the returned state is U-Boot, then use `serial_exec(mode=uboot)`. Never use
+`serial_exec(mode=shell)` at the U-Boot prompt.
 
 Use boot-stage learning only when the task calls for adapting detection to a
 new device or correcting classifications. `serial_load_reference` requires an

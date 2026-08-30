@@ -220,15 +220,10 @@ pub fn plan_integrations(
     if harnesses.contains(&Harness::Pi)
         && let Some(bytes) = available.get("pi-extensions/sermcp/index.ts")
     {
+        // The pi extension registers the server with pi's built-in MCP
+        // support (pi >= 1.0) and imports nothing at runtime, so it needs no
+        // package.json and no npm-installed node_modules.
         files.insert(".pi/extensions/sermcp/index.ts".into(), bytes.clone());
-        files.insert(
-            ".pi/extensions/sermcp/package.json".into(),
-            serde_json::to_vec_pretty(&json!({
-                "name":"sermcp-project-bridge", "private":true,
-                "dependencies":{"@modelcontextprotocol/sdk":"^1.30.0"}
-            }))
-            .unwrap(),
-        );
     }
     if harnesses.contains(&Harness::DeepSeek) {
         let index = available
@@ -417,20 +412,20 @@ impl InstallPlan {
             }
         }
         let manifest = serde_json::to_vec(&self.manifest).map_err(|e| e.to_string())?;
-        std::fs::write(
-            local_path(&self.root, ".sermcp/project-setup.json")?,
-            manifest,
-        )
-        .map_err(|e| e.to_string())
+        let manifest_path = local_path(&self.root, ".sermcp/project-setup.json")?;
+        // A pi-only selection has no other .sermcp/ write, so the directory
+        // may not exist yet.
+        std::fs::create_dir_all(manifest_path.parent().unwrap()).map_err(|e| e.to_string())?;
+        std::fs::write(manifest_path, manifest).map_err(|e| e.to_string())
     }
 }
 
 /// Resolve extension dependencies for the selected agents' harnesses.
+///
+/// Only the DeepSeek plugin imports a runtime package (the MCP SDK); the pi
+/// extension uses pi's built-in MCP support and installs nothing.
 pub fn install_dependencies_for(root: &Path, agents: &[String]) -> Result<(), String> {
     let harnesses: Vec<Harness> = agents.iter().filter_map(|a| harness_for_agent(a)).collect();
-    if harnesses.contains(&Harness::Pi) {
-        install_dependencies(root, ".pi/extensions/sermcp", "pi")?;
-    }
     if harnesses.contains(&Harness::DeepSeek) {
         install_dependencies(root, ".dsh/sermcp", "deepseek")?;
     }
@@ -587,5 +582,30 @@ mod tests {
         std::fs::write(&path, "my local work").unwrap();
         assert!(plan_integrations(root, &selection(&["claude-code"])).is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "my local work");
+    }
+
+    #[test]
+    fn pi_integration_is_dependency_free() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let plan = plan_integrations(root, &selection(&["pi.dev"]))
+            .unwrap()
+            .expect("pi.dev maps to a known harness");
+        assert!(plan.writes.contains_key(".pi/extensions/sermcp/index.ts"));
+        assert!(
+            !plan
+                .writes
+                .contains_key(".pi/extensions/sermcp/package.json"),
+            "the pi extension uses built-in MCP and needs no npm dependencies"
+        );
+        plan.apply().unwrap();
+        assert!(root.join(".pi/skills/embedded-debug/SKILL.md").is_file());
+        assert!(root.join(".pi/extensions/sermcp/index.ts").is_file());
+        assert!(!root.join(".pi/extensions/sermcp/package.json").exists());
+        // Returns without an npm install for the pi harness. The removed
+        // installer created this log before spawning npm, so its absence
+        // guards the dependency-free path even when npm is unavailable.
+        install_dependencies_for(root, &["pi.dev".to_string()]).unwrap();
+        assert!(!root.join(".sermcp/pi-install.log").exists());
     }
 }

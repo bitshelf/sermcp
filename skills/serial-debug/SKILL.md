@@ -14,6 +14,10 @@ Use this skill for direct serial-console operations. Use `embedded-debug`
 instead when the main task is diagnosing a boot hang, kernel crash, or changing
 boot-stage detection.
 
+Tool names below are written without a server namespace. MCP clients expose
+them namespaced (for example `mcp__sermcp__serial_exec` in Claude Code and
+pi); call the names your harness advertises.
+
 ## Activation boundary
 
 Search from the current directory upward for `.target.jsonc` before calling a
@@ -54,12 +58,12 @@ agent needs write access; it must never displace a live owner.
 | --- | --- |
 | Check whether the device is online | `serial_get_state({})` |
 | Read recent serial output | `serial_get_logs({"archive":0,"lines":50})` |
-| Run a Linux shell command | `serial_send_command({"command":"...","timeout":90})` |
-| Restart Linux through its shell | `serial_send_command({"command":"reboot","timeout":5})` |
+| Run a Linux shell command | `serial_exec({"command":"...","mode":"shell","timeout":90})` |
+| Restart Linux through its shell | `serial_exec({"command":"reboot","mode":"shell","timeout":5})` |
 | Restart through configured reset control | `serial_reset({"wait_boot":true})` |
 | Power the device off and back on | `serial_power_cycle({"wait_boot":true})` |
 | Enter U-Boot | `serial_enter_uboot({"restart":"auto"})` |
-| Run a command at the U-Boot prompt | `serial_uboot_command({"command":"...","timeout":15})` |
+| Run a command at the U-Boot prompt | `serial_exec({"command":"...","mode":"uboot","timeout":15})` |
 | Wait for serial text | `serial_wait_pattern({"pattern":"...","timeout":60})` |
 | Press a configured button | `serial_button({"button":"...","action":"pulse"})` |
 | Inspect a firmware operation | `serial_flash_plan({"image_path":"...","image_type":"full"})` |
@@ -67,14 +71,14 @@ agent needs write access; it must never displace a live owner.
 `serial_flash_plan` only describes the planned operation; it does not flash the
 device. Use `image_type: "kernel"` for a kernel or boot image.
 
-For `serial_send_command`, treat the returned `output`, `exit_code`, and
+For `serial_exec(mode=shell)`, treat the returned `output`, `exit_code`, and
 `timed_out` fields as the result. A queued write by itself does not prove that
 the device received or completed the command. Use `serial_send_raw` only when an
 exact byte sequence is required and a structured command tool cannot do the
 job.
 
-At a U-Boot prompt, use `serial_uboot_command`; the Linux-shell marker protocol
-used by `serial_send_command` does not work there. The configured
+At a U-Boot prompt, use `serial_exec(mode=uboot)`; the Linux-shell marker protocol
+used by `serial_exec(mode=shell)` does not work there. The configured
 `uboot.interrupt_char` is the byte used to interrupt autoboot. `ctrl_c` means
 byte `0x03`.
 
