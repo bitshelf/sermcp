@@ -1,0 +1,124 @@
+# GitCode Actions CI — mirror of .github/workflows/ci.yml.
+#
+# PREREQUISITE: GitCode's "code-based pipeline" capability is NOT on by
+# default. GitCode's own quick-start lists "contact customer service to
+# have the pipeline capability enabled" as its first prerequisite. Until
+# that happens the workflow files are accepted and listed as `active`
+# (`GET /api/v8/repos/:owner/:repo/actions/workflows`) but no job is ever
+# scheduled — pushes and tags produce no runs, no artifacts, no releases.
+#
+# GitCode resolves `uses:` against its own plugin registry, so `actions/*`
+# and `dtolnay/rust-toolchain@*` are unavailable here: the built-in
+# `checkout` plugin replaces actions/checkout, and the Rust toolchain comes
+# from the runner image (Rust stable via rustup is preinstalled on
+# ubuntu-latest) instead of a setup action.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  repository: read
+
+jobs:
+  build:
+    name: Format, lint, test, static build
+    runs-on: [ubuntu-latest, x64, small]
+    # clippy --all-targets, two test suites, the musl build and then a
+    # `cargo install` that rebuilds through a second profile — on a 2-core
+    # runner that is a long tail, so keep generous headroom above it.
+    timeout-minutes: 150
+    steps:
+      - name: Checkout
+        uses: checkout
+
+      # The runner ships "latest stable", which the project outgrew once
+      # (Cargo.toml requires 1.98); assert instead of assuming.
+      - name: Ensure Rust toolchain
+        run: |
+          set -euo pipefail
+          rustc --version
+          cargo --version
+          have=$(rustc --version | sed -E 's/^rustc ([0-9]+\.[0-9]+).*/\1/')
+          if [ "$(printf '%s\n%s\n' 1.98 "${have}" | sort -V | head -1)" != "1.98" ]; then
+            echo "active toolchain ${have} is older than 1.98, updating stable"
+            rustup update stable
+          fi
+          rustup component add rustfmt clippy
+          rustup target add x86_64-unknown-linux-musl
+
+      # tracing-perfetto-sdk-schema compiles perfetto_trace.proto via
+      # prost-build at build time, which requires a protoc binary.
+      - name: Install protoc
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq protobuf-compiler
+          protoc --version
+
+      # ── Lint gates (fail the PR before tests run) ─────────────────
+      - name: Format gate
+        working-directory: sermcp
+        run: cargo fmt --check
+
+      - name: Clippy gate (deny all warnings)
+        working-directory: sermcp
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      # ── Tests ─────────────────────────────────────────────────────
+      - name: Unit tests
+        working-directory: sermcp
+        run: cargo test --locked --lib -- --test-threads=1
+
+      - name: Smoke tests
+        working-directory: sermcp
+        run: cargo test --locked --test smoke -- --test-threads=1
+
+      # ── Static (musl) build gate ─────────────────────────────────
+      - name: Static musl build
+        working-directory: sermcp
+        run: cargo musl
+
+      # Exercises the install path DEPLOY.md documents for users, and asserts
+      # the result really is static. Paths are taken from the step's own CWD
+      # (`working-directory: sermcp` above already depends on the checkout
+      # landing here) rather than a platform-specific variable.
+      - name: Verify static installation
+        run: |
+          set -euo pipefail
+          repo_root="$(pwd)"
+          install_root="${RUNNER_TEMP:-/tmp}/sermcp-install"
+          cargo install --git "file://${repo_root}" --locked \
+            --target x86_64-unknown-linux-musl \
+            --target-dir "${repo_root}/sermcp/target" \
+            --root "${install_root}" --force
+          for bin in sermcp dutabo; do
+            executable="${install_root}/bin/${bin}"
+            readelf -l "${executable}" > "${install_root}/${bin}.headers"
+            readelf -d "${executable}" > "${install_root}/${bin}.dynamic"
+            if grep -q INTERP "${install_root}/${bin}.headers" || \
+               grep -q NEEDED "${install_root}/${bin}.dynamic"; then
+              echo "Dynamic dependency found in ${bin}" >&2
+              exit 1
+            fi
+            "${executable}" --help > /dev/null
+          done
+
+      - name: Stage CI artifacts
+        run: |
+          set -euo pipefail
+          mkdir -p ci-artifacts
+          cp sermcp/target/x86_64-unknown-linux-musl/release/sermcp ci-artifacts/
+          cp sermcp/target/x86_64-unknown-linux-musl/release/dutabo ci-artifacts/
+          ls -lh ci-artifacts
+
+      # Also a liveness probe: an artifact appearing proves the GitCode
+      # Actions engine actually executes jobs for this repository.
+      - name: Upload static binaries
+        uses: upload-artifact
+        with:
+          name: ci-static-binaries
+          path: ci-artifacts/

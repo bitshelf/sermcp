@@ -1,0 +1,355 @@
+# GitCode Actions release pipeline — mirror of .github/workflows/release.yml
+# for the GitCode mirror at https://gitcode.com/JZ_Loh/sermcp.
+#
+# PREREQUISITE: see ci.yml — GitCode's pipeline capability is not enabled
+# by default and has to be requested from customer service first. Nothing
+# here runs until that is granted.
+#
+# Two ways in:
+#   * tag push matching `v*` — the normal path, same trigger as GitHub;
+#   * workflow_dispatch with an explicit version — the tag does not exist on
+#     GitCode yet, so this path creates and pushes it from the triggered commit.
+#
+# Publishing goes through the GitCode OpenAPI v5 with the built-in
+# ATOMGIT_TOKEN (scoped by `permissions.repository: write`), so no PAT secret
+# has to be configured:
+#   POST /repos/:owner/:repo/releases                     -> create the release
+#   GET  /repos/:owner/:repo/releases/:tag/upload_url     -> signed OBS URL
+#        ?file_name=<name>                                  + headers to replay
+# `softprops/action-gh-release` and friends are NOT usable on GitCode:
+# `uses:` resolves against GitCode's own plugin registry only, so the release
+# is created and filled with curl instead.
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '要发布的版本号，例如 v0.4.2（会在当前提交上创建并推送该 tag）'
+        required: true
+        type: string
+
+permissions:
+  repository: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: [ubuntu-latest, x64, medium]
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Both targets are STATIC musl builds — they run on any glibc, and
+          # x86_64 musl is the artifact cargo-binstall resolves by default.
+          - target: x86_64-unknown-linux-musl
+          - target: aarch64-unknown-linux-musl
+    steps:
+      - name: Checkout
+        uses: checkout
+
+      - name: Resolve release version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [ "${ATOMGIT_EVENT_NAME}" = "workflow_dispatch" ]; then
+            version="${INPUT_VERSION}"
+          else
+            version="${ATOMGIT_REF_NAME}"
+          fi
+          case "${version}" in
+            v[0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "unexpected release version: '${version}'" >&2; exit 1 ;;
+          esac
+          echo "RELEASE_VERSION=${version}" >> "$ATOMGIT_ENV"
+          echo "release version: ${version}"
+
+      - name: Ensure Rust toolchain
+        run: |
+          set -euo pipefail
+          rustc --version
+          have=$(rustc --version | sed -E 's/^rustc ([0-9]+\.[0-9]+).*/\1/')
+          if [ "$(printf '%s\n%s\n' 1.98 "${have}" | sort -V | head -1)" != "1.98" ]; then
+            echo "active toolchain ${have} is older than 1.98, updating stable"
+            rustup update stable
+          fi
+          rustup target add "${{ matrix.target }}"
+
+      - name: Install build prerequisites
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          # protoc: tracing-perfetto-sdk-schema compiles perfetto_trace.proto
+          # via prost-build at build time. gcc-aarch64-linux-gnu: drives the
+          # arm64 link only — the binary is still static musl (see
+          # sermcp/.cargo/config.toml).
+          packages="protobuf-compiler"
+          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-musl" ]; then
+            packages="${packages} gcc-aarch64-linux-gnu"
+          fi
+          sudo apt-get install -y -qq ${packages}
+          protoc --version
+          # Optional, only used by the smoke test below.
+          sudo apt-get install -y -qq qemu-user-static \
+            || echo "qemu-user-static unavailable, arm64 smoke test will be skipped"
+
+      - name: Build
+        working-directory: sermcp
+        run: |
+          set -euo pipefail
+          cargo build --release --locked --target "${{ matrix.target }}"
+
+      - name: Verify build has no dynamic dependencies
+        working-directory: sermcp
+        run: |
+          set -euo pipefail
+          for bin in sermcp dutabo; do
+            exe="target/${{ matrix.target }}/release/${bin}"
+            if readelf -l "${exe}" | grep -q INTERP || readelf -d "${exe}" | grep -q NEEDED; then
+              echo "dynamic dependency found in ${bin}" >&2
+              exit 1
+            fi
+          done
+
+      # Executing is the only check that catches a musl/glibc mismatch that
+      # readelf cannot see. arm64 needs qemu-user-static (installed above).
+      - name: Smoke test binaries
+        working-directory: sermcp
+        run: |
+          set -euo pipefail
+          exe="target/${{ matrix.target }}/release/sermcp"
+          if [ "${{ matrix.target }}" = "x86_64-unknown-linux-musl" ]; then
+            "${exe}" --help > /dev/null
+            target/${{ matrix.target }}/release/dutabo --help > /dev/null
+          elif command -v qemu-aarch64-static > /dev/null; then
+            qemu-aarch64-static "${exe}" --help > /dev/null
+            qemu-aarch64-static target/${{ matrix.target }}/release/dutabo --help > /dev/null
+          else
+            echo "no qemu-aarch64-static, skipping arm64 execution test"
+          fi
+
+      # ── cargo-binstall packages: name_version_target.tar.gz ────────
+      # (binstall's default pkg-url template resolves exactly this name,
+      # so `cargo binstall --git <repo>` works with zero configuration.)
+      # Bare binaries are kept alongside for direct-download users.
+      - name: Package
+        working-directory: sermcp
+        run: |
+          set -euo pipefail
+          target="${{ matrix.target }}"
+          release_dir="target/${target}/release"
+          tarball="sermcp_${RELEASE_VERSION}_${target}.tar.gz"
+          mkdir -p dist
+          tar -czf "dist/${tarball}" -C "${release_dir}" sermcp dutabo
+          cp "${release_dir}/sermcp" "dist/sermcp-${target}"
+          cp "${release_dir}/dutabo" "dist/dutabo-${target}"
+          # Listed explicitly: a `./*` glob here would race the redirect that
+          # creates the checksum file itself.
+          (
+            cd dist
+            sha256sum "${tarball}" "sermcp-${target}" "dutabo-${target}" \
+              > "SHA256SUMS-${target}"
+          )
+          ls -lh dist
+          cat "dist/SHA256SUMS-${target}"
+
+      - name: Upload artifacts
+        uses: upload-artifact
+        with:
+          name: release-${{ matrix.target }}
+          path: sermcp/dist/
+
+  publish:
+    name: Publish GitCode release
+    needs: build
+    runs-on: [ubuntu-latest, x64, small]
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: checkout
+
+      - name: Resolve release version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [ "${ATOMGIT_EVENT_NAME}" = "workflow_dispatch" ]; then
+            version="${INPUT_VERSION}"
+          else
+            version="${ATOMGIT_REF_NAME}"
+          fi
+          case "${version}" in
+            v[0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "unexpected release version: '${version}'" >&2; exit 1 ;;
+          esac
+          echo "RELEASE_VERSION=${version}" >> "$ATOMGIT_ENV"
+          echo "release version: ${version}"
+
+      - name: Download x86_64 artifacts
+        uses: download-artifact
+        with:
+          name: release-x86_64-unknown-linux-musl
+          path: dist/
+
+      - name: Download aarch64 artifacts
+        uses: download-artifact
+        with:
+          name: release-aarch64-unknown-linux-musl
+          path: dist/
+
+      - name: Verify checksums
+        run: |
+          set -euo pipefail
+          # The artifact plugins may nest the payload one level under `path`;
+          # flatten so every file lands directly in dist/.
+          find dist -mindepth 2 -type f -exec mv -f {} dist/ \;
+          find dist -mindepth 1 -type d -exec rm -rf {} +
+          cd dist
+          for sum in SHA256SUMS-*; do
+            sha256sum -c "${sum}"
+          done
+          rm -f SHA256SUMS-*
+          sha256sum ./* > SHA256SUMS
+          ls -lh
+          cat SHA256SUMS
+
+      # A tag push already has the tag; a manual run has to create it, which
+      # is also what makes the pipeline the bootstrap path on GitCode.
+      - name: Ensure the release tag exists
+        run: |
+          set -euo pipefail
+          version="${RELEASE_VERSION}"
+          remote="https://oauth2:${ATOMGIT_TOKEN}@${ATOMGIT_SERVER_URL#https://}/${ATOMGIT_REPOSITORY}.git"
+          if [ "${ATOMGIT_EVENT_NAME}" = "workflow_dispatch" ]; then
+            if git ls-remote --exit-code --tags "${remote}" "refs/tags/${version}" >/dev/null 2>&1; then
+              echo "tag ${version} already exists on the remote"
+            else
+              git tag -f "${version}" "${ATOMGIT_SHA}"
+              git push "${remote}" "refs/tags/${version}"
+            fi
+          else
+            resolved=$(git ls-remote --tags "${remote}" "refs/tags/${version}" | awk '{print $1}' | head -1)
+            if [ -z "${resolved}" ]; then
+              echo "tag ${version} not found on the remote" >&2
+              exit 1
+            fi
+            echo "tag ${version} -> ${resolved}"
+          fi
+
+      # GitCode neither documents nor guarantees whether re-uploading a name
+      # replaces or duplicates the attachment, so refuse to guess: a re-run
+      # after a partial failure needs the old release removed first.
+      - name: Refuse to publish over an existing release
+        run: |
+          set -euo pipefail
+          api="https://api.gitcode.com/api/v5"
+          version="${RELEASE_VERSION}"
+          status=$(curl -sS -o existing-release.json -w '%{http_code}' -G \
+            "${api}/repos/${ATOMGIT_REPOSITORY}/releases/tags/${version}" \
+            --data-urlencode "access_token=${ATOMGIT_TOKEN}")
+          if [ "${status}" = "200" ]; then
+            echo "a GitCode release for ${version} already exists." >&2
+            echo "delete it first, then re-run this pipeline:" >&2
+            echo "  https://gitcode.com/${ATOMGIT_REPOSITORY}/releases" >&2
+            head -c 500 existing-release.json >&2
+            exit 1
+          fi
+          echo "no existing release for ${version} (HTTP ${status})"
+
+      - name: Build release notes
+        run: |
+          set -euo pipefail
+          version="${RELEASE_VERSION}"
+          {
+            echo "sermcp ${version}"
+            echo
+            echo "由 GitCode 流水线自动构建。下载后建议先校验完整性："
+            echo
+            echo '```sh'
+            echo "sha256sum -c SHA256SUMS"
+            echo '```'
+            echo
+            echo "| 文件 | 说明 |"
+            echo "|------|------|"
+            echo "| \`sermcp_${version}_x86_64-unknown-linux-musl.tar.gz\` | x86_64 静态 musl，含 sermcp + dutabo |"
+            echo "| \`sermcp_${version}_aarch64-unknown-linux-musl.tar.gz\` | aarch64 静态 musl，含 sermcp + dutabo |"
+            echo "| \`sermcp-<target>\` / \`dutabo-<target>\` | 免解压的裸二进制 |"
+            echo "| \`SHA256SUMS\` | 全部文件的校验和 |"
+          } > release-notes.md
+          cat release-notes.md
+
+      - name: Create release
+        run: |
+          set -euo pipefail
+          version="${RELEASE_VERSION}"
+          case "${version}" in *-*) prerelease="true" ;; *) prerelease="false" ;; esac
+          jq -n \
+            --arg tag "${version}" \
+            --arg name "sermcp ${version}" \
+            --rawfile body release-notes.md \
+            --argjson prerelease "${prerelease}" \
+            '{tag_name:$tag, name:$name, body:$body, prerelease:$prerelease}' \
+            > release-payload.json
+          curl -fsS -X POST \
+            "https://api.gitcode.com/api/v5/repos/${ATOMGIT_REPOSITORY}/releases?access_token=${ATOMGIT_TOKEN}" \
+            -H 'Content-Type: application/json' \
+            --data-binary @release-payload.json \
+            -o create-release.json
+          jq '{tag_name,name,release_status}' create-release.json
+
+      # Each asset needs its own signed upload URL, and the signature travels
+      # in the response headers — replay them verbatim with the PUT.
+      - name: Upload release assets
+        run: |
+          set -euo pipefail
+          api="https://api.gitcode.com/api/v5"
+          version="${RELEASE_VERSION}"
+          cd dist
+          for file in *; do
+            [ -f "${file}" ] || continue
+            echo "uploading ${file}"
+            attempt=1
+            while :; do
+              reserved=$(curl -fsS -G \
+                "${api}/repos/${ATOMGIT_REPOSITORY}/releases/${version}/upload_url" \
+                --data-urlencode "access_token=${ATOMGIT_TOKEN}" \
+                --data-urlencode "file_name=${file}")
+              upload_url=$(printf '%s' "${reserved}" | jq -r '.url // .upload_url // empty')
+              if [ -z "${upload_url}" ]; then
+                echo "no upload URL returned for ${file}: ${reserved}" >&2
+                exit 1
+              fi
+              # Outside dist/: anything written there would be a candidate for
+              # the `for file in *` list (and for the release itself).
+              printf '%s' "${reserved}" \
+                | jq -r '.headers | to_entries[] | "\(.key): \(.value)"' \
+                > /tmp/upload-headers.txt
+              if curl -fsS -X PUT -H "@/tmp/upload-headers.txt" \
+                   --upload-file "${file}" "${upload_url}"; then
+                echo "uploaded ${file}"
+                break
+              fi
+              if [ "${attempt}" -ge 3 ]; then
+                echo "giving up on ${file} after ${attempt} attempts" >&2
+                exit 1
+              fi
+              attempt=$((attempt + 1))
+              echo "retrying ${file} (attempt ${attempt})" >&2
+              sleep 5
+            done
+          done
+
+      - name: Report
+        run: |
+          set -euo pipefail
+          version="${RELEASE_VERSION}"
+          echo "release published: https://gitcode.com/${ATOMGIT_REPOSITORY}/releases/tag/${version}"
+          curl -fsS -G \
+            "https://api.gitcode.com/api/v5/repos/${ATOMGIT_REPOSITORY}/releases/tags/${version}" \
+            --data-urlencode "access_token=${ATOMGIT_TOKEN}" \
+            | jq '{tag_name, name, assets: [.assets[]?.name]}'
