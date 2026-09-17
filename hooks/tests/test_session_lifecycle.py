@@ -29,15 +29,30 @@ class SessionLifecycleTests(unittest.TestCase):
                 port.assert_not_called()
                 spawn.assert_not_called()
 
-    def test_unknown_session_never_kills_or_replaces_http(self):
+    def test_unknown_session_never_starts_http(self):
         with patch.object(prompt, "_mcp_http_port", return_value=3000), \
              patch.object(prompt, "http_health_ok", return_value=False), \
              patch.object(prompt, "agent_session_process", return_value=None), \
-             patch.object(prompt, "terminate_pid") as terminate, \
+             patch.object(prompt, "project_locked", return_value=False), \
              patch.object(prompt, "spawn_http_mcp") as spawn:
             prompt._restart_mcp("/unused/project")
-            terminate.assert_not_called()
             spawn.assert_not_called()
+
+    def test_restart_leaves_existing_project_lock_alone(self):
+        import fcntl
+
+        with tempfile.TemporaryDirectory() as project:
+            fd = os.open(project, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX)
+                with patch.object(prompt, "_mcp_http_port", return_value=3000), \
+                     patch.object(prompt, "http_health_ok") as health, \
+                     patch.object(prompt, "spawn_http_mcp") as spawn:
+                    prompt._restart_mcp(project)
+                    health.assert_not_called()
+                    spawn.assert_not_called()
+            finally:
+                os.close(fd)
 
     def test_session_pid_reuse_is_rejected(self):
         with patch.dict(os.environ, {"SERMCP_SESSION_PID": "42", "SERMCP_SESSION_START_TICKS": "100"}), \
