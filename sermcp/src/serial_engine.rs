@@ -624,7 +624,7 @@ impl SerialEngine {
                     "success": false,
                     "code": "serial_endpoint_busy",
                     "owner_pid": conflicting,
-                    "error": format!("Serial lock is held by live PID {conflicting}")
+                    "error": format!("Serial lock is held by live PID {conflicting}; run dutabo stop in the owning project and wait for confirmed release before retrying")
                 });
             }
             self.owns_serial_lock = true;

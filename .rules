@@ -168,7 +168,7 @@ The ONLY config format is `.target.jsonc` (`[[dev_hosts]]` with nested `duts[]`;
 ### Locking Strategy
 
 Two levels:
-1. **Project singleton**: `.dut-serial/mcp.pid` prevents multiple MCP processes in the same project
+1. **Project singleton**: `.dut-serial/mcp.pid` prevents multiple MCP processes in the same project. Automatic takeover requires evidence that the recorded supervised session exited and no live parent or hooks owner protects the holder. Missing supervision alone preserves the holder; a legitimately held project refuses the second spawn.
 2. **Host:port mutex**: FNV1A-hash-based lock files in `/tmp/sermcp/locks/` with O_EXCL atomic creation + zombie cleanup
 
 ### Power Control (`dut-ctrl` sub-crate)
@@ -186,7 +186,7 @@ When a serial read error occurs (`Connection closed by ser2net`):
 
 - `session-start.py` — detects project, auto-starts HTTP MCP on MD5-hash-based port (3001–3099)
 - `statusline.py` — reads MCP-written cache files; falls back to `target-state` with DUT alias
-- `pre-tool-use.py` — blocks raw `nc`/`tio`/`screen` serial access AND `dutabo serial` for Agent
+- `pre-tool-use.py` — blocks raw `nc`/`tio`/`screen` serial access AND `dutabo serial` for Agent; guards one-sermcp-per-project (deny a spawn while a live server serves the project; `--idle-timeout 0` and cross-project `TARGET_CONF` always denied)
 - `user-prompt-submit.py` — multi-DUT alerts, auto-restart MCP
 - `session-stop.py` — cleanup
 - `lib.py` — shared: project discovery, `format_serial_state` (with DUT alias support)

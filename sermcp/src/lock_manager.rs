@@ -209,6 +209,154 @@ pub fn check_project_singleton(project_dir: &Path, dut_dir: &str) -> Option<u32>
     None
 }
 
+// ── Forgotten-holder takeover ──────────────────────────────────────────────
+//
+// Automatic takeover requires evidence that a recorded supervised session
+// exited. Missing supervision alone does not authorize terminating a holder:
+// manually launched and detached HTTP services can still have active clients.
+
+/// The holder's supervised session from its environment, when that session
+/// process is still alive (tick-validated against PID reuse).
+fn holder_session_owner(pid: u32) -> Option<crate::lifecycle::SessionOwner> {
+    let environ = std::fs::read(format!("/proc/{pid}/environ")).ok()?;
+    let mut session_pid = None;
+    let mut ticks = None;
+    for entry in environ.split(|byte| *byte == 0) {
+        if let Some(value) = entry.strip_prefix(b"SERMCP_SESSION_PID=") {
+            session_pid = std::str::from_utf8(value).ok().and_then(|v| v.parse().ok());
+        } else if let Some(value) = entry.strip_prefix(b"SERMCP_SESSION_START_TICKS=") {
+            ticks = std::str::from_utf8(value).ok().and_then(|v| v.parse().ok());
+        }
+    }
+    crate::lifecycle::SessionOwner::capture(session_pid?, ticks).ok()
+}
+
+/// Parent pid from `/proc/<pid>/stat` (field 4); 1 for reparented orphans.
+fn parent_pid(pid: u32) -> Option<u32> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let after_comm = stat.rsplit_once(") ")?.1;
+    after_comm.split_whitespace().nth(1)?.parse().ok()
+}
+
+/// Match the hooks owner record liveness anchor, not the short-lived hook PID.
+fn owner_record_alive(project_dir: &Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(project_dir.join(".dut-serial/owner.json")) else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return false;
+    };
+    if value.get("schema_version").and_then(|v| v.as_u64()) != Some(1) {
+        return false;
+    }
+    value
+        .get("owner_mcp_pid")
+        .and_then(|recorded| recorded.as_u64())
+        .filter(|pid| *pid > 0 && *pid <= u32::MAX as u64)
+        .is_some_and(|pid| process_alive(pid as u32))
+}
+
+/// Preserve holders with a live parent or hooks owner. Missing supervision
+/// is not evidence of abandonment: manually launched HTTP services and
+/// detached services may still have active clients.
+pub fn holder_is_legitimate(project_dir: &Path, pid: u32) -> bool {
+    if crate::lifecycle::project_has_live_sessions(project_dir)
+        || holder_session_owner(pid).is_some()
+        || parent_pid(pid).is_some_and(|ppid| ppid > 1 && process_alive(ppid))
+        || owner_record_alive(project_dir)
+    {
+        return true;
+    }
+    !holder_session_exited(pid)
+}
+
+/// Require positive exit evidence; inaccessible or incomplete metadata is inconclusive.
+fn holder_session_exited(pid: u32) -> bool {
+    // Only a complete, verified lifetime binding can establish that a
+    // session exited. Missing, malformed, or unreadable metadata fails closed.
+    let Ok(environ) = std::fs::read(format!("/proc/{pid}/environ")) else {
+        return false;
+    };
+    let field = |key: &[u8]| {
+        environ.split(|byte| *byte == 0).find_map(|entry| {
+            std::str::from_utf8(entry.strip_prefix(key)?)
+                .ok()?
+                .parse::<u64>()
+                .ok()
+        })
+    };
+    let (Some(session_pid), Some(ticks)) = (
+        field(b"SERMCP_SESSION_PID="),
+        field(b"SERMCP_SESSION_START_TICKS="),
+    ) else {
+        return false;
+    };
+    if session_pid <= 1 || session_pid > u32::MAX as u64 || session_pid == pid as u64 {
+        return false;
+    }
+    // Permission and parse errors must not authorize termination.
+    match std::fs::read_to_string(format!("/proc/{session_pid}/stat")) {
+        Ok(stat) => {
+            let Some((_, fields)) = stat.rsplit_once(") ") else {
+                return false;
+            };
+            let fields: Vec<_> = fields.split_whitespace().collect();
+            match fields.get(19).and_then(|value| value.parse::<u64>().ok()) {
+                Some(actual) => actual != ticks || matches!(fields.first(), Some(&"Z" | &"X")),
+                None => false,
+            }
+        }
+        Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+    }
+}
+
+/// Terminate an orphaned holder so a fresh spawn can take over the
+/// project. Identity is re-verified immediately before signalling — the
+/// pid-reuse window between the conflict report and the kill is closed the
+/// same way as the hooks' terminate path. SIGTERM first with a bounded
+/// grace period, then SIGKILL. Returns true when the holder is gone.
+pub fn reap_orphan_holder(project_dir: &Path, pid: u32) -> bool {
+    if pid == 0 || pid == std::process::id() {
+        return false;
+    }
+    if !is_live_server_holder(pid) || !process_belongs_to_project(pid, project_dir) {
+        return false;
+    }
+    if holder_is_legitimate(project_dir, pid) {
+        return false;
+    }
+    terminate_holder(pid)
+}
+
+/// SIGTERM with a bounded grace period, then SIGKILL — the mechanics every
+/// verified takeover uses (the callers own the identity check).
+fn terminate_holder(pid: u32) -> bool {
+    const SIGTERM: i32 = 15;
+    const SIGKILL: i32 = 9;
+    // SAFETY: kill(2) with standard signals on a pid the caller verified.
+    if unsafe { kill(pid as i32, SIGTERM) } != 0 {
+        return false;
+    }
+    if wait_for_holder_exit(pid, std::time::Duration::from_secs(5)) {
+        return true;
+    }
+    let _ = unsafe { kill(pid as i32, SIGKILL) };
+    wait_for_holder_exit(pid, std::time::Duration::from_secs(2))
+}
+
+fn wait_for_holder_exit(pid: u32, limit: std::time::Duration) -> bool {
+    let step = std::time::Duration::from_millis(100);
+    let mut waited = std::time::Duration::ZERO;
+    while waited < limit {
+        std::thread::sleep(step);
+        waited += step;
+        if !process_alive(pid) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Acquire the lock for `host:target` (`target` may be a TCP port or device path).
 /// Returns `None` on success, `Some(pid)` if a conflict exists.
 ///
@@ -584,6 +732,185 @@ mod tests {
         assert!(acquire_project_lock(&project).is_err());
         drop(dut_guard);
         std::fs::remove_dir_all(project).ok();
+    }
+
+    fn start_ticks_of(pid: u32) -> u64 {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+        stat.rsplit_once(") ")
+            .unwrap()
+            .1
+            .split_whitespace()
+            .nth(19)
+            .unwrap()
+            .parse()
+            .unwrap()
+    }
+
+    #[test]
+    fn supervised_session_keeps_a_detached_holder_legitimate() {
+        let project = temp_lock_dir();
+        let mut session = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .unwrap();
+        let ticks = start_ticks_of(session.id());
+        let mut holder = std::process::Command::new("sleep")
+            .arg("60")
+            .env_remove("SERMCP_SESSION_PID")
+            .env_remove("SERMCP_SESSION_START_TICKS")
+            .env("SERMCP_SESSION_PID", session.id().to_string())
+            .env("SERMCP_SESSION_START_TICKS", ticks.to_string())
+            .spawn()
+            .unwrap();
+        // Bounded wait for exec: /proc/<pid>/environ shows the parent's
+        // environment until the child has exec'd.
+        let mut supervised = false;
+        for _ in 0..40 {
+            if holder_session_owner(holder.id()).is_some() {
+                supervised = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(
+            supervised,
+            "holder never exposed its supervised session env"
+        );
+        assert!(!holder_session_exited(holder.id()));
+        // Session death revokes legitimacy: the tick-validated liveness
+        // check in SessionOwner::capture fails once the session is gone.
+        session.kill().unwrap();
+        let _ = session.wait();
+        assert!(holder_session_owner(holder.id()).is_none());
+        assert!(holder_session_exited(holder.id()));
+        holder.kill().unwrap();
+        let _ = holder.wait();
+        std::fs::remove_dir_all(project).ok();
+    }
+
+    #[test]
+    fn owner_record_liveness_follows_mcp_not_hook() {
+        let project = temp_lock_dir();
+        std::fs::create_dir_all(project.join(".dut-serial")).unwrap();
+        assert!(!owner_record_alive(&project));
+        std::fs::write(
+            project.join(".dut-serial/owner.json"),
+            format!(
+                "{{\"schema_version\":1,\"owner_pid\":{}}}",
+                std::process::id()
+            ),
+        )
+        .unwrap();
+        assert!(!owner_record_alive(&project));
+
+        let mut owner = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .unwrap();
+        std::fs::write(
+            project.join(".dut-serial/owner.json"),
+            format!(
+                "{{\"schema_version\":1,\"owner_pid\":4294967295,\"owner_mcp_pid\":{}}}",
+                owner.id()
+            ),
+        )
+        .unwrap();
+        assert!(owner_record_alive(&project));
+
+        owner.kill().unwrap();
+        let _ = owner.wait();
+        assert!(!owner_record_alive(&project));
+        std::fs::remove_dir_all(project).ok();
+    }
+
+    /// Parked-child mode for the holder-shape tests: re-executed with
+    /// ORPHAN_CHILD_PID_FILE set, publishes its pid and stands by until
+    /// killed. Without the env marker this is a plain passing test.
+    #[test]
+    fn child_mode_orphan_park() {
+        let Some(path) = std::env::var("ORPHAN_CHILD_PID_FILE")
+            .ok()
+            .filter(|marker| !marker.is_empty())
+        else {
+            return;
+        };
+        let _ = std::fs::write(path, std::process::id().to_string());
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(60));
+        }
+    }
+
+    fn wait_for_parked_pid(pid_file: &Path) -> u32 {
+        for _ in 0..100 {
+            if let Some(pid) = std::fs::read_to_string(pid_file)
+                .ok()
+                .and_then(|text| text.trim().parse::<u32>().ok())
+                .filter(|pid| *pid != std::process::id())
+            {
+                return pid;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        panic!("parked holder never published its pid");
+    }
+
+    #[test]
+    fn reap_refuses_a_hosted_holder() {
+        let project = temp_lock_dir();
+        let pid_file = project.join(".holder-pid");
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("lock_manager::tests::child_mode_orphan_park")
+            .arg("--exact")
+            .env_remove("SERMCP_SESSION_PID")
+            .env_remove("SERMCP_SESSION_START_TICKS")
+            .env("ORPHAN_CHILD_PID_FILE", &pid_file)
+            .current_dir(&project)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn hosted holder");
+        let holder = wait_for_parked_pid(&pid_file);
+
+        // The live parent (this test process) hosts the stdio holder: a
+        // host-managed server is never reaped.
+        assert!(!holder_session_exited(holder));
+        assert!(holder_is_legitimate(&project, holder));
+        assert!(!reap_orphan_holder(&project, holder));
+        assert!(is_live_server_holder(holder));
+
+        child.kill().unwrap();
+        let _ = child.wait();
+        std::fs::remove_dir_all(project).ok();
+    }
+
+    #[test]
+    fn reap_ignores_foreign_and_unverifiable_pids() {
+        let project = temp_lock_dir();
+        // A live non-sermcp process is never signalled.
+        let mut foreign = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .unwrap();
+        assert!(!reap_orphan_holder(&project, foreign.id()));
+        assert!(process_alive(foreign.id()));
+        foreign.kill().unwrap();
+        let _ = foreign.wait();
+        assert!(!reap_orphan_holder(&project, 0));
+        assert!(!reap_orphan_holder(&project, std::process::id()));
+        std::fs::remove_dir_all(project).ok();
+    }
+
+    #[test]
+    fn terminate_holder_escalates_to_kill() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .unwrap();
+        assert!(terminate_holder(child.id()));
+        // The default SIGTERM disposition ends a plain sleep; the wait loop
+        // must observe it without the SIGKILL escalation path.
+        let _ = child.wait();
+        assert!(!process_alive(child.id()));
     }
 
     #[test]

@@ -483,6 +483,30 @@ fn rotate_mcp_log(log_dir: &std::path::Path) {
     }
 }
 
+/// Acquire the project singleton, taking over only after verified session exit.
+/// Missing lifetime metadata preserves the existing holder. A legitimate
+/// holder still wins: the second spawn surfaces the refusal.
+fn acquire_project_lock_or_adopt(
+    project_dir: &std::path::Path,
+) -> Result<lib::lock_manager::ProjectLock, u32> {
+    let owner = match lib::lock_manager::acquire_project_lock(project_dir) {
+        Ok(lock) => return Ok(lock),
+        Err(owner) => owner,
+    };
+    if owner != 0
+        && lib::lock_manager::reap_orphan_holder(project_dir, owner)
+        && let Ok(lock) = lib::lock_manager::acquire_project_lock(project_dir)
+    {
+        eprintln!(
+            "NOTE: took over the MCP slot from sermcp PID {owner} (supervised \
+             session exited) for project {}",
+            project_dir.display()
+        );
+        return Ok(lock);
+    }
+    Err(owner)
+}
+
 #[tokio::main]
 async fn main() {
     // ── CLI argument parsing ──
@@ -739,6 +763,11 @@ async fn main() {
         .clone()
         .expect("validated project directory");
 
+    if project_dir.join(".dut-serial/stopped").exists() {
+        eprintln!("Project MCP is stopped. Run dutabo resume in this project before reconnecting.");
+        lib::trace_chrome::exit_with_trace(1);
+    }
+
     let session_owner = match lib::lifecycle::SessionOwner::from_environment() {
         Ok(Some(owner)) => Some(owner),
         Ok(None) if !http_mode => {
@@ -763,6 +792,15 @@ async fn main() {
             lib::trace_chrome::exit_with_trace(1);
         }
     };
+    // Verified HTTP sessions own the lifetime even while clients are idle.
+    let session_owner = if http_mode {
+        session_owner.map(|owner| owner.with_project(&project_dir))
+    } else {
+        session_owner
+    };
+    if http_mode && session_owner.is_some() {
+        idle_timeout = None;
+    }
     if http_mode && idle_timeout.is_none() {
         tracing::warn!(
             session_bound = session_owner.is_some(),
@@ -779,13 +817,35 @@ async fn main() {
     // second process could later reconnect or claim resources even if it
     // initially called itself an observer.
     //
-    // Strict cross-transport singleton: the FIRST spawn wins the project
-    // lock (stdio or HTTP alike) and every later spawn refuses to start —
-    // one project path, one sermcp process, no exceptions. A later stdio
-    // client (a second agent session on the same project) surfaces the
-    // refusal through its host as a failed MCP entry instead of silently
-    // coexisting as a second process.
-    let _project_lock = match lib::lock_manager::acquire_project_lock(&project_dir) {
+    // Cross-transport singleton: the FIRST spawn wins the project lock
+    // (stdio or HTTP alike) and every later spawn refuses to start — one
+    // project path, one sermcp process. A later stdio client (a second
+    // agent session on the same project) surfaces the refusal through its
+    // host as a failed MCP entry instead of silently coexisting as a
+    // second process. A holder is eligible for automatic takeover only
+    // with evidence that its supervised session exited; missing lifetime
+    // metadata alone never authorizes terminating it.
+    let managed_configs = cfg.managed_dut_configs().unwrap_or_else(|error| {
+        eprintln!("CONFIG ERROR: {error}");
+        lib::trace_chrome::exit_with_trace(1)
+    });
+    let mut conflicts = Vec::new();
+    for dut in managed_configs {
+        if let Some(conflict) = lib::init::held_endpoint_conflict(
+            &dut.dev_host_ip(),
+            &dut.serial_target(),
+            &dut.lock_dir(),
+        ) {
+            conflicts.push(format!("{}:{} is used by project {} (PID {}). Run dutabo stop in the owning project before retrying",
+                conflict.host, conflict.port, conflict.owner_project.as_deref().unwrap_or("<unknown>"), conflict.pid));
+        }
+    }
+    if !conflicts.is_empty() {
+        eprintln!("Serial endpoint conflict:\n{}", conflicts.join("\n"));
+        lib::trace_chrome::exit_with_trace(1);
+    }
+
+    let _project_lock = match acquire_project_lock_or_adopt(&project_dir) {
         Ok(lock) => lock,
         Err(owner) => {
             let owner = if owner == 0 {
@@ -794,12 +854,19 @@ async fn main() {
                 owner.to_string()
             };
             eprintln!(
-                "MCP service already running for project {} (PID {owner}); refusing to start a second instance",
+                "MCP service already running for project {} (PID {owner}); refusing to start a \
+                 second instance. To replace it: kill $(cat {}/.dut-serial/mcp.pid)",
+                project_dir.display(),
                 project_dir.display()
             );
             lib::trace_chrome::exit_with_trace(1);
         }
     };
+    if project_dir.join(".dut-serial/stopped").exists() {
+        drop(_project_lock);
+        eprintln!("Project MCP is stopped; run dutabo resume before reconnecting.");
+        lib::trace_chrome::exit_with_trace(1);
+    }
 
     startup_hygiene(&project_dir);
     // Pre-bind the stdio control transport BEFORE the startup inventory

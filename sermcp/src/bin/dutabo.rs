@@ -393,7 +393,10 @@ async fn main() {
 
     if !matches!(
         cmd.as_str(),
-        "list"
+        "start"
+            | "stop"
+            | "resume"
+            | "list"
             | "status"
             | "serial"
             | "reboot"
@@ -418,10 +421,12 @@ async fn main() {
             "`dutabo list` does not accept positional arguments: {}",
             positional.join(" ")
         )),
-        "serial" | "reboot" | "uboot" if !positional.is_empty() => Some(format!(
-            "`dutabo {cmd}` does not accept positional arguments: {}",
-            positional.join(" ")
-        )),
+        "start" | "stop" | "resume" | "serial" | "reboot" | "uboot" if !positional.is_empty() => {
+            Some(format!(
+                "`dutabo {cmd}` does not accept positional arguments: {}",
+                positional.join(" ")
+            ))
+        }
         "status" if positional.iter().any(|arg| arg != "--watch") => Some(format!(
             "unknown argument for `dutabo status`: {}",
             positional.join(" ")
@@ -532,6 +537,27 @@ async fn main() {
             sermcp::trace_chrome::exit_with_trace(1);
         }
     };
+    if cmd == "start" || cmd == "stop" || cmd == "resume" {
+        if dut_name.is_some() {
+            eprintln!("Error: {cmd} applies to the entire project; --dut is not supported");
+            sermcp::trace_chrome::exit_with_trace(1);
+        }
+        let result = if cmd == "start" {
+            cmd_project_start(&config_path, mcp_port_explicit.then_some(mcp_port)).await
+        } else {
+            cmd_project_lifetime(
+                &config_path,
+                cmd == "resume",
+                mcp_port_explicit.then_some(mcp_port),
+            )
+            .await
+        };
+        if let Err(error) = result {
+            eprintln!("Error: {error}");
+            sermcp::trace_chrome::exit_with_trace(1);
+        }
+        return;
+    }
     let (dev_hosts, duts) = match sermcp::config::parse_config_file(&config_path) {
         Ok(cfg) => (cfg.dev_hosts, cfg.duts),
         Err(e) => {
@@ -634,6 +660,9 @@ Commands:
     init [options]                  Create or update .target.jsonc
       --non-interactive, --quick, --advanced, --force, --tui, --plain
     list [--json]                   List configured devices
+    start                           Start or reuse a persistent project MCP
+    stop                            Stop this project MCP and release all DUTs
+    resume                          Allow project MCP startup again; reconnect the Agent
 
   Device:
     status [--watch]                Show device and code-agent status
@@ -653,6 +682,258 @@ Commands:
     help                            Show help
 
 ";
+
+async fn cmd_project_start(config: &Path, requested_port: Option<u16>) -> Result<(), String> {
+    let config = std::fs::canonicalize(config).map_err(|e| e.to_string())?;
+    let project = config.parent().ok_or("Missing project directory")?;
+    sermcp::config::parse_config_file(&config)?;
+    let directory = project.join(".dut-serial");
+    std::fs::create_dir_all(&directory).map_err(|e| e.to_string())?;
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(std::time::Duration::from_secs(1))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let ready = |port: u16| {
+        let client = client.clone();
+        let pid_file = directory.join("mcp.pid");
+        async move {
+            let pid = std::fs::read_to_string(pid_file)
+                .ok()
+                .and_then(|s| s.trim().parse::<u64>().ok());
+            let Ok(response) = client
+                .get(format!("http://127.0.0.1:{port}/health"))
+                .send()
+                .await
+            else {
+                return false;
+            };
+            let Ok(value) = response.json::<serde_json::Value>().await else {
+                return false;
+            };
+            pid.is_some() && value["server"]["pid"].as_u64() == pid && value["status"] == "ok"
+        }
+    };
+    let port = requested_port
+        .or_else(|| sermcp::ports::recorded_mcp_port(project))
+        .unwrap_or_else(|| sermcp::ports::project_mcp_port(project));
+    if port == 0 {
+        return Err("--mcp-port must be nonzero".into());
+    }
+    if ready(port).await {
+        let health: serde_json::Value = client
+            .get(format!("http://127.0.0.1:{port}/health"))
+            .send()
+            .await
+            .map_err(|e| e.to_string())?
+            .json()
+            .await
+            .map_err(|e| e.to_string())?;
+        let pid = health["server"]["pid"]
+            .as_u64()
+            .ok_or("Missing server PID")?;
+        let environment =
+            std::fs::read(format!("/proc/{pid}/environ")).map_err(|e| e.to_string())?;
+        if environment
+            .split(|b| *b == 0)
+            .any(|entry| entry.starts_with(b"SERMCP_SESSION_PID="))
+            || !environment
+                .split(|b| *b == 0)
+                .any(|entry| entry == b"SERMCP_MANUAL_START=1")
+            || health["idle_timeout_disabled"] != true
+        {
+            return Err("Existing MCP is session-managed or idle-limited. Run dutabo stop, then dutabo start to create a persistent service".into());
+        }
+        cmd_project_lifetime(&config, true, None).await?;
+        println!("Reusing project MCP on 127.0.0.1:{port}");
+        return Ok(());
+    }
+    let binary = std::env::current_exe()
+        .map_err(|e| e.to_string())?
+        .with_file_name("sermcp");
+    if !binary.is_file() {
+        return Err("sermcp binary must be installed beside dutabo".into());
+    }
+    let parsed = sermcp::config::parse_config_file(&config)?;
+    let text = std::fs::read_to_string(&config).map_err(|e| e.to_string())?;
+    let lock_dir = sermcp::config::parse_jsonc_text(&text)?
+        .lock_dir
+        .unwrap_or_else(sermcp::lock_manager::default_lock_dir);
+    let conflicts = |own_pid: Option<u32>| -> Result<(), String> {
+        let mut messages = Vec::new();
+        for dut in &parsed.duts {
+            if let Some(conflict) =
+                sermcp::init::held_endpoint_conflict(&dut.dev_host_ip, &dut.serial_port, &lock_dir)
+                && Some(conflict.pid) != own_pid
+            {
+                messages.push(format!("{}:{} is used by project {} (PID {}). Run dutabo stop in that project before retrying",
+                    conflict.host, conflict.port, conflict.owner_project.as_deref().unwrap_or("<unknown>"), conflict.pid));
+            }
+        }
+        if messages.is_empty() {
+            Ok(())
+        } else {
+            Err(messages.join("\n"))
+        }
+    };
+    conflicts(None)?;
+    // A launch lock covers marker removal, spawn and readiness across concurrent clients.
+    let launch_lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(directory.join("start.lock"))
+        .map_err(|e| e.to_string())?;
+    launch_lock
+        .try_lock()
+        .map_err(|_| "Another dutabo start is in progress; retry shortly")?;
+    if ready(port).await {
+        return Err(
+            "A project MCP appeared during startup; retry dutabo start to verify its lifetime mode"
+                .into(),
+        );
+    }
+    let check = sermcp::lock_manager::acquire_project_lock(project)
+        .map_err(|pid| format!("Project MCP {pid} already owns this project but is not ready on port {port}; no second service started"))?;
+    drop(check);
+    cmd_project_lifetime(&config, true, None).await?;
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(directory.join("start.log"))
+        .map_err(|e| e.to_string())?;
+    let mut command = std::process::Command::new(binary);
+    command
+        .args([
+            "--http",
+            &format!("127.0.0.1:{port}"),
+            "--idle-timeout",
+            "0",
+        ])
+        .current_dir(project)
+        .env("TARGET_CONF", &config)
+        .env_remove("TARGET_DUT_NAME")
+        .env_remove("TARGET_DUT_ALIAS")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(log);
+    command
+        .env("SERMCP_MANUAL_START", "1")
+        .env_remove("SERMCP_SESSION_PID")
+        .env_remove("SERMCP_SESSION_START_TICKS");
+    use std::os::unix::process::CommandExt;
+    // Detach from the launching terminal; only explicit stop or process failure ends this service.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = command.spawn().map_err(|e| e.to_string())?;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        if ready(port).await {
+            if let Err(error) = conflicts(Some(child.id())) {
+                // This is our own newly spawned child, never the competing holder.
+                unsafe {
+                    libc::kill(child.id() as i32, libc::SIGTERM);
+                }
+                return Err(error);
+            }
+            println!("Project MCP ready on 127.0.0.1:{port}");
+            return Ok(());
+        }
+        if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
+            return Err(format!(
+                "MCP exited ({status}); see {}",
+                directory.join("start.log").display()
+            ));
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!(
+                "MCP readiness unconfirmed; process {} may still be starting. See start.log; use dutabo stop to cancel",
+                child.id()
+            ));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
+async fn cmd_project_lifetime(
+    config: &std::path::Path,
+    resume: bool,
+    port: Option<u16>,
+) -> Result<(), String> {
+    let config = std::fs::canonicalize(config).map_err(|e| e.to_string())?;
+    let project = config.parent().ok_or("Missing project directory")?;
+    let directory = project.join(".dut-serial");
+    let marker = directory.join("stopped");
+    if resume {
+        match std::fs::remove_file(marker) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.to_string()),
+        }
+        println!("Project startup enabled. Reconnect the Agent MCP to start or reuse the service.");
+        return Ok(());
+    }
+    std::fs::create_dir_all(&directory).map_err(|e| e.to_string())?;
+    std::fs::write(
+        marker,
+        "Stopped by dutabo; use dutabo resume to allow startup.\n",
+    )
+    .map_err(|e| e.to_string())?;
+    if let Ok(lock) = sermcp::lock_manager::acquire_project_lock(project) {
+        drop(lock);
+        println!("Project MCP is stopped; automatic startup is disabled.");
+        return Ok(());
+    }
+    let pid: u32 = std::fs::read_to_string(directory.join("mcp.pid"))
+        .map_err(|e| e.to_string())?
+        .trim()
+        .parse()
+        .map_err(|_| "Invalid MCP PID")?;
+    let ports = if let Some(port) = port {
+        vec![port]
+    } else {
+        let mut ports = Vec::new();
+        if let Some(port) = sermcp::ports::recorded_mcp_port(project) {
+            ports.push(port);
+        }
+        ports.extend([sermcp::ports::project_mcp_port(project), 3000]);
+        sermcp::ports::deduplicate_ports(&mut ports);
+        ports
+    };
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(std::time::Duration::from_secs(3))
+        .build()
+        .map_err(|e| e.to_string())?;
+    for port in ports {
+        let _ = client
+            .post(format!("http://127.0.0.1:{port}/project/stop"))
+            .json(&serde_json::json!({"config_path": config, "expected_pid": pid}))
+            .send()
+            .await;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if let Ok(lock) = sermcp::lock_manager::acquire_project_lock(project) {
+                drop(lock);
+                println!(
+                    "Project MCP stopped and project ownership released; automatic startup is disabled."
+                );
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    }
+    Err("Stop not confirmed; automatic startup is disabled, but the existing service may still own DUTs. Check the service version/control port; no process was forcibly killed.".into())
+}
 
 fn print_usage() {
     eprint!("{HELP}");

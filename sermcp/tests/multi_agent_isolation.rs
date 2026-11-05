@@ -404,3 +404,55 @@ fn startup_sweeps_dead_pid_inventory_tmp_files() {
     child.close_stdin();
     let _ = child.wait_timeout(15);
 }
+
+/// An unsupervised HTTP service may still be in use. A second spawn must
+/// refuse even when there is no hooks owner record or session environment.
+#[test]
+fn manual_http_service_survives_second_spawn() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path();
+    let conf = write_target_jsonc(project, "t13");
+    let _residue = ScratchResidueGuard::for_project(project);
+    let http_port = std::net::TcpListener::bind(("127.0.0.1", 0))
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let child = std::process::Command::new(env!("CARGO_BIN_EXE_sermcp"))
+        .env("TARGET_CONF", &conf)
+        .env_remove("SERMCP_SESSION_PID")
+        .env_remove("SERMCP_SESSION_START_TICKS")
+        .args([
+            "--http",
+            &format!("127.0.0.1:{http_port}"),
+            "--idle-timeout",
+            "86400",
+        ])
+        .current_dir(project)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut holder = ChildGuard { child, stdin: None };
+    wait_for_file(&project.join(".dut-serial/mcp.pid"), 30);
+    assert!(sermcp::lock_manager::holder_is_legitimate(
+        project,
+        holder.child.id()
+    ));
+    let (mut second, mut stderr) = spawn_stdio_refuser(&conf, project);
+    assert!(
+        !second
+            .wait_timeout(15)
+            .expect("second spawn must exit")
+            .success()
+    );
+    let mut text = String::new();
+    stderr.read_to_string(&mut text).unwrap();
+    assert!(text.contains("refusing to start"), "{text}");
+    assert!(holder.try_wait().is_none());
+    assert_eq!(
+        std::fs::read_to_string(project.join(".dut-serial/mcp.pid")).unwrap(),
+        holder.child.id().to_string()
+    );
+}

@@ -549,6 +549,7 @@ async fn serve_registry(
         .nest_service("/mcp", mcp_service)
         .route("/health", get(handle_health))
         .route("/project/reconcile", post(handle_project_reconcile))
+        .route("/project/stop", post(handle_project_stop))
         .route("/serial/ws", get(handle_serial_ws))
         // Layer order: bump_activity sits outside mcp_guard, so even a
         // guard-rejected request counts as activity (it proves the client
@@ -648,6 +649,47 @@ fn now_millis() -> u64 {
 struct ReconcileRequest {
     config_path: std::path::PathBuf,
     expected_pid: Option<u32>,
+}
+
+/// Stop only the explicitly identified local project service.
+async fn handle_project_stop(
+    State(state): State<Arc<AppState>>,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    headers: axum::http::HeaderMap,
+    Json(request): Json<ReconcileRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    if !peer.ip().is_loopback() || headers.contains_key(axum::http::header::ORIGIN) {
+        return Err((StatusCode::FORBIDDEN, "Local native clients only".into()));
+    }
+    if request.expected_pid != Some(std::process::id()) {
+        return Err((StatusCode::CONFLICT, "Project MCP process changed".into()));
+    }
+    let expected = state
+        .registry
+        .inventory_config
+        .as_ref()
+        .and_then(|config| config.config_path.as_ref())
+        .ok_or((StatusCode::CONFLICT, "Missing project configuration".into()))?;
+    let canonical = |path: &std::path::Path| {
+        std::fs::canonicalize(path).map_err(|e| (StatusCode::CONFLICT, e.to_string()))
+    };
+    let expected = canonical(expected)?;
+    if canonical(&request.config_path)? != expected {
+        return Err((
+            StatusCode::CONFLICT,
+            "Different project configuration".into(),
+        ));
+    }
+    let marker = expected.parent().unwrap().join(".dut-serial/stopped");
+    std::fs::write(
+        marker,
+        "Stopped by dutabo; use dutabo resume to allow startup.\n",
+    )
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    state.shutdown.cancel();
+    Ok(Json(
+        serde_json::json!({"success": true, "pid": std::process::id()}),
+    ))
 }
 
 /// The server reads its own saved configuration; clients cannot nominate
