@@ -4,7 +4,7 @@ _dutabo() {
     COMPREPLY=()
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]}"
-    commands="list names status serial reboot uboot button uf flash-kernel init agent"
+    commands="start stop resume list names status serial reboot uboot button uf flash-kernel init agent"
 
     case "${prev}" in
         --dut)
