@@ -5,9 +5,9 @@ use rmcp::{
 };
 use serde_json::{Value, json};
 
-use super::{McpHandler, text, tool_result};
+use super::{McpHandler, tool_result};
 use crate::state_manager::TargetState;
-use crate::tools::params::{ExecArgs, ExecMode, SendCommandArgs, SendRawArgs, UbootCommandArgs};
+use crate::tools::params::{ExecArgs, ExecMode, SendRawArgs, UbootCommandArgs};
 
 fn command_timeout(seconds: i64) -> Result<Duration, ErrorData> {
     let seconds = u64::try_from(seconds)
@@ -58,26 +58,9 @@ impl McpHandler {
         Ok(tool_result(value))
     }
 
-    #[tool(
-        name = "serial_send_command",
-        description = "Send a shell command to the target and return the output.",
-        annotations(
-            read_only_hint = false,
-            destructive_hint = true,
-            open_world_hint = false
-        )
-    )]
-    async fn send_command(
-        &self,
-        Parameters(a): Parameters<SendCommandArgs>,
-    ) -> Result<CallToolResult, ErrorData> {
-        let timeout = command_timeout(a.timeout)?;
-        Ok(text(self.exec_shell(a.command, timeout).await))
-    }
-
-    /// Drive `serial_send_command` / `serial_exec(mode=shell)`: POSIX shell
-    /// marker-echo protocol via the command queue, with the reboot-class
-    /// fast path (no marker collection — the target is about to disappear).
+    /// Drive `serial_exec(mode=shell)`: POSIX shell marker-echo protocol via
+    /// the command queue, with the reboot-class fast path (no marker
+    /// collection — the target is about to disappear).
     async fn exec_shell(&self, command: String, timeout: Duration) -> Value {
         {
             let eng = self.engine.lock().await;
@@ -87,6 +70,16 @@ impl McpHandler {
         }
         if matches!(command.trim(), "reboot" | "poweroff" | "shutdown") {
             let mut eng = self.engine.lock().await;
+            // This fast path bypasses the command queue, so it needs its own
+            // takeover check: a reboot typed by the tool must never interleave
+            // with a human's interactive session.
+            if eng.in_manual_takeover() {
+                return json!({
+                    "success": false,
+                    "code": "dutabo_session",
+                    "error": "Serial console owned by interactive dutabo session; end it first",
+                });
+            }
             eng.console.sendline(&command);
             eng.console.drain_writes().await;
             return json!({
@@ -96,11 +89,13 @@ impl McpHandler {
             });
         }
 
-        let rx = self
-            .engine
-            .lock()
-            .await
-            .queue_command(&command, timeout.as_secs_f64());
+        let rx = {
+            let mut eng = self.engine.lock().await;
+            if eng.in_manual_takeover() {
+                return crate::serial_engine::SerialEngine::dutabo_session_error();
+            }
+            eng.queue_command(&command, timeout.as_secs_f64())
+        };
         match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(result)) => {
                 let mut value = json!({
@@ -151,28 +146,12 @@ impl McpHandler {
         &self,
         Parameters(a): Parameters<SendRawArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        Ok(text(self.engine.lock().await.send_raw(&a.data)))
+        Ok(tool_result(self.engine.lock().await.send_raw(&a.data)))
     }
 
-    #[tool(
-        name = "serial_uboot_command",
-        description = "Send a raw command at the U-Boot prompt and return output. Waits until the U-Boot prompt reappears, the output goes quiet, or the timeout expires — whichever comes first. Requires no POSIX shell, so use this (not serial_send_command) while the target sits in U-Boot.",
-        annotations(
-            read_only_hint = false,
-            destructive_hint = true,
-            open_world_hint = false
-        )
-    )]
-    async fn uboot_command(
-        &self,
-        Parameters(a): Parameters<UbootCommandArgs>,
-    ) -> Result<CallToolResult, ErrorData> {
-        Ok(tool_result(self.wait_uboot_output(&a).await))
-    }
-
-    /// Drive `serial_uboot_command`: send the command, then collect output
-    /// until the U-Boot prompt reappears, the line goes quiet, or the
-    /// timeout expires.
+    /// Drive `serial_exec(mode=uboot)`: send the command, then collect
+    /// output until the U-Boot prompt reappears, the line goes quiet, or
+    /// the timeout expires.
     ///
     /// U-Boot cannot run the POSIX marker-echo wrapper `queue_command`
     /// relies on (`{ cmd; }` grouping), so collection observes the shared
@@ -196,6 +175,9 @@ impl McpHandler {
         // post-snapshot observation would mistake it for the new prompt.
         let (snapshot, delivered) = {
             let mut eng = self.engine.lock().await;
+            if eng.in_manual_takeover() {
+                return crate::serial_engine::SerialEngine::dutabo_session_error();
+            }
             eng.commit_ser2net_partial();
             (
                 eng.shared_stream_snapshot(),
@@ -364,15 +346,6 @@ mod uboot_command_tests {
                         .await
                         .is_err()
                 );
-                assert!(
-                    handler
-                        .send_command(Parameters(SendCommandArgs {
-                            command: command.into(),
-                            timeout,
-                        }))
-                        .await
-                        .is_err()
-                );
             }
         }
         assert_eq!(writes.load(std::sync::atomic::Ordering::Relaxed), 0);
@@ -385,7 +358,7 @@ mod uboot_command_tests {
     /// itself contains `=>`. Neither may finish the new command; only the final
     /// standalone prompt does.
     #[tokio::test]
-    async fn collects_output_that_arrives_after_the_legacy_500ms_window() {
+    async fn collects_output_that_arrives_after_the_settle_window() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let server = tokio::spawn(async move {
@@ -419,8 +392,9 @@ mod uboot_command_tests {
 
         let started = tokio::time::Instant::now();
         let result = handler
-            .uboot_command(Parameters(UbootCommandArgs {
+            .exec(Parameters(ExecArgs {
                 command: "version".into(),
+                mode: ExecMode::Uboot,
                 timeout: 8,
             }))
             .await
@@ -433,12 +407,13 @@ mod uboot_command_tests {
 
         assert_eq!(result.is_error, Some(false));
         let payload = payload_of(result);
+        assert_eq!(payload["mode"], json!("uboot"));
         assert!(
             payload["output"]
                 .as_str()
                 .unwrap()
                 .contains("U-Boot 2024.07"),
-            "output must survive the legacy window: {payload}"
+            "output must survive the settle window: {payload}"
         );
         assert_eq!(payload["prompt_matched"], json!(true));
         assert!(
@@ -469,8 +444,9 @@ mod uboot_command_tests {
 
         let started = tokio::time::Instant::now();
         let result = handler
-            .uboot_command(Parameters(UbootCommandArgs {
+            .exec(Parameters(ExecArgs {
                 command: "version".into(),
+                mode: ExecMode::Uboot,
                 timeout: 2,
             }))
             .await

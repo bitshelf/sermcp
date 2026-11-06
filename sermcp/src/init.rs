@@ -38,7 +38,7 @@
 //! delete+append, not rename. Answers pair with existing DUTs by NAME (then
 //! positionally, preserving rename-in-place); an existing DUT no answer
 //! claims is REMOVED (RemoveElement) — and after the write the project's OWN
-//! MCP server reconciles the saved endpoints and retires only removed engines.
+//! MCP server reconciles saved endpoints, reconnects edited ports and retires removed engines.
 //! A FOREIGN project's holder is never signalled.
 //!
 //! The wizard cannot UNSET string values (empty input keeps the current
@@ -51,8 +51,9 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 
 use crate::config::{
-    CONFIG_FILE_NAME, JsoncControl, JsoncDevHost, JsoncDut, JsoncFlash, JsoncMonitor, JsoncRelay,
-    JsoncSerial, JsoncTarget, JsoncUboot, NumberOrString, TargetJsoncConfig, supported_relay_types,
+    CONFIG_FILE_NAME, HeartbeatCommand, JsoncControl, JsoncDevHost, JsoncDut, JsoncFlash,
+    JsoncMonitor, JsoncRelay, JsoncSerial, JsoncTarget, JsoncUboot, NumberOrString,
+    TargetJsoncConfig, supported_relay_types,
 };
 use crate::loader;
 
@@ -83,13 +84,11 @@ const GLOBAL_HINTS: &str = r#"  // Global fallbacks (optional) — apply to ever
   // "serial":  { "port": "<required>", "baudrate": "<required>", "rfc2217": false },
   // "target":  { "login_user": "root", "login_prompt": "" },
   // "uboot":   { "interrupt_char": "ctrl_c", "interrupt_strategy": "flood", "pattern": "Hit any key" },
-  // "relay":   { "type": "ch340", "reset_ch": 1, "power_off_time_ms": 3000 },
+  // "relay":   { "type": "ch340-relay", "reset_ch": 1, "power_off_time_ms": 3000 },
   // "monitor": { "hang_timeout": 60, "max_archived_logs": 10, "crash_keywords": ["Kernel panic"] },
   // "flash":   { "tool": "<vendor flash tool>", "upload_dir": "/tmp" },
   // "control": { "dev_ctrl": "" },
   // "loader":  "uboot",                    // "uboot" | "uefi" (uefi: not implemented yet)
-  // "reference_log": "",       // back-compat top-level key (overrides monitor.reference_log)
-  // "dut_dir": ".dut-serial",  // back-compat top-level key
   // "lock_dir": "/tmp/sermcp/locks"   // top-level ONLY — never valid inside a dut
 "#;
 
@@ -108,15 +107,12 @@ const C_LOGIN_PROMPT: &str = "regex; empty = built-in \"login:\" matcher";
 const C_UBOOT_CHAR: &str = "ctrl_c | \"0x03\" | any 1 char | decimal";
 const C_RELAY_TYPE: &str =
     "ch340 | ch340-relay | none | disabled (usb-relay and external dev-ctl removed)";
-const C_RELAY_CH_ALIASES: &str =
-    "aliases reset_channel/download_channel/power_channel/power_key_channel also accepted";
+const C_RELAY_CHANNEL: &str = "relay channel; 0 = inherit global";
 const C_POWER_CH: &str = "supply OFF/ON channel; 0 = inherit global";
 const C_POWER_KEY_CH: &str = "sleep/wake key channel; 0 = inherit global";
 const C_RESET_TIME: &str = "0 = inherit";
 const C_POWER_OFF: &str = "clamped to >= 3000; 0 = inherit global";
 const C_CRASH_KEYWORDS: &str = "substrings, not regex";
-const C_DUT_DIR: &str = "default: \".dut-serial/<dut_name>\"";
-const C_REFERENCE_LOG_DUT: &str = "back-compat per-DUT key, overrides monitor.reference_log";
 const C_LOCK_DIR: &str = "top-level ONLY — never valid inside a dut";
 
 /// Prompt abstraction. The binary implements this with a ratatui TUI (plus a
@@ -298,7 +294,7 @@ pub enum FieldKeyFrag {
 /// Where a field's default hint comes from.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub enum DefaultSrc {
-    /// Fixed literal ("root" for login_user, "ch340" for relay.type,
+    /// Fixed literal ("root" for login_user, "ch340-relay" for relay.type,
     /// "" for the runtime-seeded ip/user/pass/port fields whose real
     /// defaults come from the existing config at materialization time).
     Static(&'static str),
@@ -379,7 +375,7 @@ macro_rules! advanced_field_table {
     };
 }
 
-/// HOST-LEVEL advanced group (the global fallback set — 4 keys; the
+/// HOST-LEVEL advanced group (the global fallback set; the
 /// DUT-owned set lives in DUT_ADVANCED_GROUP_FIELDS). The
 /// migration pin test below asserts both groups partition ADVANCED_FIELDS
 /// one-for-one.
@@ -388,6 +384,15 @@ const ADVANCED_GROUP_FIELDS: &[FieldDef] = &[
         key: FieldKeyFrag::Advanced("monitor.hang_timeout"),
         kind: FieldKind::Text,
         label: "Hang timeout seconds",
+        required: false,
+        empty: EmptyMeans::AcceptDefault,
+        default: DefaultSrc::AdvancedNatural,
+        options: &[],
+    },
+    FieldDef {
+        key: FieldKeyFrag::Advanced("monitor.heartbeat_command"),
+        kind: FieldKind::Text,
+        label: "Heartbeat commands (shell or JSON array)",
         required: false,
         empty: EmptyMeans::AcceptDefault,
         default: DefaultSrc::AdvancedNatural,
@@ -593,6 +598,7 @@ advanced_field_table! {
     "uboot.interrupt_strategy", "U-Boot interrupt strategy", AcceptDefault, AdvancedNatural;
     "uboot.pattern", "U-Boot interrupt pattern regex", SkipInherit, AdvancedNatural;
     "monitor.hang_timeout", "Hang timeout seconds", AcceptDefault, AdvancedNatural;
+    "monitor.heartbeat_command", "Heartbeat commands (shell or JSON array)", AcceptDefault, AdvancedNatural;
     "monitor.max_archived_logs", "Max archived boot logs", AcceptDefault, AdvancedNatural;
     "monitor.max_log_file_size", "Max log file size MB", AcceptDefault, AdvancedNatural;
     "monitor.reference_log", "Reference boot log path", AcceptDefault, ReferenceLogComposed;
@@ -723,7 +729,7 @@ pub static FORM_GROUPS: &[FormGroup] = &[
                 label: "Relay type",
                 required: false,
                 empty: EmptyMeans::AcceptDefault,
-                default: DefaultSrc::Static("ch340"),
+                default: DefaultSrc::Static("ch340-relay"),
                 options: &[],
             },
             FieldDef {
@@ -1445,8 +1451,9 @@ fn occupancy_gate(
 }
 
 /// Ask the project's singleton to reconcile its saved configuration. A
-/// successful response is sent only after removed engines have closed their
-/// connections, revoked queued writes and released their kernel locks.
+/// successful response is sent only after obsolete connections have closed,
+/// queued writes have been revoked and old endpoint locks have been released.
+/// Engines with an edited endpoint then connect using the saved configuration.
 fn release_removed_endpoints(
     removals: &[PlannedRemoval],
     lock_dir: &str,
@@ -2152,7 +2159,9 @@ pub fn fill_defaults(schema: &FormSchema) -> WizardAnswers {
                 login_user: dut_default.login_user.unwrap_or_else(|| "root".into()),
                 relay_gate,
                 relay_type: if relay_gate {
-                    dut_default.relay_type.unwrap_or_else(|| "ch340".into())
+                    dut_default
+                        .relay_type
+                        .unwrap_or_else(|| "ch340-relay".into())
                 } else {
                     String::new()
                 },
@@ -2404,7 +2413,7 @@ pub fn resolve_answers(
                     dut_default
                         .relay_type
                         .clone()
-                        .or_else(|| Some("ch340".into())),
+                        .or_else(|| Some("ch340-relay".into())),
                 );
                 // Zero-guarded numeric family: empty = inherit (SkipInherit)
                 // or the shown default (AcceptDefault); typed values are
@@ -2944,6 +2953,9 @@ pub fn advanced_current(config: &TargetJsoncConfig) -> HashMap<String, String> {
         }
     }
     if let Some(mo) = &config.monitor {
+        if let Some(v) = &mo.heartbeat_command {
+            m.insert("monitor.heartbeat_command".into(), v.editor_value());
+        }
         if let Some(v) = mo.hang_timeout {
             m.insert("monitor.hang_timeout".into(), v.to_string());
         }
@@ -3116,14 +3128,12 @@ fn comment_for(key: &str) -> Option<&'static str> {
         "login_prompt" => C_LOGIN_PROMPT,
         "interrupt_char" => C_UBOOT_CHAR,
         "type" => C_RELAY_TYPE,
-        "reset_ch" => C_RELAY_CH_ALIASES,
+        "reset_ch" => C_RELAY_CHANNEL,
         "power_ch" => C_POWER_CH,
         "power_key_ch" => C_POWER_KEY_CH,
         "reset_time_ms" => C_RESET_TIME,
         "power_off_time_ms" => C_POWER_OFF,
         "crash_keywords" => C_CRASH_KEYWORDS,
-        "dut_dir" => C_DUT_DIR,
-        "reference_log" => C_REFERENCE_LOG_DUT,
         "lock_dir" => C_LOCK_DIR,
         _ => return None,
     })
@@ -3203,6 +3213,22 @@ pub fn advanced_literal(key: &str, value: &str) -> Result<Option<String>, String
         "relay.power_off_time_ms" => zero_guarded("ms")
             .map(|o| o.map(|n| n.parse::<u64>().unwrap_or(0).max(3000).to_string())),
         "monitor.hang_timeout" => Ok(Some(int("seconds")?)),
+        "monitor.heartbeat_command" => {
+            let command = HeartbeatCommand::from_editor(v);
+            let script = command.script();
+            if script.len() > crate::heartbeat::MAX_PROBE_BYTES || script.contains('\0') {
+                return Err(format!(
+                    "{key}: must contain no NUL and at most {} UTF-8 bytes",
+                    crate::heartbeat::MAX_PROBE_BYTES
+                ));
+            }
+            Ok(Some(match command {
+                HeartbeatCommand::Script(script) => {
+                    serde_json::to_string(&script).map_err(|e| e.to_string())?
+                }
+                HeartbeatCommand::Commands(commands) => pretty_array_literal(&commands, 0),
+            }))
+        }
         "monitor.hang_hysteresis" | "monitor.max_archived_logs" | "monitor.max_log_file_size" => {
             Ok(Some(int("count")?))
         }
@@ -3349,6 +3375,9 @@ pub fn merge_advanced(
                         );
                     }
                     "reference_log" => set(&mut m.reference_log)?,
+                    "heartbeat_command" => {
+                        m.heartbeat_command = Some(HeartbeatCommand::from_editor(value.trim()))
+                    }
                     "learner_stage_threshold" => {
                         let f = value
                             .trim()
@@ -3381,14 +3410,20 @@ pub fn merge_advanced(
                     _ => return Err(format!("unknown advanced key: {key}")),
                 }
             }
+            "download" => {
+                let download = config.download.get_or_insert_with(Default::default);
+                match field {
+                    "loader_cmd" => set(&mut download.loader_cmd)?,
+                    "list_devices_cmd" => set(&mut download.list_devices_cmd)?,
+                    _ => return Err(format!("unknown advanced key: {key}")),
+                }
+            }
             "flash" => {
                 let f = config.flash.get_or_insert(JsoncFlash::default());
                 match field {
                     "full_image_cmd" => set(&mut f.full_image_cmd)?,
                     "kernel_image_cmd" => set(&mut f.kernel_image_cmd)?,
                     "loader_bin" => set(&mut f.loader_bin)?,
-                    "loader_cmd" => set(&mut f.loader_cmd)?,
-                    "list_devices_cmd" => set(&mut f.list_devices_cmd)?,
                     _ => return Err(format!("unknown advanced key: {key}")),
                 }
             }
@@ -3468,6 +3503,9 @@ pub fn merge_dut_advanced(
                         );
                     }
                     "reference_log" => set(&mut m.reference_log)?,
+                    "heartbeat_command" => {
+                        m.heartbeat_command = Some(HeartbeatCommand::from_editor(value.trim()))
+                    }
                     "crash_keywords" => {
                         let keywords: Vec<String> = t
                             .split([',', '\n'])
@@ -3482,14 +3520,20 @@ pub fn merge_dut_advanced(
                     _ => return Err(format!("unknown advanced key: {key}")),
                 }
             }
+            "download" => {
+                let download = dut.download.get_or_insert_with(Default::default);
+                match field {
+                    "loader_cmd" => set(&mut download.loader_cmd)?,
+                    "list_devices_cmd" => set(&mut download.list_devices_cmd)?,
+                    _ => return Err(format!("unknown advanced key: {key}")),
+                }
+            }
             "flash" => {
                 let f = dut.flash.get_or_insert(JsoncFlash::default());
                 match field {
                     "full_image_cmd" => set(&mut f.full_image_cmd)?,
                     "kernel_image_cmd" => set(&mut f.kernel_image_cmd)?,
                     "loader_bin" => set(&mut f.loader_bin)?,
-                    "loader_cmd" => set(&mut f.loader_cmd)?,
-                    "list_devices_cmd" => set(&mut f.list_devices_cmd)?,
                     _ => return Err(format!("unknown advanced key: {key}")),
                 }
             }
@@ -3627,8 +3671,7 @@ fn build_config_from_answers(answers: &WizardAnswers) -> Result<TargetJsoncConfi
         download: None,
         control: None,
         loader: None,
-        reference_log: None,
-        dut_dir: None,
+
         lock_dir: None,
     };
     for host in &answers.hosts {
@@ -3662,8 +3705,6 @@ fn build_config_from_answers(answers: &WizardAnswers) -> Result<TargetJsoncConfi
                 download: None,
                 control: None,
                 loader: None,
-                reference_log: None,
-                dut_dir: None,
             };
             merge_dut_advanced(&mut dutc, &dut.advanced)?;
             duts.push(dutc);
@@ -3820,7 +3861,7 @@ fn relay_lines(relay: &JsoncRelay) -> Vec<Line> {
         ));
     }
     for (key, value, comment) in [
-        ("reset_ch", relay.reset_ch, Some(C_RELAY_CH_ALIASES)),
+        ("reset_ch", relay.reset_ch, Some(C_RELAY_CHANNEL)),
         ("download_ch", relay.download_ch, None),
         ("power_ch", relay.power_ch, Some(C_POWER_CH)),
         ("power_key_ch", relay.power_key_ch, Some(C_POWER_KEY_CH)),
@@ -3868,10 +3909,19 @@ fn monitor_lines(monitor: &JsoncMonitor) -> Vec<Line> {
             lines.push(Line::Key(key, v, None));
         }
     }
-    if let Some(r) = &monitor.reference_log {
+    if let Some(command) = &monitor.heartbeat_command {
+        let literal = match command {
+            HeartbeatCommand::Script(script) => {
+                serde_json::to_string(script).expect("serializing a string cannot fail")
+            }
+            HeartbeatCommand::Commands(commands) => pretty_array_literal(commands, 0),
+        };
+        lines.push(Line::Key("heartbeat_command", literal, None));
+    }
+    if let Some(reference_log) = &monitor.reference_log {
         lines.push(Line::Key(
             "reference_log",
-            serde_json::to_string(r).unwrap_or_else(|_| "\"\"".into()),
+            serde_json::to_string(reference_log).expect("serializing a string cannot fail"),
             None,
         ));
     }
@@ -3892,13 +3942,9 @@ fn monitor_lines(monitor: &JsoncMonitor) -> Vec<Line> {
 }
 
 /// Lines for a `flash` section body — only set keys.
-fn flash_lines(flash: &JsoncFlash) -> Vec<Line> {
+fn string_lines(fields: &[(&'static str, &Option<String>)]) -> Vec<Line> {
     let mut lines = Vec::new();
-    for (key, value) in [
-        ("full_image_cmd", &flash.full_image_cmd),
-        ("kernel_image_cmd", &flash.kernel_image_cmd),
-        ("loader_bin", &flash.loader_bin),
-    ] {
+    for &(key, value) in fields {
         if let Some(v) = value {
             lines.push(Line::Key(
                 key,
@@ -3978,7 +4024,21 @@ pub fn render_dut_block(dut: &JsoncDut, indent: usize) -> String {
     if let Some(flash) = &dut.flash {
         lines.push(render_section_block(
             "flash",
-            &flash_lines(flash),
+            &string_lines(&[
+                ("full_image_cmd", &flash.full_image_cmd),
+                ("kernel_image_cmd", &flash.kernel_image_cmd),
+                ("loader_bin", &flash.loader_bin),
+            ]),
+            indent + 2,
+        ));
+    }
+    if let Some(download) = &dut.download {
+        lines.push(render_section_block(
+            "download",
+            &string_lines(&[
+                ("loader_cmd", &download.loader_cmd),
+                ("list_devices_cmd", &download.list_devices_cmd),
+            ]),
             indent + 2,
         ));
     }
@@ -3999,22 +4059,6 @@ pub fn render_dut_block(dut: &JsoncDut, indent: usize) -> String {
             "loader",
             &serde_json::to_string(l).unwrap_or_else(|_| "\"\"".into()),
             None,
-        ));
-    }
-    if let Some(r) = &dut.reference_log {
-        lines.push(key_line(
-            &i2,
-            "reference_log",
-            &serde_json::to_string(r).unwrap_or_else(|_| "\"\"".into()),
-            Some(C_REFERENCE_LOG_DUT),
-        ));
-    }
-    if let Some(d) = &dut.dut_dir {
-        lines.push(key_line(
-            &i2,
-            "dut_dir",
-            &serde_json::to_string(d).unwrap_or_else(|_| "\"\"".into()),
-            Some(C_DUT_DIR),
         ));
     }
     lines.push(format!("{i}}},"));
@@ -4101,8 +4145,7 @@ pub fn render_jsonc(config: &TargetJsoncConfig, with_global_hints: bool) -> Stri
     out
 }
 
-/// Global fallback section blocks (indent 2), plus top-level back-compat
-/// reference_log/dut_dir keys. Empty list when nothing is set.
+/// Global fallback section blocks (indent 2); empty when nothing is set.
 fn render_global_section_blocks(config: &TargetJsoncConfig) -> Vec<String> {
     let mut blocks = Vec::new();
     if let Some(serial) = &config.serial {
@@ -4143,7 +4186,25 @@ fn render_global_section_blocks(config: &TargetJsoncConfig) -> Vec<String> {
         blocks.push(render_section_block("monitor", &monitor_lines(monitor), 2));
     }
     if let Some(flash) = &config.flash {
-        blocks.push(render_section_block("flash", &flash_lines(flash), 2));
+        blocks.push(render_section_block(
+            "flash",
+            &string_lines(&[
+                ("full_image_cmd", &flash.full_image_cmd),
+                ("kernel_image_cmd", &flash.kernel_image_cmd),
+                ("loader_bin", &flash.loader_bin),
+            ]),
+            2,
+        ));
+    }
+    if let Some(download) = &config.download {
+        blocks.push(render_section_block(
+            "download",
+            &string_lines(&[
+                ("loader_cmd", &download.loader_cmd),
+                ("list_devices_cmd", &download.list_devices_cmd),
+            ]),
+            2,
+        ));
     }
     if let Some(control) = &config.control {
         let mut ls = Vec::new();
@@ -4162,22 +4223,6 @@ fn render_global_section_blocks(config: &TargetJsoncConfig) -> Vec<String> {
             "loader",
             &serde_json::to_string(l).unwrap_or_else(|_| "\"\"".into()),
             None,
-        ));
-    }
-    if let Some(r) = &config.reference_log {
-        blocks.push(key_line(
-            "  ",
-            "reference_log",
-            &serde_json::to_string(r).unwrap_or_else(|_| "\"\"".into()),
-            Some(C_REFERENCE_LOG_DUT),
-        ));
-    }
-    if let Some(d) = &config.dut_dir {
-        blocks.push(key_line(
-            "  ",
-            "dut_dir",
-            &serde_json::to_string(d).unwrap_or_else(|_| "\"\"".into()),
-            Some(C_DUT_DIR),
         ));
     }
     blocks
@@ -4542,7 +4587,7 @@ fn line_comment_start(text: &str, pos: usize, open: usize) -> Option<usize> {
     let mut j = 0;
     while j < bytes.len() {
         match bytes[j] {
-            b'"' if j == 0 || bytes[j - 1] != b'\\' => in_str = !in_str,
+            b'"' if j == 0 || bytes[j - 1] != b'\\' => in_str.toggle(),
             b'/' if !in_str && j + 1 < bytes.len() && bytes[j + 1] == b'/' => {
                 return Some(line_start + j);
             }
@@ -4720,7 +4765,7 @@ pub fn apply_edit(text: &str, op: &EditOp) -> Result<String, String> {
                 .unwrap_or(text.len());
             let prefix_is_indent = text[line_start..key_span.0].trim().is_empty();
             let tail = text[value_span.1..line_end].trim_start();
-            let tail = tail.strip_prefix(',').unwrap_or(tail).trim_start();
+            let tail = tail.trim_prefix(',').trim_start();
             if prefix_is_indent && (tail.is_empty() || tail.starts_with("//")) {
                 return Ok(format!("{}{}", &text[..line_start], &text[line_end..]));
             }
@@ -4774,7 +4819,7 @@ pub fn apply_edit(text: &str, op: &EditOp) -> Result<String, String> {
                 .unwrap_or(text.len());
             let prefix_is_indent = text[line_start..start].trim().is_empty();
             let tail = text[end..line_end].trim_start();
-            let tail = tail.strip_prefix(',').unwrap_or(tail).trim_start();
+            let tail = tail.trim_prefix(',').trim_start();
             if prefix_is_indent && (tail.is_empty() || tail.starts_with("//")) {
                 return Ok(format!("{}{}", &text[..line_start], &text[line_end..]));
             }
@@ -4965,6 +5010,7 @@ fn field_to_static(field: &str) -> Result<&'static str, String> {
         "reset_time_ms" => Ok("reset_time_ms"),
         "power_off_time_ms" => Ok("power_off_time_ms"),
         "hang_timeout" => Ok("hang_timeout"),
+        "heartbeat_command" => Ok("heartbeat_command"),
         "hang_hysteresis" => Ok("hang_hysteresis"),
         "max_archived_logs" => Ok("max_archived_logs"),
         "max_log_file_size" => Ok("max_log_file_size"),
@@ -5373,8 +5419,6 @@ fn dut_jsonc(dut: &DutAnswers) -> Result<JsoncDut, String> {
         download: None,
         control: None,
         loader: None,
-        reference_log: None,
-        dut_dir: None,
     };
     merge_dut_advanced(&mut dutc, &dut.advanced)?;
     Ok(dutc)
@@ -5568,7 +5612,7 @@ fn compare_dut(
     }
     // relay — gate OFF leaves any existing relay section untouched
     // (append-only update: the written file keeps the section); gate ON
-    // diffs the sub-fields with default-equivalence ("ch340" type /
+    // diffs the sub-fields with default-equivalence ("ch340-relay" type /
     // zero-guarded numerics) — an unset answer ("0"/"") drops the key.
     if answers.relay_gate {
         let ex_relay = ex.relay.as_ref();
@@ -5584,7 +5628,7 @@ fn compare_dut(
             key: "type",
             existing: ex_relay.and_then(|r| r.relay_type.clone()),
             answer: answers.relay_type.clone(),
-            default: "ch340",
+            default: "ch340-relay",
             comment: Some(C_RELAY_TYPE),
         });
         changes.push(RelayChange {
@@ -5599,7 +5643,7 @@ fn compare_dut(
             existing: ex_relay.and_then(|r| r.reset_ch.map(num)),
             answer: answers.relay_reset_ch.clone(),
             default: "0",
-            comment: Some(C_RELAY_CH_ALIASES),
+            comment: Some(C_RELAY_CHANNEL),
         });
         changes.push(RelayChange {
             key: "download_ch",
@@ -6074,6 +6118,87 @@ mod tests {
     // ── Naming ────────────────────────────────────────────────────────
 
     #[test]
+    fn render_preserves_heartbeat_and_download_commands() {
+        let text = r#"{"monitor":{"heartbeat_command":"test -r /proc/uptime"},"download":{"loader_cmd":"load-global","list_devices_cmd":"list-global"},"dev_hosts":[{"ip":"localhost","duts":[{"dut_name":"board","monitor":{"heartbeat_command":"printf 'ok'"},"download":{"loader_cmd":"load-board","list_devices_cmd":"list-board"}}]}]}"#;
+        let config = parse_jsonc_text(text).unwrap();
+        let rendered = render_jsonc(&config, false);
+        let result = parse_jsonc_text(&rendered).unwrap();
+        assert_eq!(
+            result.monitor.unwrap().heartbeat_command.unwrap().script(),
+            "test -r /proc/uptime"
+        );
+        let download = result.download.unwrap();
+        assert_eq!(download.loader_cmd.as_deref(), Some("load-global"));
+        assert_eq!(download.list_devices_cmd.as_deref(), Some("list-global"));
+        let dut = &result.dev_hosts[0].duts[0];
+        assert_eq!(
+            dut.monitor
+                .as_ref()
+                .unwrap()
+                .heartbeat_command
+                .as_ref()
+                .unwrap()
+                .script(),
+            "printf 'ok'"
+        );
+        let download = dut.download.as_ref().unwrap();
+        assert_eq!(download.loader_cmd.as_deref(), Some("load-board"));
+        assert_eq!(download.list_devices_cmd.as_deref(), Some("list-board"));
+    }
+
+    #[test]
+    fn heartbeat_advanced_edit_roundtrips_and_validates() {
+        let key = "monitor.heartbeat_command";
+        let script = "test -r /proc/uptime && printf 'ready\\n'";
+        let mut config = parse_jsonc_text(r#"{"dev_hosts":[]}"#).unwrap();
+        merge_advanced(&mut config, &HashMap::from([(key.into(), script.into())])).unwrap();
+        assert_eq!(advanced_current(&config)[key], script);
+        let result = parse_jsonc_text(&render_jsonc(&config, false)).unwrap();
+        assert_eq!(
+            result.monitor.unwrap().heartbeat_command.unwrap().script(),
+            script
+        );
+        assert_eq!(
+            field_to_static("heartbeat_command").unwrap(),
+            "heartbeat_command"
+        );
+        for invalid in ["bad\0command".into(), "界".repeat(129)] {
+            assert!(advanced_literal(key, &invalid).unwrap_err().contains(key));
+        }
+    }
+
+    #[test]
+    fn heartbeat_arrays_survive_render_and_editor_updates() {
+        let text = r#"{"monitor":{"heartbeat_command":["test -r /proc/uptime","cat /proc/uptime"]},"dev_hosts":[{"ip":"localhost","duts":[{"dut_name":"board","monitor":{"heartbeat_command":["printf board"]}}]}]}"#;
+        let mut config = parse_jsonc_text(text).unwrap();
+        let rendered = render_jsonc(&config, false);
+        let result = parse_jsonc_text(&rendered).unwrap();
+        assert!(
+            matches!(result.monitor.unwrap().heartbeat_command, Some(HeartbeatCommand::Commands(commands)) if commands.len() == 2)
+        );
+        assert!(
+            matches!(&result.dev_hosts[0].duts[0].monitor.as_ref().unwrap().heartbeat_command, Some(HeartbeatCommand::Commands(commands)) if commands == &["printf board"])
+        );
+        let value = advanced_current(&config)["monitor.heartbeat_command"].clone();
+        let literal = advanced_literal("monitor.heartbeat_command", &value)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Vec<String>>(&literal).unwrap(),
+            ["test -r /proc/uptime", "cat /proc/uptime"]
+        );
+        merge_advanced(
+            &mut config,
+            &HashMap::from([("monitor.heartbeat_command".into(), value)]),
+        )
+        .unwrap();
+        assert!(matches!(
+            config.monitor.unwrap().heartbeat_command,
+            Some(HeartbeatCommand::Commands(_))
+        ));
+    }
+
+    #[test]
     fn test_next_free_dut_name() {
         assert_eq!(next_free_dut_name("dut", &["dut1".into()]), "dut2");
     }
@@ -6204,8 +6329,7 @@ mod tests {
             download: None,
             control: None,
             loader: None,
-            reference_log: None,
-            dut_dir: None,
+
             lock_dir: None,
         };
         let answers = HashMap::from([
@@ -6268,7 +6392,7 @@ mod tests {
             "rfc2217": false
           },
           "target": { "login_user": "root", "login_pass": "" },
-          "relay": { "type": "ch340" }
+          "relay": { "type": "ch340-relay" }
         },
         {
           "dut_name": "board2",
@@ -6433,7 +6557,7 @@ mod tests {
                 login_prompt: None,
             }),
             relay: Some(JsoncRelay {
-                relay_type: Some("ch340".into()),
+                relay_type: Some("ch340-relay".into()),
                 port: None,
                 ip: None,
                 reset_ch: None,
@@ -6449,8 +6573,6 @@ mod tests {
             download: None,
             control: None,
             loader: None,
-            reference_log: None,
-            dut_dir: None,
         };
         let op = EditOp::AppendBlock {
             path: vec![key("dev_hosts"), PathSeg::Index(0), key("duts")],
@@ -6538,8 +6660,7 @@ mod tests {
 
     #[test]
     fn test_remove_key_removes_line() {
-        let text =
-            "{\n  \"lock_dir\": \"/tmp/x\",  // comment\n  \"dut_dir\": \".dut-serial\"\n}\n";
+        let text = "{\n  \"lock_dir\": \"/tmp/x\",  // comment\n  \"loader\": \"loader.bin\"\n}\n";
         let op = EditOp::RemoveKey {
             path: vec![],
             key: "lock_dir".into(),
@@ -6547,7 +6668,7 @@ mod tests {
         let result = apply_edits(text, &[op]).unwrap();
         parse_jsonc_text(&result).unwrap_or_else(|e| panic!("{e}\n{result}"));
         assert!(!result.contains("lock_dir"), "{result}");
-        assert!(result.contains("dut_dir"), "{result}");
+        assert!(result.contains("loader"), "{result}");
     }
 
     // ── Renderer ──────────────────────────────────────────────────────
@@ -6606,7 +6727,7 @@ mod tests {
                     serial_port: "41002".into(),
                     login_user: "root".into(),
                     relay_gate: true,
-                    relay_type: "ch340".into(),
+                    relay_type: "ch340-relay".into(),
                     relay_port: String::new(),
                     relay_reset_ch: "1".into(),
                     relay_download_ch: String::new(),
@@ -6754,7 +6875,7 @@ mod tests {
         let path = tmp.path().join(CONFIG_FILE_NAME);
         std::fs::write(
             &path,
-            "{\n  // untouched\n  \"dev_hosts\": [\n    {\n      \"ip\": \"10.0.0.1\",\n      \"user\": \"u\",\n      \"pass\": \"\",\n      \"duts\": [\n        {\n          \"dut_name\": \"board1\",\n          \"serial\": { \"port\": 41000, \"baudrate\": 460800 },\n          \"target\": { \"login_user\": \"root\" },\n          \"relay\": { \"type\": \"ch340\" }\n        }\n      ]\n    }\n  ]\n}\n",
+            "{\n  // untouched\n  \"dev_hosts\": [\n    {\n      \"ip\": \"10.0.0.1\",\n      \"user\": \"u\",\n      \"pass\": \"\",\n      \"duts\": [\n        {\n          \"dut_name\": \"board1\",\n          \"serial\": { \"port\": 41000, \"baudrate\": 460800 },\n          \"target\": { \"login_user\": \"root\" },\n          \"relay\": { \"type\": \"ch340-relay\" }\n        }\n      ]\n    }\n  ]\n}\n",
         )
         .unwrap();
         let before = std::fs::read_to_string(&path).unwrap();
@@ -6782,29 +6903,59 @@ mod tests {
         // Host 0 keeps its identity; port + login_user change; a second
         // DUT and a second host are appended. Canned answers in ask order.
         let inputs = [
-            "2",        // host count
-            "10.0.0.1", // host 0 ip (same)
-            "linaro",   // host 0 user (same)
-            "",         // host 0 pass (same)
-            "",         // host 0 name (same)
-            "2",        // host 0 dut count (one appended)
-            "board1",   // dut 0 name (same)
-            "41003",    // dut 0 port (CHANGED)
-            "ubuntu",   // dut 0 login_user (CHANGED)
-            "ch340",    // dut 0 relay.type (same)
-            "",         // dut 0 relay.port (inherit)
-            "",         // dut 0 relay.reset_ch (inherit)
-            "",         // dut 0 relay.download_ch (inherit)
-            "",         // dut 0 relay.power_ch (inherit)
-            "",         // relay.power_key_ch (inherit)
-            "",         // dut 0 relay.reset_time_ms (inherit)
-            "",         // dut 0 relay.power_off_time_ms (default 3000 -> no-op)
-            "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "",
+            "2",           // host count
+            "10.0.0.1",    // host 0 ip (same)
+            "linaro",      // host 0 user (same)
+            "",            // host 0 pass (same)
+            "",            // host 0 name (same)
+            "2",           // host 0 dut count (one appended)
+            "board1",      // dut 0 name (same)
+            "41003",       // dut 0 port (CHANGED)
+            "ubuntu",      // dut 0 login_user (CHANGED)
+            "ch340-relay", // dut 0 relay.type (same)
+            "",            // dut 0 relay.port (inherit)
+            "",            // dut 0 relay.reset_ch (inherit)
+            "",            // dut 0 relay.download_ch (inherit)
+            "",            // dut 0 relay.power_ch (inherit)
+            "",            // relay.power_key_ch (inherit)
+            "",            // dut 0 relay.reset_time_ms (inherit)
+            "",            // dut 0 relay.power_off_time_ms (default 3000 -> no-op)
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
             "",       // dut 0 advanced (bare Enter x17)
             "board2", // dut 1 name (same)
             "41001",  // dut 1 port (same)
             "root",   // dut 1 login_user (same; section missing -> default no-op)
-            "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
             "",         // dut 1 advanced (bare Enter x17)
             "10.0.0.2", // host 1 ip
             "",         // host 1 user
@@ -6814,7 +6965,22 @@ mod tests {
             "",         // dut name -> dut2 (auto)
             "41004",    // port
             "",         // login user -> root
-            "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
             "", // dut advanced (bare Enter x17)
         ];
         let mut io = CannedIO::new(&inputs);
@@ -7176,8 +7342,23 @@ mod tests {
         std::fs::write(&path, LOCATE_FIXTURE).unwrap();
         // Same answers as the fixture (1 host, 2 duts).
         let mut inputs: Vec<String> = [
-            "1", "10.0.0.1", "linaro", "", "", "2", "board1", "41000", "root", "ch340", "", "", "",
-            "", "", "", "",
+            "1",
+            "10.0.0.1",
+            "linaro",
+            "",
+            "",
+            "2",
+            "board1",
+            "41000",
+            "root",
+            "ch340-relay",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
         ]
         .iter()
         .map(|s| s.to_string())
@@ -7294,7 +7475,7 @@ mod tests {
         let path = tmp.path().join(CONFIG_FILE_NAME);
         std::fs::write(
             &path,
-            "{\n  \"dev_hosts\": [\n    {\n      \"ip\": \"10.0.0.1\",\n      \"user\": \"u\",\n      \"pass\": \"\",\n      \"duts\": [\n        {\n          \"dut_name\": \"board1\",\n          \"serial\": { \"port\": 41000 },\n          \"target\": { \"login_user\": \"root\" },\n          \"relay\": { \"type\": \"ch340\" }\n        }\n      ]\n    }\n  ]\n}\n",
+            "{\n  \"dev_hosts\": [\n    {\n      \"ip\": \"10.0.0.1\",\n      \"user\": \"u\",\n      \"pass\": \"\",\n      \"duts\": [\n        {\n          \"dut_name\": \"board1\",\n          \"serial\": { \"port\": 41000 },\n          \"target\": { \"login_user\": \"root\" },\n          \"relay\": { \"type\": \"ch340-relay\" }\n        }\n      ]\n    }\n  ]\n}\n",
         )
         .unwrap();
         std::fs::write(
@@ -7782,23 +7963,51 @@ mod tests {
         let path = tmp.path().join(CONFIG_FILE_NAME);
         std::fs::write(&path, LOCATE_FIXTURE).unwrap();
         let mut io = RecordingIO::new(&[
-            "1",      // host count
-            "",       // ip -> 10.0.0.1 (shown default)
-            "linaro", // user
-            "",       // pass
-            "",       // host name
-            "2",      // dut count
-            "",       // dut 0 name -> board1
-            "",       // dut 0 port -> 41000 (shown default)
-            "root",   // login user
-            "ch340",  // relay type (gate ON: board1 has a relay section)
-            "", "", "", "", "", "", "", // port/channels/times (inherit)
-            "", "", "", "", "", "", "", "", "", "", "", "",
+            "1",           // host count
+            "",            // ip -> 10.0.0.1 (shown default)
+            "linaro",      // user
+            "",            // pass
+            "",            // host name
+            "2",           // dut count
+            "",            // dut 0 name -> board1
+            "",            // dut 0 port -> 41000 (shown default)
+            "root",        // login user
+            "ch340-relay", // relay type (gate ON: board1 has a relay section)
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "", // port/channels/times (inherit)
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
             "",     // dut 0 advanced (bare Enter x13)
             "",     // dut 1 name -> board2
             "",     // dut 1 port -> "41001" (shown default)
             "root", // login user
-            "", "", "", "", "", "", "", "", "", "", "", "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
             "", // dut 1 advanced (bare Enter x13)
         ]);
         let outcome = run_init(&mut io, &quick_opts(), tmp.path()).unwrap();
@@ -8221,7 +8430,7 @@ mod tests {
     /// — the CannedIO exhaustion boundary (QUICK_ANSWERS) stays green with
     /// zero fixture reordering.
     #[test]
-    fn test_schema_fields_order_matches_legacy_sequence() {
+    fn test_schema_fields_order_matches_canned_io_sequence() {
         let schema = build_form_schema(None, &quick_opts());
         let keys: Vec<FieldKey> = schema_fields(&schema).into_iter().map(|f| f.key).collect();
         let mut expected: Vec<FieldKey> = vec![
@@ -8401,7 +8610,7 @@ mod tests {
                      "default": "RuntimeRelayGate"},
                     {"key": "DutRelayType", "kind": "Select", "label": "Relay type",
                      "required": false, "empty": "AcceptDefault",
-                     "default": {"Static": "ch340"}},
+                     "default": {"Static": "ch340-relay"}},
                     {"key": "DutRelayPort", "kind": "Text",
                      "label": "Relay port (0 = inherit)",
                      "required": false, "empty": "SkipInherit",
@@ -8465,6 +8674,10 @@ mod tests {
             ("uboot.interrupt_strategy", "U-Boot interrupt strategy"),
             ("uboot.pattern", "U-Boot interrupt pattern regex"),
             ("monitor.hang_timeout", "Hang timeout seconds"),
+            (
+                "monitor.heartbeat_command",
+                "Heartbeat commands (shell or JSON array)",
+            ),
             ("monitor.max_archived_logs", "Max archived boot logs"),
             ("monitor.max_log_file_size", "Max log file size MB"),
             ("monitor.reference_log", "Reference boot log path"),
@@ -8491,6 +8704,7 @@ mod tests {
             "uboot.interrupt_char",
             "uboot.interrupt_strategy",
             "monitor.hang_timeout",
+            "monitor.heartbeat_command",
             "monitor.max_archived_logs",
             "monitor.max_log_file_size",
             "monitor.reference_log",
@@ -8615,7 +8829,7 @@ mod tests {
           "dut_name": "board1",
           "serial": { "port": 41000, "baudrate": 460800 },
           "target": { "login_user": "root" },
-          "relay": { "type": "ch340" }
+          "relay": { "type": "ch340-relay" }
         }
       ]
     }
@@ -8644,7 +8858,7 @@ mod tests {
         assert_eq!(h0.duts[0].serial_port.as_deref(), Some("41000"));
         assert_eq!(h0.duts[1].serial_port.as_deref(), Some("41001"));
         assert_eq!(h0.duts[0].login_user.as_deref(), Some("root"));
-        assert_eq!(h0.duts[0].relay_type.as_deref(), Some("ch340"));
+        assert_eq!(h0.duts[0].relay_type.as_deref(), Some("ch340-relay"));
         // The relay gate prefills from the existing relay section presence:
         // board1 has one (YES + fields), board2 does not (NO).
         assert!(h0.duts[0].relay_gate, "board1 has a relay section");
@@ -8773,14 +8987,14 @@ mod tests {
         // Gate YES with typed fields: the section materializes.
         let mut inputs: Vec<String> = QUICK_ANSWERS[..9].iter().map(|s| s.to_string()).collect();
         inputs.extend([
-            "ch340".into(), // type
-            "".into(),      // port (inherit)
-            "2".into(),     // reset_ch
-            "".into(),      // download_ch
-            "".into(),      // power_ch
-            "".into(),      // power_key_ch
-            "100".into(),   // reset_time_ms
-            "1000".into(),  // power_off_time_ms (clamped to 3000)
+            "ch340-relay".into(), // type
+            "".into(),            // port (inherit)
+            "2".into(),           // reset_ch
+            "".into(),            // download_ch
+            "".into(),            // power_ch
+            "".into(),            // power_key_ch
+            "100".into(),         // reset_time_ms
+            "1000".into(),        // power_off_time_ms (clamped to 3000)
         ]);
         inputs.extend(dut_advanced_empties());
         let mut io = CannedIO::new(&[]);
@@ -8941,7 +9155,7 @@ mod tests {
         );
         assert_eq!(
             by_key(&FieldKey::DutRelayType(0, 0)).default.as_deref(),
-            Some("ch340")
+            Some("ch340-relay")
         );
         // Relay picker options come from the compiled backends.
         let relay = by_key(&FieldKey::DutRelayType(0, 0));
@@ -10596,7 +10810,7 @@ mod tests {
     // ── fill_defaults (headless) ───────────────────────────────────────
 
     #[test]
-    fn test_fill_defaults_create_matches_legacy() {
+    fn test_fill_defaults_create_shape() {
         let schema = build_form_schema(None, &quick_opts());
         let answers = fill_defaults(&schema);
         assert_eq!(answers.hosts.len(), 1);
@@ -10662,7 +10876,7 @@ mod tests {
         // The DUT's OWN relay section pre-fills the gate: board1 has one
         // (YES + type), so a headless update keeps it.
         assert!(answers.hosts[0].duts[0].relay_gate);
-        assert_eq!(answers.hosts[0].duts[0].relay_type, "ch340");
+        assert_eq!(answers.hosts[0].duts[0].relay_type, "ch340-relay");
         assert!(answers.announcements.is_empty());
         // Non-advanced headless update: no advanced answers at all.
         let quick = build_form_schema(Some(&existing), &quick_opts());
@@ -10699,9 +10913,11 @@ mod tests {
         )
         .unwrap();
         let err = prepare_init(tmp.path(), &quick_opts()).unwrap_err();
-        assert!(err.contains("renamed to host_name"), "{err}");
+        // The removed key is a plain unknown-field rejection (no rename
+        // hint), and init refuses to edit an unparseable file.
+        assert!(err.contains("unknown field"), "{err}");
+        assert!(err.contains("alias"), "{err}");
         assert!(err.contains("refusing to edit"), "{err}");
-        assert!(err.contains("re-run 'dutabo init'"), "{err}");
     }
 
     #[test]

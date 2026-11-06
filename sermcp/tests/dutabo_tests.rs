@@ -39,9 +39,8 @@ fn free_loopback_port() -> u16 {
         .port()
 }
 
-/// Minimal single-host / single-DUT JSONC fixture (no duts → default DUT).
-const SIMPLE_JSONC: &str =
-    r#"{"dev_hosts":[{"ip":"10.0.0.1","user":"test"}],"serial":{"port":41000}}"#;
+/// Minimal single-host / single-DUT JSONC fixture.
+const SIMPLE_JSONC: &str = r#"{"dev_hosts":[{"ip":"10.0.0.1","user":"test","duts":[{"dut_name":"default","serial":{"port":41000}}]}]}"#;
 
 // ── list ────────────────────────────────────────────────────────────────
 
@@ -50,7 +49,7 @@ fn test_list_single_dut() {
     let tmp = tempfile::TempDir::new().unwrap();
     make_config(
         tmp.path(),
-        r#"{"dev_hosts":[{"ip":"10.0.0.1","user":"test"}],"serial":{"port":41000},"target":{"login_user":"root"}}"#,
+        r#"{"dev_hosts":[{"ip":"10.0.0.1","user":"test","duts":[{"dut_name":"default","serial":{"port":41000}}]}],"target":{"login_user":"root"}}"#,
     );
     let out = Command::new(dutabo_bin())
         .arg("list")
@@ -93,10 +92,10 @@ fn test_list_multi_dut() {
     assert!(stdout.contains("test@10.0.0.1"), "{stdout}");
 }
 
+/// A dev host without `duts[]` is a configuration error, not a synthesized
+/// default DUT: every host must declare its boards explicitly.
 #[test]
-fn test_list_backward_compat() {
-    // The single-dev-host shape: no duts[] → one default DUT that
-    // inherits the global serial.port.
+fn test_list_rejects_config_without_duts() {
     let tmp = tempfile::TempDir::new().unwrap();
     make_config(
         tmp.path(),
@@ -107,8 +106,12 @@ fn test_list_backward_compat() {
         .current_dir(tmp.path())
         .output()
         .unwrap();
-    assert!(out.status.success());
-    assert!(String::from_utf8_lossy(&out.stdout).contains("9999"));
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("No DUTs configured"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 #[test]
@@ -141,7 +144,7 @@ fn test_list_stray_file_plain_missing_error() {
 }
 
 #[test]
-fn test_list_empty_dut_default() {
+fn test_list_single_dut_default_name() {
     let tmp = tempfile::TempDir::new().unwrap();
     make_config(tmp.path(), SIMPLE_JSONC);
     let out = Command::new(dutabo_bin())
@@ -293,12 +296,9 @@ fn test_list_json_output() {
             .unwrap()
             .contains("board-a:crashed")
     );
-    // mcp_port comes from ports::project_dut_mcp_port — the value the
-    // SessionStart hook will consume after it switches to this JSON.
-    assert_eq!(
-        crashed["mcp_port"].as_u64().unwrap(),
-        u64::from(sermcp::ports::project_dut_mcp_port(tmp.path(), "board-a"))
-    );
+    // The redundant per-DUT `mcp_port` field is gone from the wire shape:
+    // consumers read the inventory header's `mcp_http_port` instead.
+    assert!(crashed.get("mcp_port").is_none(), "{stdout}");
     // Missing state file → unknown, age null, not critical (never a
     // silently-healthy state).
     let missing = &json["duts"][2];
@@ -459,7 +459,8 @@ fn test_serial_help_does_not_open_console() {
 // ── status / reboot / uboot (no server) ─────────────────────────────────
 
 /// No-server fixture: 127.0.0.1 with an unused ser2net port.
-const NO_SERVER_JSONC: &str = r#"{"dev_hosts":[{"ip":"127.0.0.1"}],"serial":{"port":59999}}"#;
+const NO_SERVER_JSONC: &str =
+    r#"{"dev_hosts":[{"ip":"127.0.0.1","duts":[{"dut_name":"default","serial":{"port":59999}}]}]}"#;
 
 #[test]
 fn test_status_without_server() {
@@ -547,7 +548,7 @@ fn test_uf_nonexistent_image() {
     let tmp = tempfile::TempDir::new().unwrap();
     make_config(
         tmp.path(),
-        r#"{"dev_hosts":[{"ip":"127.0.0.1"}],"serial":{"port":59999},"flash":{"full_image_cmd":"uf {image}"}}"#,
+        r#"{"dev_hosts":[{"ip":"127.0.0.1","duts":[{"dut_name":"default","serial":{"port":59999}}]}],"flash":{"full_image_cmd":"uf {image}"}}"#,
     );
     let out = Command::new(dutabo_bin())
         .args(["uf", "/tmp/nonexistent_12345.img"])
@@ -756,7 +757,7 @@ fn test_button_tool_failure_exits_nonzero() {
     let tmp = tempfile::TempDir::new().unwrap();
     make_config(
         tmp.path(),
-        r#"{"dev_hosts":[{"ip":"127.0.0.1"}],"serial":{"port":41000}}"#,
+        r#"{"dev_hosts":[{"ip":"127.0.0.1","duts":[{"dut_name":"default","serial":{"port":41000}}]}]}"#,
     );
     let port = spawn_failing_mcp_server(
         &serde_json::json!({"success": false, "error": "relay offline"}).to_string(),
@@ -785,7 +786,7 @@ fn test_reboot_tool_failure_exits_nonzero() {
     let tmp = tempfile::TempDir::new().unwrap();
     make_config(
         tmp.path(),
-        r#"{"dev_hosts":[{"ip":"127.0.0.1"}],"serial":{"port":41000}}"#,
+        r#"{"dev_hosts":[{"ip":"127.0.0.1","duts":[{"dut_name":"default","serial":{"port":41000}}]}]}"#,
     );
     let port = spawn_failing_mcp_server(
         &serde_json::json!({"success": false, "error": "relay offline"}).to_string(),
@@ -812,7 +813,7 @@ fn test_relay_disabled() {
     let tmp = tempfile::TempDir::new().unwrap();
     make_config(
         tmp.path(),
-        r#"{"dev_hosts":[{"ip":"10.0.0.1"}],"serial":{"port":41000},"relay":{}}"#,
+        r#"{"dev_hosts":[{"ip":"10.0.0.1","duts":[{"dut_name":"default","serial":{"port":41000}}]}],"relay":{}}"#,
     );
     let out = Command::new(dutabo_bin())
         .arg("list")

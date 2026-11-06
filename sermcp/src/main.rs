@@ -37,6 +37,7 @@ Options:
                      Default: info level to {project}/.dut-serial/mcp.log.
       --log-to-stderr  Log to stderr instead of file (useful for debugging).
       --http [HOST:PORT]  Run as Streamable HTTP server (default: 127.0.0.1:3000).
+      --persistent      Keep HTTP server alive independently of Agent sessions
       --idle-timeout N   When --http, exit after N seconds with no HTTP/WS activity
                          (default: 600; pass 0 to disable). GET /health does not
                          count as client activity.
@@ -59,7 +60,7 @@ Configuration:
   endpoint fallback.
 
 MCP Tools:
-  serial_send_command  - Execute shell command on target
+  serial_exec          - Execute a console command (shell or U-Boot mode)
   serial_get_state     - Get target state and metadata
   serial_get_logs      - Retrieve serial logs with pattern filtering
   serial_list_logs     - List archived boot logs
@@ -68,7 +69,6 @@ MCP Tools:
   serial_button        - Control a DUT button (reset/download) — any SoC's
                          boot-mode sequence is composed from this generic tool.
   serial_wait_pattern  - Wait for regex pattern in serial output
-  serial_uboot_command - Send command at U-Boot prompt
   serial_poll_logs     - Get new serial output since last poll
   serial_get_config    - Show current target configuration
   serial_claim         - Claim serial ownership
@@ -96,9 +96,8 @@ Troubleshooting:
   # Check hardware connectivity:
   bash scripts/diagnose.sh
 
-  # Restart this project's MCP server (never pkill globally — other project
-  # paths have independent servers):
-  kill $(cat .dut-serial/mcp.pid)
+  # Restart this project's persistent MCP server:
+  dutabo stop --agent && dutabo start --agent
 
   # Install CLI tool for manual debug:
   rustup target add x86_64-unknown-linux-musl
@@ -449,7 +448,14 @@ fn backfill_owner_anchor(dut_serial: &std::path::Path) {
     // Dedup: the heartbeat calls this every 30s; rewriting owner.json when
     // the anchor pid is already ours would churn the file (and fire dsh's
     // fs.watch) for nothing.
-    if value.get("owner_mcp_pid").and_then(|v| v.as_u64()) == Some(std::process::id() as u64) {
+    if value
+        .get("owner_mcp_pid")
+        .and_then(|v| v.as_u64())
+        .is_some_and(|pid| {
+            pid == u64::from(std::process::id())
+                || u32::try_from(pid).is_ok_and(lib::lock_manager::process_alive)
+        })
+    {
         return;
     }
     value["owner_mcp_pid"] = serde_json::json!(std::process::id());
@@ -513,6 +519,7 @@ async fn main() {
     let mut verbose = false;
     let mut log_to_stderr = false;
     let mut http_mode = false;
+    let mut persistent = false;
     let mut http_bind = "127.0.0.1:3000".to_string();
     // HTTP-mode self-cleanup (default ON): a detached `--http` server has no
     // parent to reap it, so without an idle timeout it outlives every client
@@ -530,11 +537,11 @@ async fn main() {
         match args[i].as_str() {
             "-h" | "--help" => {
                 print_help();
-                lib::trace_chrome::exit_with_trace(0);
+                lib::trace_perfetto::exit_with_trace(0);
             }
             "-V" | "--version" => {
                 print_version();
-                lib::trace_chrome::exit_with_trace(0);
+                lib::trace_perfetto::exit_with_trace(0);
             }
             "-v" | "--verbose" => verbose = true,
             "--log-to-stderr" => log_to_stderr = true,
@@ -547,6 +554,7 @@ async fn main() {
                     http_bind = args[i].clone();
                 }
             }
+            "--persistent" => persistent = true,
             "--idle-timeout" => {
                 if i + 1 < args.len() && !args[i + 1].starts_with('-') {
                     i += 1;
@@ -555,22 +563,30 @@ async fn main() {
                         Ok(n) => idle_timeout = Some(n),
                         Err(e) => {
                             eprintln!("Invalid --idle-timeout value '{}': {e}", args[i]);
-                            lib::trace_chrome::exit_with_trace(1);
+                            lib::trace_perfetto::exit_with_trace(1);
                         }
                     }
                 } else {
                     eprintln!("--idle-timeout requires a numeric argument (seconds)");
-                    lib::trace_chrome::exit_with_trace(1);
+                    lib::trace_perfetto::exit_with_trace(1);
                 }
             }
             "--dry-run" => dry_run = true,
             other => {
                 eprintln!("Unknown option: {other}");
                 eprintln!("Use --help for usage information.");
-                lib::trace_chrome::exit_with_trace(1);
+                lib::trace_perfetto::exit_with_trace(1);
             }
         }
         i += 1;
+    }
+
+    if persistent {
+        if !http_mode {
+            eprintln!("--persistent requires --http");
+            lib::trace_perfetto::exit_with_trace(1);
+        }
+        idle_timeout = None;
     }
 
     // ── Initialize logging ──
@@ -590,7 +606,10 @@ async fn main() {
         // Logs go to stderr (for debugging) — span lifecycles are printed for pipeline tracing
         let registry = registry.with(
             tracing_subscriber::fmt::layer()
-                .with_writer(std::io::stderr)
+                .with_writer(
+                    lib::diagnostic_log::start(std::io::stderr())
+                        .expect("cannot start diagnostic writer"),
+                )
                 .with_ansi(true)
                 .with_target(true)
                 .with_span_events(FmtSpan::NEW | FmtSpan::CLOSE)
@@ -612,15 +631,16 @@ async fn main() {
         std::fs::create_dir_all(&log_dir).ok();
         rotate_mcp_log(&log_dir);
         let log_file = log_dir.join("mcp.log");
+        let log_output = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_file)
+            .unwrap_or_else(|error| panic!("Cannot open log file {log_file:?}: {error}"));
         let registry = registry.with(
             tracing_subscriber::fmt::layer()
-                .with_writer(move || {
-                    std::fs::OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open(&log_file)
-                        .unwrap_or_else(|_| panic!("Cannot open log file: {log_file:?}"))
-                })
+                .with_writer(
+                    lib::diagnostic_log::start(log_output).expect("cannot start diagnostic writer"),
+                )
                 .with_ansi(false)
                 .with_target(true)
                 .with_span_events(FmtSpan::NEW | FmtSpan::CLOSE)
@@ -655,7 +675,7 @@ async fn main() {
             "CONFIG ERROR: {guidance} cwd={}, TARGET_CONF={target_conf:?}",
             cwd.display()
         );
-        lib::trace_chrome::exit_with_trace(1);
+        lib::trace_perfetto::exit_with_trace(1);
     }
 
     // ── Validate config ──
@@ -663,7 +683,7 @@ async fn main() {
         for e in &errors {
             eprintln!("CONFIG ERROR: {e}");
         }
-        lib::trace_chrome::exit_with_trace(1);
+        lib::trace_perfetto::exit_with_trace(1);
     }
     // ── Dry-run: validate config and exit ──
     if dry_run {
@@ -696,14 +716,14 @@ async fn main() {
         );
         if cfg.dev_host_ip().is_empty() {
             eprintln!("\nERROR: dev_host.ip not set. Edit .target.jsonc");
-            lib::trace_chrome::exit_with_trace(1);
+            lib::trace_perfetto::exit_with_trace(1);
         }
         if cfg.serial_target().is_empty() || cfg.serial_target() == "0" {
             eprintln!("\nERROR: serial.port not set. Edit .target.jsonc");
-            lib::trace_chrome::exit_with_trace(1);
+            lib::trace_perfetto::exit_with_trace(1);
         }
         eprintln!("\nConfig OK. No errors found.");
-        lib::trace_chrome::exit_with_trace(0);
+        lib::trace_perfetto::exit_with_trace(0);
     }
 
     // ── Diagnose: test connectivity and exit ──
@@ -755,7 +775,7 @@ async fn main() {
         }
 
         eprintln!("\nDiagnostics complete.");
-        lib::trace_chrome::exit_with_trace(0);
+        lib::trace_perfetto::exit_with_trace(0);
     }
 
     let project_dir = cfg
@@ -763,33 +783,35 @@ async fn main() {
         .clone()
         .expect("validated project directory");
 
-    if project_dir.join(".dut-serial/stopped").exists() {
-        eprintln!("Project MCP is stopped. Run dutabo resume in this project before reconnecting.");
-        lib::trace_chrome::exit_with_trace(1);
-    }
-
-    let session_owner = match lib::lifecycle::SessionOwner::from_environment() {
-        Ok(Some(owner)) => Some(owner),
-        Ok(None) if !http_mode => {
-            #[cfg(target_os = "linux")]
-            {
-                Some(
-                    lib::lifecycle::SessionOwner::capture(unsafe { libc::getppid() } as u32, None)
+    let session_owner = if persistent {
+        None
+    } else {
+        match lib::lifecycle::SessionOwner::from_environment() {
+            Ok(Some(owner)) => Some(owner),
+            Ok(None) if !http_mode => {
+                #[cfg(target_os = "linux")]
+                {
+                    Some(
+                        lib::lifecycle::SessionOwner::capture(
+                            unsafe { libc::getppid() } as u32,
+                            None,
+                        )
                         .unwrap_or_else(|error| {
                             eprintln!("Cannot bind stdio session lifetime: {error}");
-                            lib::trace_chrome::exit_with_trace(1)
+                            lib::trace_perfetto::exit_with_trace(1)
                         }),
-                )
+                    )
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    None
+                }
             }
-            #[cfg(not(target_os = "linux"))]
-            {
-                None
+            Ok(None) => None,
+            Err(error) => {
+                eprintln!("Invalid session lifetime binding: {error}");
+                lib::trace_perfetto::exit_with_trace(1);
             }
-        }
-        Ok(None) => None,
-        Err(error) => {
-            eprintln!("Invalid session lifetime binding: {error}");
-            lib::trace_chrome::exit_with_trace(1);
         }
     };
     // Verified HTTP sessions own the lifetime even while clients are idle.
@@ -801,7 +823,7 @@ async fn main() {
     if http_mode && session_owner.is_some() {
         idle_timeout = None;
     }
-    if http_mode && idle_timeout.is_none() {
+    if http_mode && idle_timeout.is_none() && !persistent {
         tracing::warn!(
             session_bound = session_owner.is_some(),
             "[AGENT-NOTIFY] idle-timeout disabled; endpoint ownership lasts until shutdown; hosts without SessionEnd require session-process supervision"
@@ -827,8 +849,36 @@ async fn main() {
     // metadata alone never authorizes terminating it.
     let managed_configs = cfg.managed_dut_configs().unwrap_or_else(|error| {
         eprintln!("CONFIG ERROR: {error}");
-        lib::trace_chrome::exit_with_trace(1)
+        lib::trace_perfetto::exit_with_trace(1)
     });
+    let startup_gate = lib::lifecycle::StartupGate::acquire(&project_dir)
+        .await
+        .unwrap_or_else(|error| {
+            eprintln!("Cannot acquire startup gate: {error}");
+            lib::trace_perfetto::exit_with_trace(1)
+        });
+    if let Err(error) = startup_gate.require_enabled() {
+        eprintln!("{error}");
+        lib::trace_perfetto::exit_with_trace(1);
+    }
+    let _project_lock = match acquire_project_lock_or_adopt(&project_dir) {
+        Ok(lock) => lock,
+        Err(owner) => {
+            let owner = if owner == 0 {
+                "unknown".to_string()
+            } else {
+                owner.to_string()
+            };
+            eprintln!(
+                "MCP service already running for project {} (PID {owner}); refusing to start a \
+                 second instance. Stop it with dutabo stop --agent before restarting.",
+                project_dir.display()
+            );
+            lib::trace_perfetto::exit_with_trace(1);
+        }
+    };
+    drop(startup_gate);
+
     let mut conflicts = Vec::new();
     for dut in managed_configs {
         if let Some(conflict) = lib::init::held_endpoint_conflict(
@@ -842,30 +892,8 @@ async fn main() {
     }
     if !conflicts.is_empty() {
         eprintln!("Serial endpoint conflict:\n{}", conflicts.join("\n"));
-        lib::trace_chrome::exit_with_trace(1);
-    }
-
-    let _project_lock = match acquire_project_lock_or_adopt(&project_dir) {
-        Ok(lock) => lock,
-        Err(owner) => {
-            let owner = if owner == 0 {
-                "unknown".to_string()
-            } else {
-                owner.to_string()
-            };
-            eprintln!(
-                "MCP service already running for project {} (PID {owner}); refusing to start a \
-                 second instance. To replace it: kill $(cat {}/.dut-serial/mcp.pid)",
-                project_dir.display(),
-                project_dir.display()
-            );
-            lib::trace_chrome::exit_with_trace(1);
-        }
-    };
-    if project_dir.join(".dut-serial/stopped").exists() {
         drop(_project_lock);
-        eprintln!("Project MCP is stopped; run dutabo resume before reconnecting.");
-        lib::trace_chrome::exit_with_trace(1);
+        lib::trace_perfetto::exit_with_trace(1);
     }
 
     startup_hygiene(&project_dir);
@@ -896,7 +924,7 @@ async fn main() {
         Ok(registry) => registry,
         Err(error) => {
             eprintln!("CONFIG ERROR: {error}");
-            lib::trace_chrome::exit_with_trace(1);
+            lib::trace_perfetto::exit_with_trace(1);
         }
     };
     for dut in registry.entries().values() {
@@ -920,7 +948,7 @@ async fn main() {
             );
         }));
     }
-    {
+    let heartbeat_handle = {
         // ── Inventory HEARTBEAT ──
         // The statusline consumers (Claude Code per-frame, dsh fs.watch)
         // gate on the recorded mcp_pid AND written_at freshness. State
@@ -957,8 +985,8 @@ async fn main() {
                     beat_control,
                 );
             }
-        });
-    }
+        })
+    };
     let engine = registry.first().engine.clone();
     let connecting_state = registry.first().connecting_state.clone();
     let startup_handles: Vec<_> = registry
@@ -990,7 +1018,7 @@ async fn main() {
 
     // Single-DUT processes retain legacy signal takeover. Multi-DUT
     // processes require the target-specific HTTP/WS route.
-    registry.spawn_takeover_signals();
+    let takeover_handle = registry.spawn_takeover_signals();
 
     // ── Run the MCP server ──
     let transport_shutdown = tokio_util::sync::CancellationToken::new();
@@ -1024,6 +1052,7 @@ async fn main() {
                 &host,
                 port,
                 idle_timeout.map(std::time::Duration::from_secs),
+                persistent,
                 transport_shutdown.clone(),
             )
             .await
@@ -1102,6 +1131,13 @@ async fn main() {
     }
     tasks.shutdown();
 
+    heartbeat_handle.abort();
+    let _ = heartbeat_handle.await;
+    if let Some(handle) = takeover_handle {
+        handle.abort();
+        let _ = handle.await;
+    }
+
     // ── Stop the engine ──
     for handle in startup_handles {
         handle.abort();
@@ -1112,11 +1148,13 @@ async fn main() {
     tracing::info!("sermcp stopped");
     drop(_session_lock);
     drop(_project_lock);
-    if shutdown_reason.is_some() {
-        // Tokio stdin may have a blocking reader whose pipe is inherited by
-        // another process. Cleanup is complete; do not wait for that reader.
-        lib::trace_chrome::exit_with_trace(0);
-    }
+    // Exit unconditionally: cleanup is complete, and the runtime may still
+    // host blocking-pool stragglers (a stdin pipe reader inherited by another
+    // process, a blocked console/log I/O task) that Runtime::drop would wait
+    // on forever. HTTP-initiated stops (/project/stop, idle-timeout) finish
+    // the transport without a signal reason; without this exit they leave a
+    // live PID beside the replacement spawn that already took the lock.
+    lib::trace_perfetto::exit_with_trace(0);
 }
 
 #[cfg(test)]
@@ -1138,6 +1176,30 @@ mod tests {
     /// The tmp-file reaper must read the pid from the FIRST `pid[-seq]`
     /// field: dead owners are swept (both legacy and sequenced names), live
     /// owners and non-tmp files stay untouched.
+    #[test]
+    fn owner_anchor_never_replaces_a_live_process() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("owner.json");
+        let mut owner = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let record = serde_json::json!({"schema_version":1,"owner_mcp_pid":owner.id()});
+        std::fs::write(&path, record.to_string()).unwrap();
+        backfill_owner_anchor(tmp.path());
+        let kept = std::fs::read_to_string(&path).unwrap();
+        owner.kill().unwrap();
+        owner.wait().unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&kept).unwrap(),
+            record
+        );
+        backfill_owner_anchor(tmp.path());
+        let claimed: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(claimed["owner_mcp_pid"], std::process::id());
+    }
+
     #[test]
     fn stdio_display_claim_preserves_live_hook_owner_and_replaces_dead_owner() {
         let tmp = tempfile::tempdir().unwrap();

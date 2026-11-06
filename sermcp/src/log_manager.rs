@@ -2,25 +2,71 @@
 //!
 //! One observed boot prefix → next boot prefix = one `boot-NNN.log` archive.
 //! A capture attached to an already running DUT can begin with a partial cycle.
-//! `current.serial.log` is always a **regular file** holding the current cycle's
+//! `current.full.log` is always a **regular file** holding the current cycle's
 //! data; `boot-NNN.log` files are standalone archives created on boot boundaries.
 //! No symlinks are used (symlinks caused a truncation bug when `start_new_cycle`
-//! opened `current.serial.log` with `O_TRUNC`, which followed the symlink and
+//! opened `current.full.log` with `O_TRUNC`, which followed the symlink and
 //! erased the just-flushed archive).
 
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, mpsc};
+use std::time::Duration;
 
-/// Message sent to the background writer thread.
-enum WriterMsg {
-    /// Data to append to both log files.
-    Data(Vec<u8>),
-    /// Rotate: close current files and reopen (follows the LogManager's
-    /// current_path changes from a boot boundary).
-    Rotate(PathBuf, PathBuf),
-    /// Flush + respond via the oneshot (used by `flush_sync()` and shutdown).
-    Flush(std::sync::mpsc::Sender<()>),
+/// Persistence counters cover this process's received UART bytes.
+#[derive(Clone, Debug, Default, serde::Serialize)]
+pub struct PersistenceStatus {
+    pub received_bytes: u64,
+    pub durable_bytes: u64,
+    pub pending_bytes: u64,
+    pub last_error: Option<String>,
+}
+
+/// Backpressure begins before a slow or failed disk can exhaust memory.
+const MAX_PENDING_BYTES: u64 = 8 * 1024 * 1024;
+
+type WriteJob = Box<dyn FnOnce(&mut LogManager) + Send>;
+
+#[derive(Default)]
+struct WriterStatus {
+    persistence: PersistenceStatus,
+    boot_number: u32,
+}
+
+struct LogWriter {
+    tx: Option<mpsc::SyncSender<WriteJob>>,
+    status: Arc<Mutex<WriterStatus>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl LogWriter {
+    fn request<R: Send + 'static>(
+        &self,
+        operation: impl FnOnce(&mut LogManager) -> R + Send + 'static,
+    ) -> Result<R, String> {
+        let (tx, rx) = mpsc::sync_channel(1);
+        let status = self.status.clone();
+        self.send(Box::new(move |logs| {
+            let result = operation(logs);
+            {
+                let mut snapshot = status.lock().expect("writer status poisoned");
+                snapshot.persistence = logs.persistence_status();
+                snapshot.boot_number = logs.boot_number;
+            }
+            // The caller may have exited; persistence has still completed.
+            let _ = tx.send(result);
+        }))?;
+        rx.recv().map_err(|_| "serial log writer stopped".into())
+    }
+
+    fn send(&self, job: WriteJob) -> Result<(), String> {
+        self.tx
+            .as_ref()
+            .ok_or_else(|| "serial log writer closed".to_string())?
+            .send(job)
+            .map_err(|_| "serial log writer stopped".into())
+    }
 }
 
 pub struct LogManager {
@@ -29,7 +75,7 @@ pub struct LogManager {
     max_logs: usize,
     current_file: Option<fs::File>,
     current_path: Option<PathBuf>,
-    /// `full.serial.log`: continuous full log (never truncated).
+    /// `full.full.log`: continuous full log (never truncated).
     full_file: Option<fs::File>,
     boot_number: u32,
     /// Bounded recent payload for detection and live observation.
@@ -40,20 +86,24 @@ pub struct LogManager {
     /// are drained or the buffer is cleared at a boot boundary.
     stream_bytes_written: u64,
     boundary_detector: crate::boot_detector::BootLogBoundaryDetector,
+    pending_boundaries: Vec<u64>,
     /// Ring buffer max capacity (default 2 MB).
     max_buffer_size: usize,
-    /// Send end of the writer channel. `write()` pushes data here; a single
-    /// background thread drains it and does all file I/O sequentially.
-    writer_tx: Option<std::sync::mpsc::Sender<WriterMsg>>,
-    /// Handle to the writer thread (joined on close / rotation).
-    writer_thread: Option<std::thread::JoinHandle<()>>,
+    // Pending suffixes retain exact progress across short writes and ENOSPC.
+    full_pending: Vec<u8>,
+    current_pending: Vec<u8>,
+    view_pending: Vec<u8>,
+    current_clean: Option<FilteredLog>,
+    full_clean: Option<FilteredLog>,
+    persistence: PersistenceStatus,
+    writer: Option<LogWriter>,
 }
 
 impl LogManager {
     pub fn new(project_dir: &Path, max_logs: usize, _max_file_size_mb: u64, dut_dir: &str) -> Self {
         let dut_dir_path = project_dir.join(dut_dir);
         let log_dir = dut_dir_path.join("logs");
-        let live_current = log_dir.join("current.serial.log");
+        let live_current = log_dir.join("current.full.log");
 
         Self {
             log_dir,
@@ -70,9 +120,77 @@ impl LogManager {
             ring_buffer: Vec::new(),
             stream_bytes_written: 0,
             boundary_detector: crate::boot_detector::BootLogBoundaryDetector::default(),
+            pending_boundaries: Vec::new(),
             max_buffer_size: 2 * 1024 * 1024, // 2 MB
-            writer_tx: None,
-            writer_thread: None,
+            full_pending: Vec::new(),
+            current_pending: Vec::new(),
+            view_pending: Vec::new(),
+            current_clean: None,
+            full_clean: None,
+            persistence: PersistenceStatus::default(),
+            writer: None,
+        }
+    }
+
+    /// Capture with a dedicated disk owner. FIFO barriers preserve tool and
+    /// shutdown durability without charging routine fsyncs to serial I/O.
+    pub fn new_background(
+        project_dir: &Path,
+        max_logs: usize,
+        max_file_size_mb: u64,
+        dut_dir: &str,
+    ) -> Self {
+        let mut frontend = Self::new(project_dir, max_logs, max_file_size_mb, dut_dir);
+        let mut storage = Self::new(project_dir, max_logs, max_file_size_mb, dut_dir);
+        let (tx, rx) = mpsc::sync_channel::<WriteJob>(2048);
+        let status = Arc::new(Mutex::new(WriterStatus::default()));
+        let worker_status = status.clone();
+        let thread = std::thread::Builder::new()
+            .name("serial-log-writer".into())
+            .spawn(move || {
+                loop {
+                    match rx.recv_timeout(Duration::from_millis(100)) {
+                        Ok(job) => job(&mut storage),
+                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    }
+                    // Coalesce an already queued burst, without waiting for a
+                    // timer. Limit work so continuous input cannot starve sync.
+                    for _ in 0..63 {
+                        let Ok(job) = rx.try_recv() else { break };
+                        job(&mut storage);
+                    }
+                    if storage.has_pending_writes() {
+                        storage.retry_pending();
+                    }
+                    let mut snapshot = worker_status.lock().expect("writer status poisoned");
+                    snapshot.persistence = storage.persistence_status();
+                    snapshot.boot_number = storage.boot_number;
+                }
+                storage.close();
+            });
+        match thread {
+            Ok(thread) => {
+                frontend.writer = Some(LogWriter {
+                    tx: Some(tx),
+                    status,
+                    thread: Some(thread),
+                });
+            }
+            Err(error) => {
+                // Preserve capture using synchronous persistence if the OS
+                // cannot create a thread; never silently disable logging.
+                tracing::error!(%error, "Cannot start log writer; using synchronous persistence");
+            }
+        }
+        frontend
+    }
+
+    fn writer_operation(&mut self, operation: impl FnOnce(&mut LogManager) + Send + 'static) {
+        if let Some(writer) = &self.writer
+            && let Err(error) = writer.request(operation)
+        {
+            self.persistence.last_error = Some(error);
         }
     }
 
@@ -81,7 +199,7 @@ impl LogManager {
     }
 
     /// Absolute path of the `.dut-serial/logs/` directory hosting every serial
-    /// log file (`current.serial.log`, `full.serial.log`, `boot-NNN_*.log`).
+    /// log file (`current.full.log`, `full.full.log`, `boot-NNN_*.log`).
     /// Exposed so the MCP `resources` capability can list/serve them as
     /// `Resource`s without the caller having to know the on-disk layout.
     pub fn log_dir(&self) -> &Path {
@@ -95,6 +213,13 @@ impl LogManager {
     }
 
     pub fn boot_number(&self) -> u32 {
+        if let Some(writer) = &self.writer {
+            return writer
+                .status
+                .lock()
+                .expect("writer status poisoned")
+                .boot_number;
+        }
         self.boot_number
     }
 
@@ -119,6 +244,16 @@ impl LogManager {
     /// crate rely on it to set up a known boot-cycle state quickly.
     #[cfg(test)]
     pub fn open_current(&mut self) {
+        if let Some(writer) = &self.writer {
+            match writer.request(|logs| {
+                logs.open_current();
+                logs.current_path.clone()
+            }) {
+                Ok(path) => self.current_path = path,
+                Err(error) => self.persistence.last_error = Some(error),
+            }
+            return;
+        }
         let n = self.next_boot_number();
         fs::create_dir_all(&self.log_dir).ok();
 
@@ -143,54 +278,205 @@ impl LogManager {
         }
     }
 
-    /// Append raw serial data: writes to `current.serial.log` +
-    /// `full.serial.log` + the in-memory ring buffer.
-    ///
-    /// Ring buffer is updated synchronously (instant, needed by boot detection).
-    /// File I/O is pushed to a **single background writer thread** via channel
-    /// — no per-write thread spawn, no `open()` per chunk. The writer thread
-    /// keeps file handles open and does sequential `write_all`.
+    /// Queue raw bytes without waiting for disk I/O. Call flush_sync at
+    /// durability boundaries; pending_bytes includes the uncommitted queue.
     pub fn write(&mut self, data: &[u8]) {
-        if self.current_file.is_none() {
-            self.ensure_current_file();
+        self.observe(data);
+        if self.writer.is_some() {
+            self.enqueue_data(data, false);
+            return;
         }
-        // ── Ring buffer (synchronous, instant) ──────────────────────────
+        self.full_pending.extend_from_slice(data);
+        self.current_pending.extend_from_slice(data);
+        self.view_pending.extend_from_slice(data);
+    }
+
+    fn observe(&mut self, data: &[u8]) {
         self.ring_buffer.extend_from_slice(data);
         self.stream_bytes_written = self.stream_bytes_written.saturating_add(data.len() as u64);
         if self.ring_buffer.len() > self.max_buffer_size {
             let drain = self.ring_buffer.len() - self.max_buffer_size / 2;
             self.ring_buffer.drain(..drain);
         }
+        self.persistence.received_bytes += data.len() as u64;
+    }
 
-        // ── File I/O → background writer thread ─────────────────────────
-        if !data.is_empty() {
-            self.ensure_writer();
-            let message = WriterMsg::Data(data.to_vec());
-            if let Some(ref tx) = self.writer_tx
-                && let Err(err) = tx.send(message)
-            {
-                // The worker exited unexpectedly. Clear its stale sender,
-                // join it, start a replacement, and retry this same chunk.
-                self.writer_tx.take();
-                if let Some(handle) = self.writer_thread.take() {
-                    let _ = handle.join();
+    fn enqueue_data(&mut self, data: &[u8], serial: bool) {
+        // Readers normally stop at this limit before reading another chunk.
+        // Direct callers also get backpressure, never a dropping queue.
+        if self.persistence_status().pending_bytes >= MAX_PENDING_BYTES {
+            self.flush_sync();
+        }
+        let bytes = data.to_vec();
+        let writer = self.writer.as_ref().expect("background writer exists");
+        let enqueued = writer.send(Box::new(move |logs| {
+            if serial {
+                logs.write_serial(&bytes);
+            } else {
+                logs.write(&bytes);
+            }
+        }));
+        if let Err(error) = enqueued {
+            self.full_pending.extend_from_slice(data);
+            self.persistence.last_error = Some(error);
+        }
+    }
+
+    /// Whether the last persistence attempt failed and byte ingestion must
+    /// pause (the transport holds subsequent bytes until storage recovers).
+    /// Pure check, including the writer backlog; never touches the disk.
+    pub fn storage_failed(&self) -> bool {
+        let status = self.persistence_status();
+        status.last_error.is_some() || status.pending_bytes >= MAX_PENDING_BYTES
+    }
+
+    /// Poll background persistence without waiting for disk I/O. Synchronous
+    /// stores commit immediately; there is no timed data-at-risk window.
+    pub fn poll_persistence(&mut self) -> bool {
+        if self.writer.is_some() {
+            return !self.storage_failed();
+        }
+        self.retry_pending()
+    }
+
+    pub fn persistence_status(&self) -> PersistenceStatus {
+        let mut status = if let Some(writer) = &self.writer {
+            writer
+                .status
+                .lock()
+                .expect("writer status poisoned")
+                .persistence
+                .clone()
+        } else {
+            self.persistence.clone()
+        };
+        status.received_bytes = self.persistence.received_bytes;
+        status.pending_bytes = status.received_bytes.saturating_sub(status.durable_bytes);
+        if self.persistence.last_error.is_some() {
+            status.last_error.clone_from(&self.persistence.last_error);
+        }
+        if self.writer.as_ref().is_some_and(|writer| {
+            writer
+                .thread
+                .as_ref()
+                .is_some_and(|thread| thread.is_finished())
+        }) {
+            status.last_error = Some("serial log writer stopped unexpectedly".into());
+        }
+        status
+    }
+
+    pub fn has_pending_writes(&self) -> bool {
+        let status = self.persistence_status();
+        status.pending_bytes != 0 || status.last_error.is_some()
+    }
+
+    /// Retry without re-appending bytes already written before an I/O error.
+    pub fn retry_pending(&mut self) -> bool {
+        if let Some(writer) = &self.writer {
+            return match writer.request(|logs| {
+                let ready = logs.retry_pending();
+                (ready, logs.current_path.clone())
+            }) {
+                Ok((ready, path)) => {
+                    self.current_path = path;
+                    ready && self.persistence.last_error.is_none()
                 }
-                self.ensure_writer();
-                if let Some(ref retry_tx) = self.writer_tx {
-                    let _ = retry_tx.send(err.0);
+                Err(error) => {
+                    self.persistence.last_error = Some(error);
+                    false
                 }
+            };
+        }
+        if !self.has_pending_writes() && self.current_file.is_some() && self.full_file.is_some() {
+            return true;
+        }
+        self.ensure_current_file();
+        let result = (|| -> std::io::Result<()> {
+            let path = self
+                .current_path
+                .as_ref()
+                .ok_or_else(|| std::io::Error::other("no current log path"))?;
+            // Opening must succeed before any append.
+            if self.current_file.is_none() || self.full_file.is_none() {
+                return Err(std::io::Error::other(
+                    "cannot open serial logs; received bytes retained pending",
+                ));
+            }
+            append_pending(
+                &mut self.full_file,
+                &self.log_dir.join("full.full.log"),
+                &mut self.full_pending,
+            )?;
+            append_pending(&mut self.current_file, path, &mut self.current_pending)?;
+            // Persist directory entries as well as file contents, including
+            // the first creation and inode replacement after rotation.
+            fs::File::open(&self.log_dir)?.sync_all()?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                self.persistence.durable_bytes = self.persistence.received_bytes;
+                self.persistence.pending_bytes = 0;
+                self.persistence.last_error = None;
+                let current = self.current_path.as_ref().unwrap().clone();
+                let full = self.log_dir.join("full.full.log");
+                for (clean, path) in [
+                    (&mut self.current_clean, current),
+                    (&mut self.full_clean, full),
+                ] {
+                    if serial_path(&path) == path {
+                        continue;
+                    }
+                    let view = clean.as_mut().unwrap();
+                    if view.file.is_some() {
+                        view.write(&self.view_pending);
+                    }
+                    if view.file.is_none() {
+                        *view = FilteredLog::open(&path);
+                    }
+                    if view.file.is_none() {
+                        self.persistence.last_error = Some(format!(
+                            "cannot rebuild serial view {} (raw log is durable)",
+                            path.display()
+                        ));
+                    }
+                }
+                self.view_pending.clear();
+                self.apply_pending_boundaries();
+                self.persistence.last_error.is_none()
+            }
+            Err(error) => {
+                let message = error.to_string();
+                if self.persistence.last_error.as_ref() != Some(&message) {
+                    tracing::error!(%error, "Serial persistence failed; capture must pause until storage recovers");
+                }
+                self.persistence.pending_bytes =
+                    self.persistence.received_bytes - self.persistence.durable_bytes;
+                self.persistence.last_error = Some(message);
+                false
             }
         }
     }
 
-    /// Persist every payload byte immediately, then split at observed boot
-    /// prefixes, including prefixes spanning reads or following a quiet prompt.
+    /// Record a payload chunk and detect boot boundaries immediately. The disk
+    /// owner applies those same boundaries in FIFO order with persistence.
     pub fn write_serial(&mut self, data: &[u8]) -> bool {
         let boundaries = self.boundary_detector.feed(data);
         let observed_boot = !boundaries.is_empty();
+        if self.writer.is_some() {
+            self.observe(data);
+            self.enqueue_data(data, true);
+            return observed_boot;
+        }
+        self.pending_boundaries.extend(boundaries);
         self.write(data);
-        for boundary in boundaries {
-            self.flush_sync();
+        observed_boot
+    }
+
+    fn apply_pending_boundaries(&mut self) {
+        // Take the queue before rotation, whose flush re-enters retry_pending.
+        for boundary in std::mem::take(&mut self.pending_boundaries) {
             let after = self.boundary_detector.cursor() - boundary;
             let Some(path) = self.current_path.as_ref() else {
                 continue;
@@ -205,13 +491,17 @@ impl LogManager {
                 Err(error) => tracing::error!("Cannot inspect current boot log: {error}"),
             }
         }
-        observed_boot
     }
 
     /// Re-arm after a reset request; the observed firmware prefix sets the
     /// actual boundary so old shutdown output stays with the previous cycle.
     pub fn expect_boot(&mut self) {
         self.boundary_detector.expect_boot();
+        if let Some(writer) = &self.writer
+            && let Err(error) = writer.send(Box::new(Self::expect_boot))
+        {
+            self.persistence.last_error = Some(error);
+        }
     }
 
     /// Absolute cursor at the end of the shared serial stream.
@@ -236,148 +526,93 @@ impl LogManager {
         (self.ring_buffer[start..].to_vec(), truncated)
     }
 
-    /// Start the background writer thread (lazy, on first `write()`).
-    fn ensure_writer(&mut self) {
-        if self.writer_tx.is_some() {
+    /// Retry pending bytes and synchronize file data. Check persistence_status
+    /// for failures; a failed flush never acknowledges or discards pending data.
+    pub fn flush_sync(&mut self) {
+        self.retry_pending();
+    }
+
+    /// Ensure `current.full.log` + `full.full.log` are open (both regular
+    /// files — append-mode writes must never follow a symlink into an
+    /// archive file).
+    pub fn ensure_current_file(&mut self) {
+        if self.writer.is_some() {
+            self.writer_operation(Self::ensure_current_file);
             return;
         }
-        let (tx, rx) = std::sync::mpsc::channel::<WriterMsg>();
-        let mut current_path = self
-            .current_path
-            .clone()
-            .unwrap_or_else(|| self.log_dir.join("current.serial.log"));
-        let mut full_path = self.log_dir.join("full.serial.log");
-
-        let handle = match std::thread::Builder::new()
-            .name("serial-log-writer".to_string())
-            .spawn(move || {
-                // Keep file handles open for the lifetime of the writer thread.
-                let mut current_file: Option<std::fs::File> = std::fs::OpenOptions::new()
-                    .append(true)
-                    .create(true)
-                    .open(&current_path)
-                    .ok();
-                let mut full_file: Option<std::fs::File> = std::fs::OpenOptions::new()
-                    .append(true)
-                    .create(true)
-                    .open(&full_path)
-                    .ok();
-
-                for msg in rx {
-                    match msg {
-                        WriterMsg::Data(data) => {
-                            write_with_reopen(&mut current_file, &current_path, &data);
-                            write_with_reopen(&mut full_file, &full_path, &data);
-                        }
-                        WriterMsg::Rotate(new_current, new_full) => {
-                            // Close old handles, open new ones.
-                            current_path = new_current;
-                            full_path = new_full;
-                            current_file = std::fs::OpenOptions::new()
-                                .append(true)
-                                .create(true)
-                                .open(&current_path)
-                                .ok();
-                            full_file = std::fs::OpenOptions::new()
-                                .append(true)
-                                .create(true)
-                                .open(&full_path)
-                                .ok();
-                        }
-                        WriterMsg::Flush(reply) => {
-                            // Flush file handles to disk.
-                            if let Some(ref mut f) = current_file {
-                                let _ = f.flush();
-                            }
-                            if let Some(ref mut f) = full_file {
-                                let _ = f.flush();
-                            }
-                            let _ = reply.send(());
-                        }
-                    }
-                }
-                // Channel closed — final flush.
-                if let Some(ref mut f) = current_file {
-                    let _ = f.flush();
-                }
-                if let Some(ref mut f) = full_file {
-                    let _ = f.flush();
-                }
-            }) {
-            Ok(handle) => handle,
-            Err(e) => {
-                tracing::error!("Failed to start serial log writer: {e}");
-                // Leave writer_tx unset. The next write() calls ensure_writer()
-                // again instead of permanently dropping all future log data.
-                return;
-            }
-        };
-
-        self.writer_tx = Some(tx);
-        self.writer_thread = Some(handle);
-    }
-
-    /// Wait for all pending file writes to land on disk (test determinism +
-    /// boot boundary synchronization).
-    pub fn flush_sync(&mut self) {
-        if let Some(ref tx) = self.writer_tx {
-            let (reply, rx) = std::sync::mpsc::channel();
-            let _ = tx.send(WriterMsg::Flush(reply));
-            let _ = rx.recv();
-        }
-    }
-
-    /// Tell the writer thread to reopen the current file after a boot boundary.
-    fn writer_rotate(&mut self, current_path: PathBuf, full_path: PathBuf) {
-        if let Some(ref tx) = self.writer_tx {
-            let _ = tx.send(WriterMsg::Rotate(current_path, full_path));
-        }
-    }
-
-    /// Ensure `current.serial.log` + `full.serial.log` are open.
-    ///
-    /// If `current.serial.log` exists as a **symlink** (leftover from a
-    /// previous version that used symlinks), remove it and create a regular
-    /// file instead — this prevents append-mode writes from following the
-    /// symlink into an archive file.
-    pub fn ensure_current_file(&mut self) {
         fs::create_dir_all(&self.log_dir).ok();
-        // current.serial.log (current boot cycle, always a regular file)
-        if self.current_file.is_none() {
-            let path = self.log_dir.join("current.serial.log");
-            // If a symlink lingered from an older version, remove it so we
-            // don't append into an archive file via the symlink.
-            if path.is_symlink() {
-                fs::remove_file(&path).ok();
+        use std::os::unix::fs::MetadataExt;
+        for (file, clean, path) in [
+            (
+                &mut self.current_file,
+                &mut self.current_clean,
+                self.current_path.clone(),
+            ),
+            (
+                &mut self.full_file,
+                &mut self.full_clean,
+                Some(self.log_dir.join("full.full.log")),
+            ),
+        ] {
+            if let (Some(opened), Some(path)) = (file.as_ref(), path.as_ref()) {
+                let same = opened
+                    .metadata()
+                    .ok()
+                    .zip(fs::symlink_metadata(path).ok())
+                    .is_some_and(|(a, b)| b.is_file() && (a.dev(), a.ino()) == (b.dev(), b.ino()));
+                if !same {
+                    *file = None;
+                    *clean = None;
+                }
             }
-            match fs::OpenOptions::new().create(true).append(true).open(&path) {
+        }
+        // current.full.log (current boot cycle, always a regular file)
+        if self.current_file.is_none() {
+            let path = self.log_dir.join("current.full.log");
+            match open_raw_log(&path) {
                 Ok(file) => {
                     self.current_file = Some(file);
                     self.current_path = Some(path);
                 }
-                Err(e) => tracing::error!("Failed to open current.serial.log: {e}"),
+                Err(e) => tracing::error!("Failed to open current.full.log: {e}"),
             }
         }
-        // full.serial.log (continuous, never truncated)
+        // full.full.log (continuous, never truncated)
         if self.full_file.is_none() {
-            let full = self.log_dir.join("full.serial.log");
-            match fs::OpenOptions::new().create(true).append(true).open(&full) {
+            let full = self.log_dir.join("full.full.log");
+            match open_raw_log(&full) {
                 Ok(file) => {
                     self.full_file = Some(file);
                 }
-                Err(e) => tracing::error!("Failed to open full.serial.log: {e}"),
+                Err(e) => tracing::error!("Failed to open full.full.log: {e}"),
             }
+        }
+        if self.current_clean.is_none() && self.current_file.is_some() {
+            self.current_clean = Some(FilteredLog::open(self.current_path.as_ref().unwrap()));
+        }
+        if self.full_clean.is_none() && self.full_file.is_some() {
+            self.full_clean = Some(FilteredLog::open(&self.log_dir.join("full.full.log")));
         }
     }
 
     /// Explicitly finish the current cycle. Production capture uses observed
     /// byte offsets through `write_serial` instead of cutting at tool requests.
     pub fn mark_boot_start(&mut self) {
+        if self.writer.is_some() {
+            self.writer_operation(Self::mark_boot_start);
+            self.boundary_detector.expect_boot();
+            return;
+        }
         self.finish_current_cycle(false);
         self.expect_boot();
     }
 
     pub fn rotate(&mut self) {
+        if self.writer.is_some() {
+            self.writer_operation(Self::rotate);
+            self.boundary_detector.expect_boot();
+            return;
+        }
         self.finish_current_cycle(true);
         self.expect_boot();
     }
@@ -406,7 +641,9 @@ impl LogManager {
         }
         let number = self.next_boot_number();
         let stamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
-        let archive_path = self.log_dir.join(format!("boot-{number:03}_{stamp}.log"));
+        let archive_path = self
+            .log_dir
+            .join(format!("boot-{number:03}_{stamp}.full.log"));
         self.split_current_to(offset, &archive_path)
     }
 
@@ -414,6 +651,11 @@ impl LogManager {
     /// independently of the wall clock used to name production archives.
     fn split_current_to(&mut self, offset: u64, archive_path: &Path) -> std::io::Result<()> {
         self.flush_sync();
+        if self.has_pending_writes() {
+            return Err(std::io::Error::other(
+                "cannot rotate logs with pending writes",
+            ));
+        }
         let source_path = self
             .current_path
             .as_ref()
@@ -424,7 +666,7 @@ impl LogManager {
             .write(true)
             .create_new(true)
             .open(archive_path)?;
-        let new_current = self.log_dir.join("current.serial.log");
+        let new_current = self.log_dir.join("current.full.log");
         let result = (|| {
             let copied = std::io::copy(&mut (&mut source).take(offset), &mut archive)?;
             if copied != offset {
@@ -446,9 +688,17 @@ impl LogManager {
             let _ = fs::remove_file(archive_path);
             return result;
         }
+        // Derive the companion from the authoritative archive, including any
+        // partial frame at its boundary. Never let filtering discard evidence.
+        let clean_archive = serial_path(archive_path);
+        if clean_archive != archive_path {
+            let mut clean = FilteredLog::open(archive_path);
+            clean.finish();
+        }
         self.current_file = Some(fs::OpenOptions::new().append(true).open(&new_current)?);
         self.current_path = Some(new_current.clone());
-        self.writer_rotate(new_current, self.log_dir.join("full.serial.log"));
+        self.current_clean = Some(FilteredLog::open(&new_current));
+        fs::File::open(&self.log_dir)?.sync_all()?;
         self.flush_sync();
         self.cleanup_old_logs();
         tracing::info!(
@@ -459,11 +709,31 @@ impl LogManager {
     }
 
     pub fn close(&mut self) {
-        // Flush + join writer thread before dropping file handles.
+        if self.writer.is_some() {
+            self.writer_operation(Self::close);
+            let status = self.persistence_status();
+            if status.pending_bytes != 0 || status.last_error.is_some() {
+                tracing::error!(pending_bytes = status.pending_bytes, error = ?status.last_error,
+                    "Serial log shutdown incomplete; unpersisted bytes remain");
+            }
+            // Keep the writer usable after close for ownership handoffs.
+            return;
+        }
+        if self.current_file.is_none() && self.full_file.is_none() && !self.has_pending_writes() {
+            return;
+        }
         self.flush_sync();
-        self.writer_tx.take(); // close channel → writer thread exits loop
-        if let Some(handle) = self.writer_thread.take() {
-            let _ = handle.join();
+        if let Some(mut clean) = self.current_clean.take() {
+            clean.finish();
+        }
+        if let Some(mut clean) = self.full_clean.take() {
+            clean.finish();
+        }
+        if self.has_pending_writes() {
+            tracing::error!(
+                pending = self.persistence.pending_bytes,
+                "Closing with unpersisted serial bytes; storage failure remains unresolved"
+            );
         }
         self.current_file.take();
         self.full_file.take();
@@ -537,13 +807,13 @@ impl LogManager {
     /// Snapshot the selected archive under the engine lock. The returned
     /// target owns its path, so callers can release the lock before doing disk
     /// I/O; a subsequent boot rollover cannot retarget an in-flight read.
-    /// Read target for the LIVE current-cycle file (`current.serial.log`).
+    /// Read target for the LIVE current-cycle file (`current.full.log`).
     /// Valid from construction — a freshly started server must be able to
     /// serve its in-progress log before the first boot rotation.
     pub fn live_read_target(&self) -> Option<LogReadTarget> {
         self.current_path.as_ref().map(|path| LogReadTarget {
             filename: "current.serial.log".to_string(),
-            path: path.clone(),
+            path: serial_path(path),
         })
     }
 
@@ -586,7 +856,8 @@ impl LogManager {
         let mut reader = BufReader::new(file);
 
         let mut total_lines: usize = 0;
-        let mut filtered: Vec<String> = Vec::new();
+        let mut filtered = std::collections::VecDeque::new();
+        let mut filtered_lines = 0;
 
         let mut bytes = Vec::new();
         loop {
@@ -617,17 +888,15 @@ impl LogManager {
                 None => true,
             };
             if matches {
-                filtered.push(line);
+                filtered_lines += 1;
+                if lines > 0 && filtered.len() == lines {
+                    filtered.pop_front();
+                }
+                filtered.push_back(line);
             }
         }
 
-        let filtered_lines = filtered.len();
-        // Keep only the last `lines` entries if a limit is set.
-        let result: Vec<String> = if lines > 0 && filtered.len() > lines {
-            filtered.split_off(filtered.len() - lines)
-        } else {
-            filtered
-        };
+        let result: Vec<_> = filtered.into_iter().collect();
 
         LogContent {
             content: result.join("\n"),
@@ -648,6 +917,13 @@ impl LogManager {
             let to_remove = logs.len() - self.max_logs;
             for old in &logs[..to_remove] {
                 fs::remove_file(&old.path).ok();
+                if let Some(name) = old
+                    .path
+                    .to_str()
+                    .and_then(|p| p.strip_suffix(".serial.log"))
+                {
+                    fs::remove_file(format!("{name}.full.log")).ok();
+                }
                 tracing::debug!("Cleaned old log: {}", old.name);
             }
         }
@@ -659,10 +935,11 @@ impl LogManager {
             for entry in entries.flatten() {
                 let path = entry.path();
                 if path.extension().and_then(|e| e.to_str()) == Some("log")
-                    && !path
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .is_some_and(|n| n == "current.serial.log" || n == "full.serial.log")
+                    && !path.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+                        n.starts_with("current.")
+                            || n.starts_with("full.")
+                            || n.ends_with(".full.log")
+                    })
                 {
                     let size = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
                     result.push(LogFileInfo {
@@ -696,42 +973,181 @@ fn boot_sort_key(name: &str) -> (u32, &str) {
     (number, name)
 }
 
-impl Drop for LogManager {
-    fn drop(&mut self) {
-        self.close();
+fn open_raw_log(raw: &Path) -> std::io::Result<fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let open = || {
+        fs::OpenOptions::new()
+            .append(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(raw)
+    };
+    let file = match open() {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let clean = serial_path(raw);
+            if fs::symlink_metadata(&clean).is_ok_and(|metadata| metadata.is_file()) {
+                // Keep the existing capture authoritative before rebuilding the view.
+                fs::hard_link(clean, raw)?;
+                open()?
+            } else {
+                fs::OpenOptions::new()
+                    .append(true)
+                    .create_new(true)
+                    .open(raw)?
+            }
+        }
+        Err(error) => return Err(error),
+    };
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::other(
+            "raw serial log is not a regular file",
+        ));
+    }
+    Ok(file)
+}
+
+fn serial_path(raw: &Path) -> PathBuf {
+    let Some(name) = raw
+        .file_name()
+        .and_then(|n| n.to_str())
+        .and_then(|n| n.strip_suffix(".full.log"))
+    else {
+        return raw.to_path_buf();
+    };
+    raw.with_file_name(format!("{name}.serial.log"))
+}
+
+/// A recoverable view: the authoritative full file is always written first.
+struct FilteredLog {
+    file: Option<fs::File>,
+    filter: crate::heartbeat::Filter,
+}
+
+impl FilteredLog {
+    fn open(raw: &Path) -> Self {
+        let mut view = Self {
+            file: None,
+            filter: crate::heartbeat::Filter::default(),
+        };
+        let clean = serial_path(raw);
+        if clean == raw {
+            return view;
+        }
+        let rebuild = (|| -> std::io::Result<()> {
+            let mut source = fs::File::open(raw)?;
+            let mut destination =
+                tempfile::NamedTempFile::new_in(raw.parent().unwrap_or(Path::new(".")))?;
+            let mut buf = [0; 8192];
+            loop {
+                let n = source.read(&mut buf)?;
+                if n == 0 {
+                    break;
+                }
+                let mut bytes = Vec::new();
+                view.filter.feed(&buf[..n], &mut bytes);
+                destination.write_all(&bytes)?;
+            }
+            destination
+                .as_file()
+                .set_permissions(source.metadata()?.permissions())?;
+            destination.persist(&clean).map_err(|e| e.error)?;
+            view.file = Some(fs::OpenOptions::new().append(true).open(&clean)?);
+            Ok(())
+        })();
+        if let Err(error) = rebuild {
+            tracing::error!(path = %clean.display(), %error, "Cannot rebuild filtered serial log; full log retained");
+        }
+        view
+    }
+
+    fn write(&mut self, data: &[u8]) {
+        let mut bytes = Vec::new();
+        self.filter.feed(data, &mut bytes);
+        self.append(&bytes);
+    }
+
+    fn finish(&mut self) {
+        let mut bytes = Vec::new();
+        self.filter.finish(&mut bytes);
+        self.append(&bytes);
+    }
+
+    fn append(&mut self, bytes: &[u8]) {
+        if let Some(file) = self.file.as_mut()
+            && let Err(error) = file.write_all(bytes)
+        {
+            tracing::error!(%error, "Cannot write filtered log; full log retained for replay");
+            self.file = None;
+        }
     }
 }
 
-/// Append data and make a closed/failed handle recoverable on the next write.
-fn write_with_reopen(file: &mut Option<std::fs::File>, path: &Path, data: &[u8]) {
-    // A yielded MCP can resume after dutabo archived/replaced current.
-    // Append to the current pathname rather than the stale unlinked inode.
-    use std::os::unix::fs::MetadataExt;
-    if let Some(opened) = file.as_ref()
-        && let (Ok(held), Ok(current)) = (opened.metadata(), fs::metadata(path))
-        && (held.dev(), held.ino()) != (current.dev(), current.ino())
-    {
-        *file = None;
-    }
-    if file.is_none() {
-        match std::fs::OpenOptions::new()
-            .append(true)
-            .create(true)
-            .open(path)
-        {
-            Ok(opened) => *file = Some(opened),
-            Err(e) => {
-                tracing::error!("Failed to reopen serial log {}: {e}", path.display());
-                return;
+impl Drop for LogManager {
+    fn drop(&mut self) {
+        self.close();
+        if let Some(mut writer) = self.writer.take() {
+            writer.tx.take();
+            if let Some(thread) = writer.thread.take()
+                && thread.join().is_err()
+            {
+                tracing::error!("Serial log writer panicked");
             }
         }
     }
-    if let Some(opened) = file
-        && let Err(e) = opened.write_all(data)
-    {
-        tracing::error!("Failed to write serial log {}: {e}", path.display());
-        *file = None;
+}
+
+/// Write progress is retained even when a later write fails. `write_all`
+/// cannot provide that offset, so retrying it can duplicate a partial prefix.
+fn write_pending<W: Write>(file: &mut W, pending: &mut Vec<u8>) -> std::io::Result<()> {
+    let mut written = 0;
+    let result = loop {
+        if written == pending.len() {
+            break Ok(());
+        }
+        match file.write(&pending[written..]) {
+            Ok(0) => break Err(std::io::ErrorKind::WriteZero.into()),
+            Ok(n) => written += n,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => break Err(error),
+        }
+    };
+    pending.drain(..written);
+    result
+}
+
+fn append_pending(
+    file: &mut Option<fs::File>,
+    path: &Path,
+    pending: &mut Vec<u8>,
+) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    if let Some(opened) = file.as_ref() {
+        let held = opened.metadata()?;
+        match fs::metadata(path) {
+            Ok(current) if (held.dev(), held.ino()) == (current.dev(), current.ino()) => {}
+            Ok(_) => *file = None,
+            // Never continue writing to an unlinked inode silently.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => *file = None,
+            Err(error) => return Err(error),
+        }
     }
+    if file.is_none() {
+        *file = Some(
+            fs::OpenOptions::new()
+                .append(true)
+                .create(true)
+                .open(path)?,
+        );
+    }
+    let opened = file.as_mut().unwrap();
+    write_pending(opened, pending)?;
+    opened.sync_data()
+}
+
+#[cfg(test)]
+fn write_with_reopen(file: &mut Option<fs::File>, path: &Path, data: &[u8]) -> std::io::Result<()> {
+    append_pending(file, path, &mut data.to_vec())
 }
 
 struct LogFileInfo {
@@ -758,11 +1174,309 @@ pub struct LogContent {
 #[derive(Debug, Clone)]
 pub struct LogReadTarget {
     filename: String,
-    path: PathBuf,
+    pub(crate) path: PathBuf,
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn disconnected_writer_retains_rejected_bytes_and_reports_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut logs = LogManager::new_background(dir.path(), 100, 100, ".dut-serial");
+        logs.writer.as_mut().unwrap().tx.take();
+        logs.write_serial(b"not accepted by writer");
+        assert_eq!(logs.full_pending, b"not accepted by writer");
+        let status = logs.persistence_status();
+        assert_eq!(status.pending_bytes, 22);
+        assert_eq!(status.durable_bytes, 0);
+        assert!(status.last_error.is_some());
+        assert!(!logs.retry_pending());
+    }
+
+    #[test]
+    fn background_capture_does_not_wait_for_busy_disk_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (observed_tx, observed_rx) = mpsc::channel();
+        let producer = std::thread::spawn(move || {
+            let mut logs = LogManager::new_background(&root, 100, 100, ".dut-serial");
+            logs.writer
+                .as_ref()
+                .unwrap()
+                .send(Box::new(move |_| {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                }))
+                .unwrap();
+            logs.write_serial(b"interactive echo\r\n");
+            let healthy = logs.poll_persistence();
+            observed_tx
+                .send((healthy, logs.persistence_status()))
+                .unwrap();
+            logs.flush_sync();
+            assert_eq!(logs.persistence_status().pending_bytes, 0);
+        });
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        // Release even on failure so a blocking regression cannot hang tests.
+        let observed = observed_rx.recv_timeout(Duration::from_secs(1));
+        release_tx.send(()).unwrap();
+        producer.join().unwrap();
+        let (healthy, status) = observed.expect("capture waited for the disk owner");
+        assert!(healthy);
+        assert_eq!(status.pending_bytes, b"interactive echo\r\n".len() as u64);
+        assert_eq!(status.durable_bytes, 0);
+        assert_eq!(
+            fs::read(dir.path().join(".dut-serial/logs/full.full.log")).unwrap(),
+            b"interactive echo\r\n"
+        );
+    }
+
+    #[test]
+    fn background_storage_recovers_without_a_reader_barrier() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut logs = LogManager::new_background(dir.path(), 100, 100, ".dut-serial");
+        fs::create_dir_all(logs.dut_dir()).unwrap();
+        fs::write(logs.log_dir(), b"obstructed").unwrap();
+        logs.write_serial(b"first\x00\xff\n");
+        logs.flush_sync();
+        assert!(logs.storage_failed());
+        assert_eq!(logs.persistence_status().pending_bytes, 8);
+        fs::remove_file(logs.log_dir()).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while logs.storage_failed() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!logs.storage_failed());
+        logs.write_serial(b"second\n");
+        logs.close();
+        for name in ["full.full.log", "current.full.log"] {
+            assert_eq!(
+                fs::read(logs.log_dir().join(name)).unwrap(),
+                b"first\x00\xff\nsecond\n"
+            );
+        }
+        assert_eq!(logs.persistence_status().pending_bytes, 0);
+    }
+
+    #[test]
+    fn background_drop_drains_every_queued_byte() {
+        let dir = tempfile::tempdir().unwrap();
+        let expected: Vec<u8> = (0..512u32)
+            .flat_map(|n| n.to_le_bytes().repeat(256))
+            .collect();
+        {
+            let mut logs = LogManager::new_background(dir.path(), 100, 100, ".dut-serial");
+            for chunk in expected.chunks(1024) {
+                logs.write_serial(chunk);
+            }
+        }
+        for name in ["full.full.log", "current.full.log"] {
+            assert_eq!(
+                fs::read(dir.path().join(".dut-serial/logs").join(name)).unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn background_flush_survives_process_exit_without_drop() {
+        const ENV: &str = "SERMCP_LOG_BG_EXIT_TEST_DIR";
+        if let Ok(dir) = std::env::var(ENV) {
+            let mut logs = LogManager::new_background(Path::new(&dir), 100, 100, ".dut-serial");
+            for n in 0..64u32 {
+                logs.write(&n.to_le_bytes().repeat(1024));
+            }
+            logs.flush_sync();
+            assert!(!logs.has_pending_writes());
+            std::process::exit(73);
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "log_manager::tests::background_flush_survives_process_exit_without_drop",
+            ])
+            .env(ENV, dir.path())
+            .stdout(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(73));
+        let expected: Vec<u8> = (0..64u32)
+            .flat_map(|n| n.to_le_bytes().repeat(1024))
+            .collect();
+        assert_eq!(
+            fs::read(dir.path().join(".dut-serial/logs/full.full.log")).unwrap(),
+            expected
+        );
+        assert_eq!(
+            fs::read(dir.path().join(".dut-serial/logs/current.full.log")).unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn acknowledged_raw_bytes_survive_exit_without_drop() {
+        const ENV: &str = "SERMCP_LOG_EXIT_TEST_DIR";
+        if let Ok(dir) = std::env::var(ENV) {
+            let mut logs = LogManager::new(Path::new(&dir), 100, 100, ".dut-serial");
+            for n in 0..256u32 {
+                logs.write(&n.to_le_bytes().repeat(1024));
+            }
+            // Durability is batched on read paths; the exit boundary flushes.
+            logs.flush_sync();
+            assert!(!logs.has_pending_writes());
+            std::process::exit(73);
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "log_manager::tests::acknowledged_raw_bytes_survive_exit_without_drop",
+            ])
+            .env(ENV, dir.path())
+            .stdout(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(73));
+        let expected: Vec<u8> = (0..256u32)
+            .flat_map(|n| n.to_le_bytes().repeat(1024))
+            .collect();
+        assert_eq!(
+            fs::read(dir.path().join(".dut-serial/logs/full.full.log")).unwrap(),
+            expected
+        );
+        assert_eq!(
+            fs::read(dir.path().join(".dut-serial/logs/current.full.log")).unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn failed_view_recovers_from_raw_without_duplicate_bytes() {
+        let (mut logs, _tmp) = create_test_log_manager(100, 100);
+        fs::create_dir_all(logs.log_dir().join("current.serial.log")).unwrap();
+        logs.write(b"first\n");
+        // Surface the view failure explicitly (read paths batch flushes).
+        logs.flush_sync();
+        assert!(logs.persistence_status().last_error.is_some());
+        assert_eq!(logs.persistence_status().durable_bytes, 6);
+        fs::remove_dir(logs.log_dir().join("current.serial.log")).unwrap();
+        assert!(logs.retry_pending());
+        logs.write(b"second\n");
+        logs.flush_sync();
+        assert!(logs.persistence_status().last_error.is_none());
+        assert_eq!(
+            fs::read(logs.log_dir().join("current.serial.log")).unwrap(),
+            b"first\nsecond\n"
+        );
+    }
+
+    #[test]
+    fn partial_write_failure_retries_only_unwritten_suffix() {
+        struct ShortWriter {
+            bytes: Vec<u8>,
+            fail: bool,
+        }
+        impl Write for ShortWriter {
+            fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+                if self.fail && !self.bytes.is_empty() {
+                    return Err(std::io::Error::from_raw_os_error(28));
+                }
+                let n = data.len().min(3);
+                self.bytes.extend_from_slice(&data[..n]);
+                Ok(n)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut writer = ShortWriter {
+            bytes: Vec::new(),
+            fail: true,
+        };
+        let mut pending = b"abcdefgh".to_vec();
+        assert!(super::write_pending(&mut writer, &mut pending).is_err());
+        assert_eq!(pending, b"defgh");
+        writer.fail = false;
+        super::write_pending(&mut writer, &mut pending).unwrap();
+        assert_eq!(writer.bytes, b"abcdefgh");
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn paired_logs_filter_echoes_rotate_together_and_preserve_partial_frames() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut lm = super::LogManager::new(tmp.path(), 1, 100, ".dut-serial");
+        let id = "0123456789abcdef0123456789abcdef_1";
+        let raw = format!(
+            "boot output\n{}\r\n@@SMHB1:{id}@@ t=NA u=1 c=NA m=NA l=NA b=NA d=NA r=NA w=NA @@END@@\r\nOops preserved\n",
+            crate::heartbeat::command(id)
+        );
+        for chunk in raw.as_bytes().chunks(7) {
+            lm.write_serial(chunk);
+        }
+        lm.flush_sync();
+        let dir = lm.log_dir().to_path_buf();
+        assert_eq!(
+            std::fs::read(dir.join("current.full.log")).unwrap(),
+            raw.as_bytes()
+        );
+        let expected = b"boot output\n\r\n\r\nOops preserved\n";
+        assert_eq!(
+            std::fs::read(dir.join("current.serial.log")).unwrap(),
+            expected
+        );
+        lm.mark_boot_start();
+        let archives = lm.list_archives();
+        assert_eq!(archives.len(), 1);
+        assert!(archives[0].filename.ends_with(".serial.log"));
+        assert_eq!(
+            std::fs::read(dir.join(&archives[0].filename)).unwrap(),
+            expected
+        );
+        let full = archives[0].filename.replace(".serial.log", ".full.log");
+        assert_eq!(std::fs::read(dir.join(&full)).unwrap(), raw.as_bytes());
+        lm.write_serial(b"next boot\n@@SMHB1:partial");
+        lm.close();
+        assert_eq!(
+            std::fs::read(dir.join("current.serial.log")).unwrap(),
+            b"next boot\n@@SMHB1:partial"
+        );
+        lm.mark_boot_start();
+        assert!(!dir.join(&full).exists());
+        assert!(!dir.join(&archives[0].filename).exists());
+    }
+
+    #[test]
+    fn reopening_capture_preserves_existing_serial_history() {
+        let project = tempfile::tempdir().unwrap();
+        let directory = project.path().join(".dut-serial/logs");
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join("current.serial.log"), b"old cycle\n").unwrap();
+        std::fs::write(
+            directory.join("full.serial.log"),
+            b"older history\nold cycle\n",
+        )
+        .unwrap();
+
+        let mut log = super::LogManager::new(project.path(), 10, 100, ".dut-serial");
+        log.write_serial(b"new data\n");
+        log.close();
+
+        for suffix in ["full.log", "serial.log"] {
+            assert_eq!(
+                std::fs::read(directory.join(format!("current.{suffix}"))).unwrap(),
+                b"old cycle\nnew data\n"
+            );
+            assert_eq!(
+                std::fs::read(directory.join(format!("full.{suffix}"))).unwrap(),
+                b"older history\nold cycle\nnew data\n"
+            );
+        }
+    }
+
     fn combined_cycles(lm: &super::LogManager) -> Vec<u8> {
         let mut archives: Vec<_> = std::fs::read_dir(lm.log_dir())
             .unwrap()
@@ -772,6 +1486,7 @@ mod tests {
                     .unwrap()
                     .to_string_lossy()
                     .starts_with("boot-")
+                    && !path.to_string_lossy().ends_with(".serial.log")
             })
             .collect();
         archives.sort();
@@ -848,7 +1563,7 @@ mod tests {
         // while the MCP process is yielded; those bytes never pass through
         // the resumed process's boundary detector.
         let log_dir = tmp.path().join(".dut-serial/logs");
-        let current_path = log_dir.join("current.serial.log");
+        let current_path = log_dir.join("current.full.log");
         let mut external = std::fs::OpenOptions::new()
             .append(true)
             .open(&current_path)
@@ -877,13 +1592,13 @@ mod tests {
     #[test]
     fn resumed_writer_reopens_current_after_external_rotation() {
         let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("current.serial.log");
+        let path = tmp.path().join("current.full.log");
         let mut file = None;
-        super::write_with_reopen(&mut file, &path, b"old cycle\n");
+        super::write_with_reopen(&mut file, &path, b"old cycle\n").unwrap();
         let archive = tmp.path().join("boot-001.log");
         std::fs::rename(&path, &archive).unwrap();
         std::fs::write(&path, b"direct cycle\n").unwrap();
-        super::write_with_reopen(&mut file, &path, b"resumed MCP\n");
+        super::write_with_reopen(&mut file, &path, b"resumed MCP\n").unwrap();
         assert_eq!(std::fs::read(&archive).unwrap(), b"old cycle\n");
         assert_eq!(
             std::fs::read(&path).unwrap(),
@@ -997,10 +1712,12 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires an explicitly supplied recorded UART log"]
     fn replay_recorded_serial_log_preserves_every_byte() {
-        let source = std::env::var("SERMCP_REPLAY_LOG").expect("SERMCP_REPLAY_LOG");
-        let bytes = std::fs::read(source).unwrap();
+        let bytes = match std::env::var_os("SERMCP_REPLAY_LOG") {
+            Some(path) => std::fs::read(path).expect("read SERMCP_REPLAY_LOG"),
+            None => include_bytes!("../tests/fixtures/rk3576-boot.log").to_vec(),
+        };
+        assert!(!bytes.is_empty(), "UART replay input must not be empty");
         let (mut lm, _tmp) = create_test_log_manager(10000, 100);
         for chunk in bytes.chunks(4096) {
             lm.write_serial(chunk);
@@ -1016,15 +1733,15 @@ mod tests {
 
     /// Regression (live acceptance): a FRESH LogManager must serve the
     /// live current-cycle log through live_read_target() BEFORE any boot
-    /// rotation — the writer appends to current.serial.log from startup,
+    /// rotation — the writer appends to current.full.log from startup,
     /// and serial_get_logs(archive=0) reads through this path.
     #[test]
     fn fresh_log_manager_serves_live_current_log() {
         let tmp = tempfile::tempdir().expect("tmpdir");
         let mut lm = LogManager::new(tmp.path(), 10, 100, ".dut-serial");
         lm.write(b"hello live log\n");
-        // give the writer thread a moment to flush
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        // Persistence is batched; flush before observing on-disk state.
+        lm.flush_sync();
         let target = lm
             .live_read_target()
             .expect("live target must exist before any rotation");
@@ -1101,11 +1818,11 @@ mod tests {
         let path = tmp.path().join("not-created-yet/serial.log");
         let mut file = None;
 
-        write_with_reopen(&mut file, &path, b"lost-attempt");
+        assert!(write_with_reopen(&mut file, &path, b"lost-attempt").is_err());
         assert!(file.is_none());
 
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        write_with_reopen(&mut file, &path, b"recovered\n");
+        write_with_reopen(&mut file, &path, b"recovered\n").unwrap();
         assert!(file.is_some());
         assert_eq!(std::fs::read(&path).unwrap(), b"recovered\n");
     }
@@ -1120,8 +1837,8 @@ mod tests {
         lm.flush_sync();
 
         let log_dir = tmp.path().join(".dut-serial/logs");
-        let current = fs::read(log_dir.join("current.serial.log")).unwrap();
-        let full = fs::read(log_dir.join("full.serial.log")).unwrap();
+        let current = fs::read(log_dir.join("current.full.log")).unwrap();
+        let full = fs::read(log_dir.join("full.full.log")).unwrap();
 
         assert!(contains_bytes(&current, raw));
         assert!(contains_bytes(&full, raw));
@@ -1145,7 +1862,7 @@ mod tests {
         }
         lm.flush_sync();
 
-        let log = fs::read(tmp.path().join(".dut-serial/logs/current.serial.log")).unwrap();
+        let log = fs::read(tmp.path().join(".dut-serial/logs/current.full.log")).unwrap();
         let expected = b"2: eth0: <BROADCAST> mtu 1500 state \x1b[32mUP\x1b[0m group default\n    inet \x1b[32m127.0.0.1\x1b[0m/8 scope host lo\n";
 
         assert!(contains_bytes(&log, expected));
@@ -1168,9 +1885,9 @@ mod tests {
             .unwrap()
             .filter_map(|e| e.ok())
             .find(|e| {
-                e.file_name()
-                    .to_str()
-                    .is_some_and(|n| n.starts_with("boot-") && n.ends_with(".log"))
+                e.file_name().to_str().is_some_and(|n| {
+                    n.starts_with("boot-") && n.ends_with(".log") && !n.ends_with(".serial.log")
+                })
             })
             .expect("expected archived boot log");
         let archived = fs::read(archive.path()).unwrap();
@@ -1347,7 +2064,7 @@ mod tests {
 
     // ── Smoke tests: boot log splitting ─────────────────────────────────
 
-    /// `ensure_current_file()` opens `current.serial.log` WITHOUT creating a
+    /// `ensure_current_file()` opens `current.full.log` WITHOUT creating a
     /// numbered `boot-NNN.log`.  Boot log files are only created on BootStart.
     #[test]
     fn test_ensure_current_file_no_numbered_log() {
@@ -1356,17 +2073,17 @@ mod tests {
 
         lm.ensure_current_file();
 
-        // current.serial.log should exist as a regular file (not a symlink)
-        assert!(log_dir.join("current.serial.log").exists());
-        assert!(!log_dir.join("current.serial.log").is_symlink());
+        // current.full.log should exist as a regular file (not a symlink)
+        assert!(log_dir.join("current.full.log").exists());
+        assert!(!log_dir.join("current.full.log").is_symlink());
         // But no numbered boot-NNN.log should have been created
         let numbered: Vec<_> = std::fs::read_dir(&log_dir)
             .unwrap()
             .filter_map(|e| e.ok())
             .filter(|e| {
-                e.file_name()
-                    .to_str()
-                    .is_some_and(|n| n.starts_with("boot-") && n.ends_with(".log"))
+                e.file_name().to_str().is_some_and(|n| {
+                    n.starts_with("boot-") && n.ends_with(".log") && !n.ends_with(".serial.log")
+                })
             })
             .collect();
         assert!(
@@ -1395,9 +2112,9 @@ mod tests {
             .unwrap()
             .filter_map(|e| e.ok())
             .filter(|e| {
-                e.file_name()
-                    .to_str()
-                    .is_some_and(|n| n.starts_with("boot-") && n.ends_with(".log"))
+                e.file_name().to_str().is_some_and(|n| {
+                    n.starts_with("boot-") && n.ends_with(".log") && !n.ends_with(".serial.log")
+                })
             })
             .collect();
         assert_eq!(
@@ -1405,8 +2122,8 @@ mod tests {
             1,
             "mark_boot_start should create exactly 1 boot log"
         );
-        // current.serial.log is a regular file (not a symlink)
-        assert!(!log_dir.join("current.serial.log").is_symlink());
+        // current.full.log is a regular file (not a symlink)
+        assert!(!log_dir.join("current.full.log").is_symlink());
     }
 
     /// After `mark_boot_start`, the archived boot log retains its data (the
@@ -1428,9 +2145,9 @@ mod tests {
             .unwrap()
             .filter_map(|e| e.ok())
             .filter(|e| {
-                e.file_name()
-                    .to_str()
-                    .is_some_and(|n| n.starts_with("boot-") && n.ends_with(".log"))
+                e.file_name().to_str().is_some_and(|n| {
+                    n.starts_with("boot-") && n.ends_with(".log") && !n.ends_with(".serial.log")
+                })
             })
             .collect();
         assert_eq!(numbered.len(), 1);
@@ -1459,7 +2176,7 @@ mod tests {
         lm.flush_sync();
 
         // boot 1 data should be in the archived file, not current
-        let current = std::fs::read_to_string(log_dir.join("current.serial.log")).unwrap();
+        let current = std::fs::read_to_string(log_dir.join("current.full.log")).unwrap();
         assert!(current.contains("boot 2 data"));
         assert!(!current.contains("boot 1 data")); // flushed to numbered log
     }
@@ -1499,9 +2216,9 @@ mod tests {
             .unwrap()
             .filter_map(|e| e.ok())
             .filter(|e| {
-                e.file_name()
-                    .to_str()
-                    .is_some_and(|n| n.starts_with("boot-") && n.ends_with(".log"))
+                e.file_name().to_str().is_some_and(|n| {
+                    n.starts_with("boot-") && n.ends_with(".log") && !n.ends_with(".serial.log")
+                })
             })
             .collect();
         assert_eq!(

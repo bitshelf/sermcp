@@ -61,7 +61,7 @@ impl TaskManager {
         let slot = self
             .slots
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .expect("resource registry mutex poisoned")
             .entry(dut.to_string())
             .or_insert_with(|| Arc::new(Semaphore::new(1)))
             .clone();

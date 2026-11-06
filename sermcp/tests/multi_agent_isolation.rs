@@ -252,11 +252,9 @@ fn second_stdio_server_refuses_and_leaves_owner_untouched() {
     wait_for_file(&project.join(".dut-serial/mcp.pid"), 30);
     wait_for_file(&project.join(".dut-serial/inventory.json"), 30);
     wait_for_port(ports::project_mcp_port(project), 30);
-    let inv_before = std::fs::read(project.join(".dut-serial/inventory.json")).unwrap();
-    let mt_before = std::fs::metadata(project.join(".dut-serial/inventory.json"))
-        .unwrap()
-        .modified()
-        .unwrap();
+    let inventory_path = project.join(".dut-serial/inventory.json");
+    let inv_before: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&inventory_path).unwrap()).unwrap();
     let owner_pid = first.child.id().to_string();
 
     let (mut second, mut stderr) = spawn_stdio_refuser(&conf, project);
@@ -281,27 +279,64 @@ fn second_stdio_server_refuses_and_leaves_owner_untouched() {
         "the refused spawn must not replace the owner's PID"
     );
 
-    assert_eq!(
-        std::fs::read(project.join(".dut-serial/inventory.json")).unwrap(),
-        inv_before,
-        "the refused spawn must never rewrite inventory"
-    );
-    let mt_after = std::fs::metadata(project.join(".dut-serial/inventory.json"))
-        .unwrap()
-        .modified()
-        .unwrap();
-    assert_eq!(
-        mt_after, mt_before,
-        "the refused spawn must not touch inventory mtime"
-    );
+    let inv_after: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&inventory_path).unwrap()).unwrap();
+    // The owner can refresh DUT state while the contender is starting.
+    for key in ["mcp_pid", "mcp_http_port", "config_path", "owner"] {
+        assert_eq!(inv_after[key], inv_before[key], "ownership changed: {key}");
+    }
 
     first.close_stdin();
     let _ = first.wait_timeout(15);
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn project_path_remains_reserved_when_directory_is_replaced() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("project");
+    let retired = tmp.path().join("retired");
+    std::fs::create_dir(&project).unwrap();
+    let conf = write_target_jsonc(&project, "board");
+    let _residue = ScratchResidueGuard::for_project(&project);
+
+    let mut first = spawn_server(&conf, &project);
+    wait_for_port(ports::project_mcp_port(&project), 15);
+    std::fs::rename(&project, &retired).unwrap();
+    std::fs::create_dir(&project).unwrap();
+    write_target_jsonc(&project, "replacement");
+
+    let (mut second, mut stderr) = spawn_stdio_refuser(&conf, &project);
+    let status = second.wait_timeout(15).expect("second server must exit");
+    let mut message = String::new();
+    stderr.read_to_string(&mut message).unwrap();
+    assert!(!status.success());
+    assert!(
+        message.contains("refusing to start a second instance"),
+        "{message}"
+    );
+    assert!(first.try_wait().is_none());
+    assert!(!project.join(".dut-serial/mcp.pid").exists());
+
+    first.close_stdin();
+    first
+        .wait_timeout(15)
+        .expect("first server must release its locks");
+    let mut successor = spawn_server(&conf, &project);
+    wait_for_file(&project.join(".dut-serial/mcp.pid"), 15);
+    assert_eq!(
+        std::fs::read_to_string(project.join(".dut-serial/mcp.pid")).unwrap(),
+        successor.child.id().to_string()
+    );
+    successor.close_stdin();
+    successor
+        .wait_timeout(15)
+        .expect("successor must shut down");
+}
+
 /// Different project paths have independent lifecycle ownership. If they are
 /// accidentally configured for the same physical endpoint, the later project
-/// must become a serial non-owner without killing, rewriting, or stealing from
+/// must refuse startup without killing, rewriting, or stealing from
 /// the first project. Physical host:port exclusivity is global by necessity;
 /// project lifecycle and files remain strictly path-scoped.
 #[test]
@@ -334,14 +369,13 @@ fn different_projects_never_steal_same_serial_endpoint() {
         "first project owns the physical endpoint"
     );
 
-    let mut second = spawn_server(&second_conf, &second_project);
-    wait_for_file(&second_project.join(".dut-serial/mcp.pid"), 30);
-    std::thread::sleep(Duration::from_secs(2));
+    let (mut second, mut stderr) = spawn_stdio_refuser(&second_conf, &second_project);
+    let status = second.wait_timeout(15).expect("conflicting startup exits");
+    assert!(!status.success());
+    let mut message = String::new();
+    std::io::Read::read_to_string(&mut stderr, &mut message).unwrap();
+    assert!(message.contains("Serial endpoint conflict"), "{message}");
     assert!(first.try_wait().is_none(), "first project remains alive");
-    assert!(
-        second.try_wait().is_none(),
-        "second project remains an observer"
-    );
     assert_eq!(
         sermcp::lock_manager::endpoint_lock_owner(&endpoint_lock),
         Some(first.child.id()),
@@ -360,7 +394,21 @@ fn different_projects_never_steal_same_serial_endpoint() {
         "stopping the second project cannot release the first project's lock"
     );
     first.close_stdin();
-    let _ = first.wait_timeout(15);
+    assert!(first.wait_timeout(15).is_some());
+    let mut successor = spawn_server(&second_conf, &second_project);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline
+        && sermcp::lock_manager::endpoint_lock_owner(&endpoint_lock) != Some(successor.child.id())
+    {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(
+        sermcp::lock_manager::endpoint_lock_owner(&endpoint_lock),
+        Some(successor.child.id()),
+        "next project acquires ownership only after the former owner exits"
+    );
+    successor.close_stdin();
+    assert!(successor.wait_timeout(15).is_some());
 }
 
 /// R12 (B4): startup sweeps `.inventory.json.tmp-<pid>-<seq>` files whose

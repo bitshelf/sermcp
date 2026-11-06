@@ -1,6 +1,123 @@
-//! Bind a server to a session process, checking its start time against PID reuse.
+//! Serialize project startup/stop and bind session lifetimes against PID reuse.
 
 use std::io;
+use std::path::{Path, PathBuf};
+
+pub const CONTROL_HEADER: &str = "x-sermcp-control";
+
+fn control_token_path(project: &Path, port: u16) -> PathBuf {
+    project
+        .join(".dut-serial")
+        .join(format!("control-{port}.token"))
+}
+
+pub fn read_control_token(project: &Path, port: u16) -> Option<String> {
+    use std::io::Read as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(control_token_path(project, port))
+        .ok()?;
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
+    let mut token = String::new();
+    file.take(33).read_to_string(&mut token).ok()?;
+    (token.len() == 32 && token.bytes().all(|byte| byte.is_ascii_hexdigit())).then_some(token)
+}
+
+pub(crate) fn publish_control_token(
+    project: &Path,
+    port: u16,
+) -> io::Result<(String, tempfile::TempPath)> {
+    use std::io::Write as _;
+
+    let path = control_token_path(project, port);
+    let directory = project.join(".dut-serial");
+    std::fs::create_dir_all(&directory)?;
+    let mut file = tempfile::NamedTempFile::new_in(directory)?;
+    let token = format!("{:032x}", rand::random::<u128>());
+    file.write_all(token.as_bytes())?;
+    file.persist(&path)?;
+    Ok((token, tempfile::TempPath::try_from_path(path)?))
+}
+
+async fn lock_lifecycle_file(project: &Path, name: &str) -> io::Result<std::fs::File> {
+    let directory = project.join(".dut-serial");
+    std::fs::create_dir_all(&directory)?;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(directory.join(name))?;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            Err(std::fs::TryLockError::Error(error)) => return Err(error),
+            Err(std::fs::TryLockError::WouldBlock) => {}
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "Project lifecycle operation is busy; retry after it completes",
+            ));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+/// Serialize CLI start/stop/resume through completion, including readiness.
+/// Acquire this before StartupGate; a server never takes this CLI-only lock.
+pub async fn lock_project_control(project: &Path) -> io::Result<std::fs::File> {
+    lock_lifecycle_file(project, "start.lock").await
+}
+
+/// Serialize startup admission and manual inhibit changes across processes.
+/// Keep this gate until the server holds its project lock and has checked
+/// the inhibit. Stop writes the inhibit before checking for a live owner.
+/// Lock files are never removed: replacing an inode would split ownership.
+pub struct StartupGate {
+    _lock: std::fs::File,
+    marker: PathBuf,
+}
+
+impl StartupGate {
+    pub async fn acquire(project: &Path) -> io::Result<Self> {
+        Ok(Self {
+            _lock: lock_lifecycle_file(project, "startup.lock").await?,
+            marker: project.join(".dut-serial/stopped"),
+        })
+    }
+
+    pub fn require_enabled(&self) -> io::Result<()> {
+        if self.marker.try_exists()? {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "Project startup is disabled; a human must run dutabo start or dutabo resume",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn inhibit(&self) -> io::Result<()> {
+        std::fs::write(
+            &self.marker,
+            "Stopped by dutabo; human dutabo start or dutabo resume enables startup.\n",
+        )
+    }
+
+    /// Clear the startup inhibit for a human start or resume.
+    pub fn enable(&self) -> io::Result<()> {
+        match std::fs::remove_file(&self.marker) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct SessionOwner {

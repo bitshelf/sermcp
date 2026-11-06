@@ -221,7 +221,9 @@ impl Pane {
                         "no MCP is serving this DUT's serial endpoint — start one from the form (TEST spawns it, the quick actions and this click do too) or check the sermcp binary and the DUT's serial port"
                     })?;
                     let url=if monitor {format!("ws://127.0.0.1:{port}/serial/ws?{selector}&mode=monitor")} else {format!("ws://127.0.0.1:{port}/serial/ws?{selector}")};
-                    let (mut ws,_)=tokio::time::timeout(std::time::Duration::from_secs(3),tokio_tungstenite::connect_async(url)).await.map_err(|e|e.to_string())?.map_err(|e|e.to_string())?;
+                    let project = if monitor { None } else { ports.project.as_deref() };
+                    let request = super::super::serial_ws_request(url, project, port).map_err(|e| e.to_string())?;
+                    let (mut ws,_)=tokio::time::timeout(std::time::Duration::from_secs(3),tokio_tungstenite::connect_async(request)).await.map_err(|e|e.to_string())?.map_err(|e|e.to_string())?;
                     loop {tokio::select! {
                         bytes=tx_rx.recv()=>match bytes {Some(bytes)=>ws.send(Message::Binary(bytes.into())).await.map_err(|e|e.to_string())?, None=>{let _=ws.close(None).await;break;}},
                         frame=ws.next()=>match frame {
@@ -502,7 +504,12 @@ impl<B: Backend, E: EventSource> FormTui<B, E> {
                         {
                             Ok(text) => {
                                 let config = self.mcp.write_test_config(&root, &text)?;
-                                self.mcp.ensure(&root, &name, ports[0], &config);
+                                if let Err(error) =
+                                    self.mcp.ensure_terminal(&root, &name, &ports, &config)
+                                {
+                                    self.state.pane.message = error;
+                                    return Ok(true);
+                                }
                             }
                             Err(error) => {
                                 self.state.pane.message = error;
@@ -759,7 +766,7 @@ impl<B: Backend, E: EventSource> FormTui<B, E> {
             std::thread::spawn(move || {
                 // The MCP owning this DUT's endpoint (serial entry and
                 // relay presses go through it).
-                let matched = probe_runtime().block_on(async {
+                let matched = run_probe(async {
                     let http = reqwest::Client::builder()
                         .timeout(std::time::Duration::from_secs(2))
                         .build()
@@ -828,6 +835,7 @@ impl<B: Backend, E: EventSource> FormTui<B, E> {
                         mcp_ports: DutPorts {
                             ports: vec![port],
                             dut: ports.dut.clone(),
+                            project: ports.project.clone(),
                         },
                     };
                     let (mark, detail) =
@@ -853,8 +861,9 @@ impl<B: Backend, E: EventSource> FormTui<B, E> {
                     let ports = DutPorts {
                         ports: vec![port],
                         dut: ports.dut.clone(),
+                        project: ports.project.clone(),
                     };
-                    match probe_runtime().block_on(ports.call(
+                    match run_probe(ports.call(
                         "tools/call",
                         serde_json::json!({"name": tool, "arguments": args}),
                     )) {
@@ -984,6 +993,7 @@ mod tests {
             DutPorts {
                 ports: vec![port_rx.recv().unwrap()],
                 dut: Some("board-b".into()),
+                project: None,
             },
             "test-host".into(),
             "2002".into(),

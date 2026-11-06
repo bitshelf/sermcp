@@ -177,6 +177,11 @@ impl CommandQueue {
         self.pending.len()
     }
 
+    /// Includes the command already running on the DUT.
+    pub fn is_busy(&self) -> bool {
+        self.current.is_some() || !self.pending.is_empty()
+    }
+
     /// Drop pending requests when endpoint ownership is no longer valid.
     pub fn cancel_all(&mut self) {
         self.pending.clear();

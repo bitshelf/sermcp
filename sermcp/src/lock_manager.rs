@@ -25,12 +25,13 @@ fn held_locks() -> &'static Mutex<HashMap<PathBuf, std::fs::File>> {
 
 /// Lifetime guard for the single MCP service allowed in one project path.
 ///
-/// The kernel lock is held on the canonical project directory itself. The
-/// PID file is diagnostic state only: deleting or corrupting it cannot create
-/// a second owner while the first process still holds the directory lock.
+/// The directory lock protects aliases to the same inode. On Linux an
+/// abstract socket also reserves the canonical path across directory replacement.
 pub struct ProjectLock {
     pid_path: std::path::PathBuf,
     _project_dir: std::fs::File,
+    #[cfg(target_os = "linux")]
+    _project_path: std::os::unix::net::UnixListener,
 }
 
 impl Drop for ProjectLock {
@@ -52,10 +53,8 @@ fn read_pid_file(path: &Path) -> Option<u32> {
 pub fn acquire_project_lock(project_dir: &Path) -> Result<ProjectLock, u32> {
     use std::os::unix::fs::OpenOptionsExt;
 
-    let canonical = project_dir
-        .canonicalize()
-        .unwrap_or_else(|_| project_dir.to_path_buf());
-    let dir = project_dir.join(".dut-serial");
+    let canonical = project_dir.canonicalize().map_err(|_| 0u32)?;
+    let dir = canonical.join(".dut-serial");
     let path = dir.join("mcp.pid");
     if std::fs::create_dir_all(&dir).is_err() {
         // 0 = "unknown holder": reporting our own pid here printed
@@ -69,19 +68,41 @@ pub fn acquire_project_lock(project_dir: &Path) -> Result<ProjectLock, u32> {
     let Ok(project_file) = std::fs::File::open(&canonical) else {
         return Err(0);
     };
-    if project_file.try_lock().is_err() {
-        return Err(read_pid_file(&path)
-            .filter(|pid| is_live_server_holder(*pid))
-            .or_else(|| check_project_singleton(project_dir, ".dut-serial"))
-            .or_else(|| find_project_process(project_dir))
-            .unwrap_or_default());
+    match project_file.try_lock() {
+        Ok(()) => {}
+        Err(std::fs::TryLockError::WouldBlock) => {
+            return Err(read_pid_file(&path)
+                .filter(|pid| {
+                    *pid == std::process::id()
+                        || (is_live_server_holder(*pid)
+                            && process_belongs_to_project(*pid, &canonical))
+                })
+                .unwrap_or_default());
+        }
+        Err(std::fs::TryLockError::Error(_)) => return Err(0),
     }
 
-    // Compatibility with older binaries that did not flock the project
-    // directory. They did write either the root or a per-DUT PID file, so a
-    // current binary must honor those live holders before publishing itself.
-    if let Some(owner) = find_project_pid_file_holder(project_dir) {
-        return Err(owner);
+    #[cfg(target_os = "linux")]
+    let project_path = {
+        use md5::{Digest, Md5};
+        use std::os::linux::net::SocketAddrExt as _;
+        use std::os::unix::ffi::OsStrExt as _;
+        use std::os::unix::net::{SocketAddr, UnixListener};
+
+        let digest = Md5::digest(canonical.as_os_str().as_bytes());
+        let name = format!("sermcp-project-{}", crate::ports::md5_hex(&digest));
+        let addr = SocketAddr::from_abstract_name(name.as_bytes()).map_err(|_| 0u32)?;
+        UnixListener::bind_addr(&addr).map_err(|_| 0u32)?
+    };
+
+    // Do not overwrite a verified live owner even if it has not reserved
+    // the current directory inode.
+    if let Some(pid) = read_pid_file(&path).filter(|pid| {
+        *pid != std::process::id()
+            && is_live_server_holder(*pid)
+            && process_belongs_to_project(*pid, &canonical)
+    }) {
+        return Err(pid);
     }
 
     let write_result = std::fs::OpenOptions::new()
@@ -97,91 +118,34 @@ pub fn acquire_project_lock(project_dir: &Path) -> Result<ProjectLock, u32> {
     Ok(ProjectLock {
         pid_path: path,
         _project_dir: project_file,
+        #[cfg(target_os = "linux")]
+        _project_path: project_path,
     })
-}
-
-/// Backward-compatible entry point for callers that select one DUT. The lock
-/// scope remains the whole project path; a DUT name never creates a second
-/// MCP ownership domain.
-pub fn acquire_dut_lock(project_dir: &Path, _name: &str) -> Result<ProjectLock, u32> {
-    acquire_project_lock(project_dir)
-}
-
-/// Find a live older server named by the root or an immediate per-DUT PID
-/// file. Current servers use the project-directory flock; these files are
-/// checked only to avoid overlapping with a pre-flock binary during upgrade.
-fn find_project_pid_file_holder(project_dir: &Path) -> Option<u32> {
-    let dut_root = project_dir.join(".dut-serial");
-    let mut candidates = vec![dut_root.join("mcp.pid")];
-    if let Ok(entries) = std::fs::read_dir(&dut_root) {
-        candidates.extend(
-            entries
-                .flatten()
-                .map(|entry| entry.path().join("mcp.pid"))
-                .filter(|path| path.is_file()),
-        );
-    }
-    candidates.into_iter().find_map(|path| {
-        let pid = read_pid_file(&path)?;
-        (pid != std::process::id()
-            && is_live_server_holder(pid)
-            && process_belongs_to_project(pid, project_dir))
-        .then_some(pid)
-    })
-}
-
-/// Fallback when an older process did not write (or later lost) its PID file.
-/// MCP children are launched with the project as cwd, so `/proc/<pid>/cwd`
-/// gives us an authoritative project identity without parsing command lines.
-pub fn find_project_process(project_dir: &Path) -> Option<u32> {
-    let current = std::process::id();
-    for entry in std::fs::read_dir("/proc").ok()?.flatten() {
-        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
-            continue;
-        };
-        if pid == current {
-            continue;
-        }
-        let Ok(comm) = std::fs::read_to_string(entry.path().join("comm")) else {
-            continue;
-        };
-        if !comm.contains("sermcp") {
-            continue;
-        }
-        if !process_alive(pid) || !process_belongs_to_project(pid, project_dir) {
-            continue;
-        }
-        return Some(pid);
-    }
-    None
 }
 
 fn process_belongs_to_project(pid: u32, project_dir: &Path) -> bool {
-    let expected = project_dir
-        .canonicalize()
-        .unwrap_or_else(|_| project_dir.to_path_buf());
-    if std::fs::read_link(format!("/proc/{pid}/cwd"))
-        .ok()
-        .and_then(|path| path.canonicalize().ok().or(Some(path)))
-        .is_some_and(|cwd| cwd == expected)
-    {
-        return true;
-    }
-    let Ok(environ) = std::fs::read(format!("/proc/{pid}/environ")) else {
+    use std::os::unix::ffi::OsStrExt;
+
+    let (Ok(expected), Ok(cwd), Ok(environ)) = (
+        project_dir.canonicalize(),
+        std::fs::read_link(format!("/proc/{pid}/cwd")),
+        std::fs::read(format!("/proc/{pid}/environ")),
+    ) else {
         return false;
     };
-    environ.split(|byte| *byte == 0).any(|entry| {
-        let Some(value) = entry.strip_prefix(b"TARGET_CONF=") else {
-            return false;
-        };
-        let path = PathBuf::from(String::from_utf8_lossy(value).into_owned());
-        let config_project = if path.is_dir() {
-            path
-        } else {
-            path.parent().unwrap_or(Path::new("")).to_path_buf()
-        };
-        config_project.canonicalize().unwrap_or(config_project) == expected
-    })
+    let configured = environ
+        .split(|byte| *byte == 0)
+        .find_map(|entry| entry.strip_prefix(b"TARGET_CONF="));
+    let config = match configured {
+        Some(value) => cwd
+            .join(std::ffi::OsStr::from_bytes(value))
+            .canonicalize()
+            .ok(),
+        None => cwd
+            .ancestors()
+            .find_map(|dir| dir.join(".target.jsonc").canonicalize().ok()),
+    };
+    config.as_deref().and_then(Path::parent) == Some(expected.as_path())
 }
 
 /// Is `pid` a live sermcp server process?
@@ -197,39 +161,11 @@ pub fn is_live_server_holder(pid: u32) -> bool {
             .unwrap_or(false)
 }
 
-/// Check one project-level singleton PID file.
-pub fn check_project_singleton(project_dir: &Path, dut_dir: &str) -> Option<u32> {
-    let pid_file = project_dir.join(dut_dir).join("mcp.pid");
-    let pid: u32 = read_pid_file(&pid_file)?;
-    if is_live_server_holder(pid) && process_belongs_to_project(pid, project_dir) {
-        return Some(pid);
-    }
-    // Stale PID file → clean up.
-    let _ = std::fs::remove_file(&pid_file);
-    None
-}
-
 // ── Forgotten-holder takeover ──────────────────────────────────────────────
 //
 // Automatic takeover requires evidence that a recorded supervised session
 // exited. Missing supervision alone does not authorize terminating a holder:
 // manually launched and detached HTTP services can still have active clients.
-
-/// The holder's supervised session from its environment, when that session
-/// process is still alive (tick-validated against PID reuse).
-fn holder_session_owner(pid: u32) -> Option<crate::lifecycle::SessionOwner> {
-    let environ = std::fs::read(format!("/proc/{pid}/environ")).ok()?;
-    let mut session_pid = None;
-    let mut ticks = None;
-    for entry in environ.split(|byte| *byte == 0) {
-        if let Some(value) = entry.strip_prefix(b"SERMCP_SESSION_PID=") {
-            session_pid = std::str::from_utf8(value).ok().and_then(|v| v.parse().ok());
-        } else if let Some(value) = entry.strip_prefix(b"SERMCP_SESSION_START_TICKS=") {
-            ticks = std::str::from_utf8(value).ok().and_then(|v| v.parse().ok());
-        }
-    }
-    crate::lifecycle::SessionOwner::capture(session_pid?, ticks).ok()
-}
 
 /// Parent pid from `/proc/<pid>/stat` (field 4); 1 for reparented orphans.
 fn parent_pid(pid: u32) -> Option<u32> {
@@ -260,8 +196,11 @@ fn owner_record_alive(project_dir: &Path) -> bool {
 /// is not evidence of abandonment: manually launched HTTP services and
 /// detached services may still have active clients.
 pub fn holder_is_legitimate(project_dir: &Path, pid: u32) -> bool {
-    if crate::lifecycle::project_has_live_sessions(project_dir)
-        || holder_session_owner(pid).is_some()
+    // If process arguments cannot be verified, do not authorize takeover.
+    if std::fs::read(format!("/proc/{pid}/cmdline")).map_or(true, |args| {
+        args.split(|byte| *byte == 0)
+            .any(|arg| arg == b"--persistent")
+    }) || crate::lifecycle::project_has_live_sessions(project_dir)
         || parent_pid(pid).is_some_and(|ppid| ppid > 1 && process_alive(ppid))
         || owner_record_alive(project_dir)
     {
@@ -360,14 +299,14 @@ fn wait_for_holder_exit(pid: u32, limit: std::time::Duration) -> bool {
 /// Acquire the lock for `host:target` (`target` may be a TCP port or device path).
 /// Returns `None` on success, `Some(pid)` if a conflict exists.
 ///
-/// Uses a bounded retry loop (max 8 attempts) instead of unbounded recursion
-/// to prevent stack overflow under persistent races.
+/// Serial owners may recheck their lease; operation-scoped callers must use
+/// `EndpointLease` to exclude independent callers in the same process.
 pub fn acquire_lock(host: &str, target: &str, lock_dir: &str) -> Option<u32> {
     let lock_path = endpoint_lock_path(host, target, lock_dir);
     std::fs::create_dir_all(lock_dir).ok();
     let mut held = held_locks()
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+        .expect("resource registry mutex poisoned");
     // Idempotent re-acquire by the same process.
     if let Some(file) = held.get(&lock_path) {
         return if same_lock_inode(file, &lock_path) {
@@ -442,8 +381,87 @@ pub fn acquire_lock(host: &str, target: &str, lock_dir: &str) -> Option<u32> {
 /// serial`'s direct takeover: the CLI reads the lock to find the live owner
 /// process it must ask to yield (SIGUSR1) before connecting directly.
 pub fn endpoint_lock_path(host: &str, target: &str, lock_dir: &str) -> std::path::PathBuf {
+    let host = canonical_host(host);
+    let target = canonical_target(target);
     let lock_key = format!("{:x}", fnv1a_hash(&format!("{host}:{target}")))[..8].to_string();
     Path::new(lock_dir).join(format!("{lock_key}.lock"))
+}
+
+/// Normalize numeric ports and local device aliases.
+pub fn canonical_target(target: &str) -> String {
+    let target = target.trim();
+    target.parse::<u16>().map_or_else(
+        |_| {
+            if target.starts_with("/dev/") {
+                std::fs::canonicalize(target)
+                    .map(|path| path.to_string_lossy().into_owned())
+                    .unwrap_or_else(|_| target.to_string())
+            } else {
+                target.to_string()
+            }
+        },
+        |port| port.to_string(),
+    )
+}
+
+/// Normalize numeric addresses without DNS lookups or network side effects.
+pub fn canonical_host(host: &str) -> String {
+    let host = host.trim();
+    host.parse::<std::net::IpAddr>().map_or_else(
+        |_| host.to_ascii_lowercase(),
+        |ip| ip.to_canonical().to_string(),
+    )
+}
+
+/// An exclusive lease owned by one operation, including within this process.
+#[derive(Debug)]
+#[must_use = "dropping the lease immediately releases the resource"]
+pub struct EndpointLease(std::fs::File);
+
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum LockError {
+    #[error("resource is busy (owner PID {0:?})")]
+    Busy(Option<u32>),
+    #[error("cannot acquire resource lock: {0}")]
+    Io(#[from] std::io::Error),
+}
+
+impl EndpointLease {
+    pub fn acquire(host: &str, target: &str, lock_dir: &str) -> Result<Self, LockError> {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        std::fs::create_dir_all(lock_dir)?;
+        let path = endpoint_lock_path(host, target, lock_dir);
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .mode(0o600)
+            .open(&path)?;
+        match file.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => {
+                return Err(LockError::Busy(read_lock_pid(&path)));
+            }
+            Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
+        }
+        if !same_lock_inode(&file, &path) {
+            return Err(std::io::Error::other("resource lock inode changed").into());
+        }
+        file.set_len(0)?;
+        writeln!(file, "{}", std::process::id())?;
+        Ok(Self(file))
+    }
+}
+
+impl Drop for EndpointLease {
+    fn drop(&mut self) {
+        if let Err(error) = self.0.set_len(0) {
+            tracing::warn!(%error, "Cannot clear released resource lock diagnostics");
+        }
+    }
 }
 
 /// First-line PID recorded in a lock file, if parseable (no liveness check).
@@ -494,7 +512,7 @@ pub fn lock_identity_intact(host: &str, target: &str, lock_dir: &str) -> bool {
     let path = endpoint_lock_path(host, target, lock_dir);
     held_locks()
         .lock()
-        .unwrap_or_else(|e| e.into_inner())
+        .expect("resource registry mutex poisoned")
         .get(&path)
         .is_some_and(|file| same_lock_inode(file, &path))
 }
@@ -507,18 +525,13 @@ pub fn release_lock(host: &str, target: &str, lock_dir: &str) {
     let lock_path = endpoint_lock_path(host, target, lock_dir);
     if let Some(file) = held_locks()
         .lock()
-        .unwrap_or_else(|e| e.into_inner())
+        .expect("resource registry mutex poisoned")
         .remove(&lock_path)
     {
         // Write only through the locked descriptor, never reopen the path.
         let _ = file.set_len(0);
     }
 }
-
-/// Compatibility entry point: endpoint lock files deliberately persist.
-/// A stale diagnostic PID is overwritten after the next successful flock.
-/// Checking a dead PID before unlinking cannot exclude a concurrent acquirer.
-pub fn cleanup_dead_process_locks(_pid: u32, _lock_dir: &str) {}
 
 // Minimal libc bindings — avoid a `nix`/`libc` dependency for two syscalls.
 // `C-unwind` is used so an unwind across the FFI boundary is safe under
@@ -628,6 +641,28 @@ pub fn wait_for_foreign_holder(lock_path: &Path) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn leases_are_exclusive_and_normalize_numeric_endpoints() {
+        // A trailing dot is significant to DNS search-domain resolution.
+        assert_eq!(canonical_host("Device.Example."), "device.example.");
+        let dir = tempfile::tempdir().unwrap();
+        let dir = dir.path().to_str().unwrap();
+        let lease = EndpointLease::acquire("127.0.0.1", "41000", dir).unwrap();
+        assert!(matches!(
+            EndpointLease::acquire("::ffff:127.0.0.1", "041000", dir),
+            Err(LockError::Busy(_))
+        ));
+        assert_eq!(
+            endpoint_lock_path("0:0:0:0:0:0:0:1", "041000", dir),
+            endpoint_lock_path("::1", "41000", dir)
+        );
+        let other = EndpointLease::acquire("127.0.0.1", "41001", dir).unwrap();
+        drop(other);
+        assert!(EndpointLease::acquire("127.0.0.1", "41000", dir).is_err());
+        drop(lease);
+        let _reacquired = EndpointLease::acquire("127.0.0.1", "041000", dir).unwrap();
+    }
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -704,6 +739,30 @@ mod tests {
     }
 
     #[test]
+    fn unlocked_process_blocks_start_only_with_a_verified_project_record() {
+        let project = tempfile::tempdir().unwrap();
+        let executable = project.path().join("sermcp");
+        std::os::unix::fs::symlink("/bin/sleep", &executable).unwrap();
+        let config = project.path().join(".target.jsonc");
+        std::fs::write(&config, "{}").unwrap();
+        let mut child = std::process::Command::new(&executable)
+            .arg("30")
+            .env("TARGET_CONF", &config)
+            .current_dir(project.path())
+            .spawn()
+            .unwrap();
+        let without_record = acquire_project_lock(project.path()).is_ok();
+        let pid_path = project.path().join(".dut-serial/mcp.pid");
+        std::fs::write(&pid_path, child.id().to_string()).unwrap();
+        let with_record = acquire_project_lock(project.path());
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(without_record);
+        assert!(matches!(with_record, Err(pid) if pid == child.id()));
+        assert!(acquire_project_lock(project.path()).is_ok());
+    }
+
+    #[test]
     fn stale_unanchored_per_dut_pid_does_not_block_project_lock() {
         let project = temp_lock_dir();
         let dut_dir = project.join(".dut-serial/rk3576");
@@ -716,21 +775,6 @@ mod tests {
         assert!(project.join(".dut-serial/mcp.pid").exists());
         assert!(dut_dir.join("mcp.pid").exists());
         drop(guard);
-        std::fs::remove_dir_all(project).ok();
-    }
-
-    #[test]
-    fn dut_lock_uses_the_same_project_singleton() {
-        let project = temp_lock_dir();
-        // A DUT selection changes engine configuration only. It never creates
-        // a second ownership domain inside the same project path.
-        let guard = acquire_project_lock(&project).unwrap();
-        assert!(acquire_dut_lock(&project, "rk3576-2").is_err());
-        assert!(acquire_dut_lock(&project, "rk3576").is_err());
-        drop(guard);
-        let dut_guard = acquire_dut_lock(&project, "rk3576").unwrap();
-        assert!(acquire_project_lock(&project).is_err());
-        drop(dut_guard);
         std::fs::remove_dir_all(project).ok();
     }
 
@@ -747,7 +791,7 @@ mod tests {
     }
 
     #[test]
-    fn supervised_session_keeps_a_detached_holder_legitimate() {
+    fn holder_session_exit_requires_matching_process_identity() {
         let project = temp_lock_dir();
         let mut session = std::process::Command::new("sleep")
             .arg("60")
@@ -762,26 +806,9 @@ mod tests {
             .env("SERMCP_SESSION_START_TICKS", ticks.to_string())
             .spawn()
             .unwrap();
-        // Bounded wait for exec: /proc/<pid>/environ shows the parent's
-        // environment until the child has exec'd.
-        let mut supervised = false;
-        for _ in 0..40 {
-            if holder_session_owner(holder.id()).is_some() {
-                supervised = true;
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
-        assert!(
-            supervised,
-            "holder never exposed its supervised session env"
-        );
         assert!(!holder_session_exited(holder.id()));
-        // Session death revokes legitimacy: the tick-validated liveness
-        // check in SessionOwner::capture fails once the session is gone.
         session.kill().unwrap();
         let _ = session.wait();
-        assert!(holder_session_owner(holder.id()).is_none());
         assert!(holder_session_exited(holder.id()));
         holder.kill().unwrap();
         let _ = holder.wait();
@@ -970,32 +997,6 @@ mod tests {
 
         release_lock(&host, &port, dir_str);
         std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn cleanup_dead_process_locks_is_pid_scoped() {
-        let dir = temp_lock_dir();
-        let dead = dir.join("dead.lock");
-        let live = dir.join("live.lock");
-        let (dead_host, dead_port) = test_endpoint();
-        let (live_host, live_port) = test_endpoint();
-        std::fs::write(
-            &dead,
-            format!("99999999\n{dead_host}:{dead_port}\nhost\nnow"),
-        )
-        .unwrap();
-        std::fs::write(
-            &live,
-            format!("{}\n{live_host}:{live_port}\nhost\nnow", std::process::id()),
-        )
-        .unwrap();
-
-        cleanup_dead_process_locks(99999999, dir.to_str().unwrap());
-        assert!(dead.exists(), "dead PID residue preserves the lock inode");
-        assert!(live.exists(), "another process's lock is untouched");
-        cleanup_dead_process_locks(std::process::id(), dir.to_str().unwrap());
-        assert!(live.exists(), "a live PID is never cleaned");
-        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]

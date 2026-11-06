@@ -43,9 +43,9 @@ ls .dut-serial/logs/boot-*.log
 # → 每次上电一个文件
 
 # 3f. reboot 性能 (必须 < 3s)
-time curl ... serial_send_command '{"command":"reboot","timeout":5}'
+time curl ... serial_exec '{"command":"reboot","mode":"shell","timeout":5}'
 # → 必须 < 3s 返回 {"output":"reboot sent"}
-# ❌ 若 > 3s: wait_readable 持锁过久或 serial_send_command 未走 fast-path
+# ❌ 若 > 3s: wait_readable 持锁过久或 serial_exec 未走 fast-path
 ```
 
 ### 4. 继电器回归测试 (自动化)
@@ -87,7 +87,7 @@ cat .dut-serial/target-state                   # → 与 API serial_get_state �
 ### reboot 状态流转 ✅
 ```bash
 # 1. 发送 reboot
-serial_send_command("reboot")
+serial_exec("reboot")
 # 2. 监控 target-state
 watch -n 0.5 cat .dut-serial/target-state
 # 预期: active → booting → uboot → booting → active
@@ -109,7 +109,7 @@ tail -f .dut-serial/logs/current.serial.log
 serial_enter_uboot()
 # 问题: prompt 检测超时 (watcher 在 flood 之后设置)
 # 修复: watcher 提前于 relay_reset 设置
-# U-Boot 交互: serial_send_command 不支持 U-Boot (需 marker-echo shell)
+# U-Boot 交互: serial_exec(mode=shell) 不支持 U-Boot (需 marker-echo shell)
 ```
 
 ### 心跳探针 ✅
@@ -126,7 +126,7 @@ watch -n 1 cat .dut-serial/target-state
 curl -s -X POST http://localhost:3000/mcp -H 'Content-Type: application/json' \
   -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}'
 curl -s -X POST http://localhost:3000/mcp -H 'Content-Type: application/json' \
-  -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"serial_send_command","arguments":{"command":"uname -a","timeout":10}}}'
+  -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"serial_exec","arguments":{"command":"uname -a","mode":"shell","timeout":10}}}'
 
 # 查询状态
 curl ... "tools/call" ... "name":"serial_get_state"

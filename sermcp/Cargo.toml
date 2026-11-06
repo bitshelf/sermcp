@@ -2,7 +2,7 @@
 name = "sermcp"
 version = "0.4.2"
 edition = "2024"
-rust-version = "1.98"
+rust-version.workspace = true
 description = "MCP server for embedded Linux serial console debugging via ser2net"
 autobins = false
 
@@ -21,17 +21,21 @@ name = "serial-sim"
 path = "src/bin/serial-sim.rs"
 required-features = ["serial-sim"]
 
+[[bench]]
+name = "ansi_strip"
+harness = false
+
 [dependencies]
 tempfile = "3"
 toml = "1.1"
-rmcp = { version = "3.8", features = [
+rmcp = { workspace = true, features = [
     "server",
     "macros",
     "transport-io",
     "transport-streamable-http-server",
     "elicitation",
 ] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "io-std", "sync", "time", "signal", "fs", "process"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util", "io-std", "sync", "time", "signal", "fs", "process"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 serde = { version = "1", features = ["derive"] }
 # preserve_order: the `dutabo init` .mcp.json reconciler round-trips the
@@ -88,16 +92,19 @@ alacritty_terminal = { version = "0.26", default-features = false }
 [features]
 default = ["ch340"]
 ch340 = ["dut-ctrl/ch340"]
-# Direct DUT probing from the `dutabo init` TEST button is DEBUG-ONLY.
-# Production must route every DUT test through the MCP server; this feature
-# restores the original direct relay/serial probes as a fallback when the MCP
-# server is unreachable. Enable for local debugging:
-#   cargo run --bin dutabo --features direct-dut-probe -- init
-direct-dut-probe = []
 # Opt-in gate for the serial-sim [[bin]] above: keeps the test simulator out
 # of `cargo install` and default builds. Local usage:
 #   cargo run --bin serial-sim --features serial-sim -- --port 9999
 serial-sim = []
+# Compile the interactive-relay hop instrumentation (`relay_trace!`) into
+# release builds. Default builds contain none of it; when the feature is
+# off the `relay_trace!` macro expands to nothing, so production binaries
+# carry zero per-hop tracing code. Tail-latency attribution workflow:
+#   cargo musl --features relay-trace
+#   SERMCP_TRACE=/tmp/relay.pftrace sermcp --http ...   (and/or dutabo)
+#   TRACE_DUMP=/tmp/relay.pftrace cargo test --test latency_probe trace_dump \
+#     -- --ignored --nocapture
+relay-trace = []
 
 [build-dependencies]
 toml = "1.1"
@@ -112,7 +119,7 @@ proptest = "1"
 # In-process rmcp client for the end-to-end pre-flash review gate test
 # (mcp_handler tests: serve_server + serve_client over tokio::io::duplex).
 # Features merge with the main dependency during test builds only.
-rmcp = { version = "3.8", features = ["client"] }
+rmcp = { workspace = true, features = ["client"] }
 
 # cargo-binstall support: the release workflow publishes exactly this
 # default pkg-url shape —

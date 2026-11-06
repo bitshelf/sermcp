@@ -210,14 +210,11 @@ pub fn format_state_cell(view: &DutStateView) -> String {
 /// The live state file for one DUT — the ONE shared path derivation used by
 /// `inventory_state_for` and the `dutabo list` table.
 ///
-/// The name dir (`.dut-serial/<dut_name>/target-state`) wins when it holds a
-/// file: the engine writes it on EVERY transition when the DUT has a name,
-/// and a `TARGET_DUT_NAME` server FORCES its dut_dir to that same path — so
-/// with an explicit `dut_dir` key the configured dir can hold a stale
-/// leftover while the live state sits in the name dir (the source the
-/// Python statusline reads). The configured `dut_dir` file is the fallback
-/// (name-less engines write only there). A name-less DUT always uses the
-/// configured dir — there is no name dir to consult.
+/// Named engines write ONLY `.dut-serial/<dut_name>/target-state` (on every
+/// transition), so the name dir is the live source. The configured
+/// `dut_dir` file is the fallback for name-less engines, which write only
+/// there. A name-less DUT always uses the configured dir — there is no
+/// name dir to consult.
 pub fn dut_state_file(project_dir: &Path, dut: &crate::config::DutConfig) -> PathBuf {
     let configured = project_dir.join(&dut.dut_dir).join("target-state");
     if dut.dut_name.trim().is_empty() {
@@ -580,7 +577,7 @@ mod tests {
             dev_host_pass: String::new(),
             serial_port,
             relay_ip: String::new(),
-            relay_type: "ch340".into(),
+            relay_type: "ch340-relay".into(),
             dev_ctl: String::new(),
             relay_port: 0,
             reset_ch: 0,

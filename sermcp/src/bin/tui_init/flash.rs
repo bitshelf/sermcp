@@ -679,9 +679,9 @@ mod tests {
     /// dev-host list.
     #[derive(Clone, Copy, PartialEq)]
     enum TriggerOn {
-        /// `serial_send_command` (the shell-style trigger) is the trigger.
+        /// `serial_exec(mode=shell)` (the shell-style trigger) is the trigger.
         SendCommand,
-        /// The RAW `serial_uboot_command` loader command is the trigger.
+        /// The RAW `serial_exec(mode=uboot)` loader command is the trigger.
         UbootRaw,
         /// No call ever triggers the device — the probe must fall through
         /// every attempt and fail with an empty XOR.
@@ -756,15 +756,15 @@ mod tests {
 
     /// Fake Streamable-HTTP MCP server: answers `initialize` (with a
     /// session header), `notifications/initialized`, and `tools/call` for
-    /// serial_get_state / serial_uboot_command / serial_send_command.
+    /// serial_get_state / serial_exec.
     /// `state` starts at the given DUT state and flips to `active` when
-    /// `serial_uboot_command boot` arrives; the trigger file appears when
+    /// `serial_exec(mode=uboot) boot` arrives; the trigger file appears when
     /// the configured trigger call arrives.
     struct FakeMcp {
         listener: tokio::net::TcpListener,
         state: std::sync::Arc<std::sync::Mutex<String>>,
         trigger_on: TriggerOn,
-        /// serial_uboot_command `boot` answers `success: false` (the
+        /// `serial_exec(mode=uboot)` `boot` answers `success: false` (the
         /// boot-resume path must fall through to the next attempt).
         boot_fails: bool,
         trigger_path: std::path::PathBuf,
@@ -829,10 +829,11 @@ mod tests {
                         .as_str()
                         .unwrap_or("")
                         .to_string();
-                    let detail = if tool == "serial_button" {
-                        button
-                    } else {
-                        command.clone()
+                    let mode = req["params"]["arguments"]["mode"].as_str().unwrap_or("");
+                    let detail = match tool.as_str() {
+                        "serial_button" => button,
+                        "serial_exec" => format!("{mode}:{command}"),
+                        _ => command.clone(),
                     };
                     calls
                         .lock()
@@ -870,36 +871,54 @@ mod tests {
                             )
                             .await;
                         }
-                        ("tools/call", "serial_uboot_command") => {
-                            if command == "boot" {
-                                if self.boot_fails {
-                                    write_http_response(
-                                        &mut sock,
-                                        "200 OK",
-                                        "",
-                                        &tool_result_frame(serde_json::json!({
-                                            "success": false,
-                                            "error": "boot refused (fake)"
-                                        })),
-                                    )
-                                    .await;
-                                    continue;
+                        ("tools/call", "serial_exec") => {
+                            let uboot = mode == "uboot";
+                            if uboot {
+                                if command == "boot" {
+                                    if self.boot_fails {
+                                        write_http_response(
+                                            &mut sock,
+                                            "200 OK",
+                                            "",
+                                            &tool_result_frame(serde_json::json!({
+                                                "success": false,
+                                                "error": "boot refused (fake)"
+                                            })),
+                                        )
+                                        .await;
+                                        continue;
+                                    }
+                                    *state.lock().unwrap() = "active".to_string();
                                 }
-                                *state.lock().unwrap() = "active".to_string();
+                                if self.trigger_on == TriggerOn::UbootRaw && command != "boot" {
+                                    std::fs::write(&self.trigger_path, "1").ok();
+                                }
+                                write_http_response(
+                                    &mut sock,
+                                    "200 OK",
+                                    "",
+                                    &tool_result_frame(serde_json::json!({
+                                        "sent": command,
+                                        "output": ""
+                                    })),
+                                )
+                                .await;
+                            } else {
+                                if self.trigger_on == TriggerOn::SendCommand {
+                                    std::fs::write(&self.trigger_path, "1").ok();
+                                }
+                                write_http_response(
+                                    &mut sock,
+                                    "200 OK",
+                                    "",
+                                    &tool_result_frame(serde_json::json!({
+                                        "output": "ok",
+                                        "exit_code": 0,
+                                        "timed_out": false
+                                    })),
+                                )
+                                .await;
                             }
-                            if self.trigger_on == TriggerOn::UbootRaw && command != "boot" {
-                                std::fs::write(&self.trigger_path, "1").ok();
-                            }
-                            write_http_response(
-                                &mut sock,
-                                "200 OK",
-                                "",
-                                &tool_result_frame(serde_json::json!({
-                                    "sent": command,
-                                    "output": ""
-                                })),
-                            )
-                            .await;
                         }
                         ("tools/call", "serial_button") => {
                             write_http_response(
@@ -918,22 +937,6 @@ mod tests {
                                 &tool_result_frame(serde_json::json!({
                                     "success": true,
                                     "wait_boot": false
-                                })),
-                            )
-                            .await;
-                        }
-                        ("tools/call", "serial_send_command") => {
-                            if self.trigger_on == TriggerOn::SendCommand {
-                                std::fs::write(&self.trigger_path, "1").ok();
-                            }
-                            write_http_response(
-                                &mut sock,
-                                "200 OK",
-                                "",
-                                &tool_result_frame(serde_json::json!({
-                                    "output": "ok",
-                                    "exit_code": 0,
-                                    "timed_out": false
                                 })),
                             )
                             .await;
@@ -1074,13 +1077,13 @@ mod tests {
         assert!(detail.contains("TESTDUT"), "device line missing: {detail}");
         let raw_idx = calls
             .iter()
-            .position(|c| c == "tools/call:serial_uboot_command:reboot loader");
+            .position(|c| c == "tools/call:serial_exec:uboot:reboot loader");
         let boot_idx = calls
             .iter()
-            .position(|c| c == "tools/call:serial_uboot_command:boot");
+            .position(|c| c == "tools/call:serial_exec:uboot:boot");
         let send_idx = calls
             .iter()
-            .position(|c| c == "tools/call:serial_send_command:reboot loader");
+            .position(|c| c == "tools/call:serial_exec:shell:reboot loader");
         assert!(
             raw_idx.is_some(),
             "the loader_cmd must be tried RAW at the prompt first; calls={calls:?}"
@@ -1127,11 +1130,11 @@ mod tests {
         assert!(
             !calls
                 .iter()
-                .any(|c| c.starts_with("tools/call:serial_uboot_command")),
+                .any(|c| c.starts_with("tools/call:serial_exec:uboot:")),
             "no U-Boot dance needed from active; calls={calls:?}"
         );
         assert!(
-            calls.contains(&"tools/call:serial_send_command:reboot loader".to_string()),
+            calls.contains(&"tools/call:serial_exec:shell:reboot loader".to_string()),
             "shell trigger must be sent; calls={calls:?}"
         );
     }
@@ -1162,17 +1165,17 @@ mod tests {
             "device line missing: {detail:?}"
         );
         assert!(
-            calls.contains(&"tools/call:serial_uboot_command:db loader.bin".to_string()),
+            calls.contains(&"tools/call:serial_exec:uboot:db loader.bin".to_string()),
             "the loader_cmd must be tried RAW at the prompt; calls={calls:?}"
         );
         assert!(
-            !calls.contains(&"tools/call:serial_uboot_command:boot".to_string()),
+            !calls.contains(&"tools/call:serial_exec:uboot:boot".to_string()),
             "raw trigger succeeded — no boot-resume needed; calls={calls:?}"
         );
         assert!(
             !calls
                 .iter()
-                .any(|c| c.starts_with("tools/call:serial_send_command")),
+                .any(|c| c.starts_with("tools/call:serial_exec:shell:")),
             "a U-Boot command must never be shell-wrapped; calls={calls:?}"
         );
     }
@@ -1220,7 +1223,7 @@ mod tests {
         );
     }
 
-    /// A failed boot-resume (`serial_uboot_command boot` answers
+    /// A failed boot-resume (`serial_exec(mode=uboot)` boot answers
     /// failure) must fall through to the next attempt instead of sending
     /// the shell trigger into a dead console.
     #[test]
@@ -1247,13 +1250,13 @@ mod tests {
              detail={detail:?} calls={calls:?}"
         );
         assert!(
-            calls.contains(&"tools/call:serial_uboot_command:boot".to_string()),
+            calls.contains(&"tools/call:serial_exec:uboot:boot".to_string()),
             "boot must be attempted; calls={calls:?}"
         );
         assert!(
             !calls
                 .iter()
-                .any(|c| c.starts_with("tools/call:serial_send_command")),
+                .any(|c| c.starts_with("tools/call:serial_exec:shell:")),
             "no shell trigger after a failed boot-resume; calls={calls:?}"
         );
     }

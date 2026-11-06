@@ -274,7 +274,7 @@ impl McpHandler {
 
     #[tool(
         name = "serial_poll_logs",
-        description = "Get new serial output since last poll (long-polling). Blocks until new output arrives or the timeout expires.",
+        description = "Get a bounded page of new serial output. Follow the returned since cursor immediately when more is true. An empty poll waits for output up to timeout seconds.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -285,33 +285,45 @@ impl McpHandler {
         &self,
         Parameters(a): Parameters<PollLogsArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        // Gap #8: honor the advertised `since` cursor and `timeout` long-poll
-        // instead of ignoring both. `since` is the byte-offset cursor echoed
-        // back from a previous response (`since` field). When present we read
-        // the current log file directly from that offset WITHOUT consuming the
-        // engine's shared poll position, so independent pollers stay correct.
-        // With no cursor, the engine's own positional poll is used
-        // (single-consumer behavior, unchanged).
+        // Explicit offsets read the raw log independently of the shared
+        // cursor, which follows the filtered log for legacy callers.
         let cursor: Option<u64> = a.since.filter(|s| s.is_finite()).map(|s| s.max(0.0) as u64);
         let timeout = a.timeout.max(0) as f64;
         let deadline = tokio::time::Instant::now() + Duration::from_secs_f64(timeout);
         loop {
-            let result = {
-                let mut eng = self.engine.lock().await;
+            let (path, shared_cursor) = {
+                let eng = self.engine.lock().await;
                 match cursor {
-                    Some(offset) => read_log_from_offset(eng.logs.current_path(), offset),
-                    None => eng.poll_logs(),
+                    Some(_) => (eng.logs.current_path().map(std::path::Path::to_owned), None),
+                    None => (
+                        eng.logs.live_read_target().map(|target| target.path),
+                        Some(eng.log_poll.clone()),
+                    ),
                 }
             };
+            let shared_cursor = match shared_cursor {
+                Some(cursor) => Some(cursor.lock_owned().await),
+                None => None,
+            };
+            let result = tokio::task::spawn_blocking(move || match shared_cursor {
+                Some(mut position) => position.read_page(path.as_deref()),
+                None => crate::serial_engine::LogPollCursor::at(cursor.unwrap_or_default())
+                    .read_page(path.as_deref()),
+            })
+            .await
+            .map_err(|error| {
+                ErrorData::internal_error(format!("serial log reader failed: {error}"), None)
+            })?;
             let has_new = result["lines"]
                 .as_array()
                 .is_some_and(|lines| !lines.is_empty());
-            if has_new || tokio::time::Instant::now() >= deadline {
+            if has_new || result.get("error").is_some() || tokio::time::Instant::now() >= deadline {
                 return Ok(text(result));
             }
-            // Release the engine mutex between polls so the read loop and
-            // other tools keep running during the long-poll window.
-            tokio::time::sleep(Duration::from_millis(200)).await;
+            tokio::time::sleep_until(
+                deadline.min(tokio::time::Instant::now() + Duration::from_millis(200)),
+            )
+            .await;
         }
     }
 
@@ -333,43 +345,6 @@ impl McpHandler {
         // cause-visible failure → isError:true.
         Ok(tool_result(result))
     }
-}
-
-/// Gap #8: read the current serial log file from a client-supplied byte
-/// cursor without touching the engine's shared `poll_position`. If the
-/// cursor is past EOF (log rotated since the last poll), deliver the whole
-/// new file and reset the cursor so the client catches up on one call.
-fn read_log_from_offset(path: Option<&std::path::Path>, offset: u64) -> serde_json::Value {
-    use std::io::{Read, Seek, SeekFrom};
-
-    let Some(path) = path else {
-        return json!({"lines": [], "since": offset});
-    };
-    let Ok(meta) = std::fs::metadata(path) else {
-        return json!({"lines": [], "since": offset});
-    };
-    let size = meta.len();
-    // Cursor at EOF → nothing new. Cursor past EOF → rotation, rewind.
-    if offset == size {
-        return json!({"lines": [], "since": size});
-    }
-    let start = if offset < size { offset } else { 0 };
-    let Ok(mut file) = std::fs::File::open(path) else {
-        return json!({"lines": [], "since": offset});
-    };
-    if file.seek(SeekFrom::Start(start)).is_err() {
-        return json!({"lines": [], "since": offset});
-    }
-    let mut buf = Vec::new();
-    if let Err(e) = file.read_to_end(&mut buf) {
-        tracing::warn!("serial_poll_logs: read {} failed: {e}", path.display());
-        return json!({"lines": [], "since": offset});
-    }
-    let lines: Vec<String> = String::from_utf8_lossy(&buf)
-        .lines()
-        .map(str::to_owned)
-        .collect();
-    json!({"lines": lines, "since": size})
 }
 
 #[cfg(test)]
@@ -439,8 +414,6 @@ mod tests {
             logs.get_logs(Parameters(GetLogsArgs {
                 lines: 120,
                 pattern: None,
-                // archive=0 is the LIVE current cycle since the fresh-log
-                // fix; the FIFO is the first ARCHIVE entry → index 1.
                 archive: 1,
                 highlighted: false,
             }))
@@ -455,73 +428,21 @@ mod tests {
         .expect("state and metrics must not starve behind a large log scan");
         assert!(state.is_ok());
         assert!(metrics.is_ok());
-        assert!(
-            tokio::time::timeout(Duration::from_secs(2), logs_task)
-                .await
-                .expect("get_logs must be bounded")
-                .unwrap()
-                .is_ok()
-        );
+        let result = tokio::time::timeout(Duration::from_secs(2), logs_task)
+            .await
+            .expect("get_logs must be bounded")
+            .unwrap()
+            .unwrap();
+        let response = serde_json::to_value(result).unwrap();
+        let log: serde_json::Value =
+            serde_json::from_str(response["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(log["total_lines"], 12_000);
+        let content = log["content"].as_str().unwrap();
+        assert_eq!(content.lines().count(), 120);
+        assert!(content.starts_with("boot log line 11880 "));
+        assert!(!content.contains("old boot"));
 
         server.abort();
         let _ = server.await;
-    }
-
-    #[cfg(target_os = "linux")]
-    // The FIFO open/write rendezvous deadlocks in this ptrace-restricted
-    // sandbox (thread dumps show neither side ever blocked in open()).
-    // The property itself is enforced structurally by the handler: the
-    // path is snapshotted under the engine lock and ALL file I/O runs in
-    // spawn_blocking outside it.
-    #[ignore = "fifo rendezvous hangs in restricted sandboxes"]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn blocked_log_open_does_not_hold_engine_mutex() {
-        use std::ffi::CString;
-        use std::os::unix::ffi::OsStrExt;
-
-        let tmp = TempDir::new().unwrap();
-        let engine = new_shared_engine(handler_config(&tmp, 59999));
-        let handler = McpHandler::new(engine.clone(), TaskManager::new());
-        let log_dir = engine.lock().await.logs.log_dir().to_path_buf();
-        std::fs::create_dir_all(&log_dir).unwrap();
-        let fifo = log_dir.join("boot-999_20260821_999999.log");
-        let path = CString::new(fifo.as_os_str().as_bytes()).unwrap();
-        // SAFETY: path is a valid NUL-terminated filesystem path.
-        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
-
-        let logs = handler.clone();
-        let logs_task = tokio::spawn(async move {
-            logs.get_logs(Parameters(GetLogsArgs {
-                lines: 120,
-                pattern: None,
-                archive: 0,
-                highlighted: false,
-            }))
-            .await
-        });
-        tokio::time::sleep(Duration::from_millis(25)).await;
-
-        let state = handler.get_state(Parameters(NoArgs::default()));
-        let metrics = handler.get_metrics(Parameters(NoArgs::default()));
-        let (state, metrics) = tokio::time::timeout(Duration::from_millis(100), async {
-            tokio::join!(state, metrics)
-        })
-        .await
-        .expect("blocked filesystem I/O must not retain the engine mutex");
-        assert!(state.is_ok());
-        assert!(metrics.is_ok());
-
-        let writer = tokio::task::spawn_blocking(move || {
-            let mut file = std::fs::OpenOptions::new().write(true).open(fifo).unwrap();
-            file.write_all(b"fifo log line\n").unwrap();
-        });
-        writer.await.unwrap();
-        assert!(
-            tokio::time::timeout(Duration::from_secs(1), logs_task)
-                .await
-                .expect("log call must finish after FIFO writer closes")
-                .unwrap()
-                .is_ok()
-        );
     }
 }

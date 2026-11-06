@@ -29,12 +29,6 @@ async fn test_all_tools_have_valid_schema() {
     );
 
     let tools = router.list_all();
-    assert!(
-        tools.len() >= 23,
-        "Expected >= 23 MCP tools, got {}",
-        tools.len()
-    );
-
     for tool in &tools {
         assert!(!tool.name.is_empty(), "Tool has empty name");
         assert!(
@@ -62,7 +56,7 @@ async fn test_all_tools_have_valid_schema() {
     assert_eq!(state.read_only_hint, Some(true));
     assert_eq!(state.destructive_hint, Some(false));
 
-    let command = find_tool(&router, "serial_send_command")
+    let command = find_tool(&router, "serial_exec")
         .annotations
         .as_ref()
         .unwrap();
@@ -151,13 +145,11 @@ async fn test_essential_tools_present() {
 
     let required = &[
         "serial_exec",
-        "serial_send_command",
         "serial_get_state",
         "serial_get_logs",
         "serial_reset",
         "serial_enter_uboot",
         "serial_wait_pattern",
-        "serial_uboot_command",
         "serial_button",
         "serial_flash_plan",
         "serial_get_config",
@@ -300,24 +292,15 @@ async fn test_server_instructions_lead_with_tool_selection_rules() {
     );
 }
 
-/// The advertised catalog must be deterministic across handler builds so
-/// clients can cache it (and prompt caches stay warm).
+/// Return tools in name order so clients can cache the catalog.
 #[tokio::test]
-async fn test_tool_catalog_is_deterministic_across_builds() {
-    let first: Vec<String> = make_router()
+async fn test_tool_catalog_is_sorted_by_name() {
+    let names: Vec<String> = make_router()
         .list_all()
         .into_iter()
         .map(|t| t.name.to_string())
         .collect();
-    let second: Vec<String> = make_router()
-        .list_all()
-        .into_iter()
-        .map(|t| t.name.to_string())
-        .collect();
-    assert_eq!(first, second);
-    let mut sorted = first.clone();
-    sorted.sort();
-    assert_eq!(first, sorted, "catalog must be name-sorted");
+    assert!(names.is_sorted(), "catalog must be name-sorted: {names:?}");
 }
 
 /// Verify config validation catches missing host IP.

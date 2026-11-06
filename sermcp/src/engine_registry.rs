@@ -14,12 +14,14 @@ pub struct ManagedDut {
     pub engine: SharedEngine,
     pub connecting_state: Value,
     pub(crate) capabilities: crate::mcp_handler::DutCapabilities,
-    endpoint: (String, String),
+    endpoint: Arc<std::sync::Mutex<(String, String)>>,
 }
 
 #[derive(Clone)]
 pub struct EngineRegistry {
     entries: Arc<BTreeMap<String, ManagedDut>>,
+    reconcile_gate: Arc<tokio::sync::Mutex<()>>,
+    restart_tasks: Arc<tokio::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
     pub tasks: Arc<crate::task_manager::TaskManager>,
     pub(crate) inventory_config: Option<Config>,
 }
@@ -37,15 +39,10 @@ impl EngineRegistry {
             if !names.insert(name.clone()) {
                 return Err(format!("Duplicate DUT name: {name}"));
             }
-            let host = config.dev_host_ip();
-            let host = host
-                .parse::<std::net::IpAddr>()
-                .map_or(host.clone(), |ip| ip.to_string());
-            let target = config.serial_target();
-            let target = target
-                .parse::<u16>()
-                .map_or(target.clone(), |port| port.to_string());
-            if !endpoints.insert((host, target)) {
+            if !endpoints.insert(endpoint_identity(
+                &config.dev_host_ip(),
+                &config.serial_target(),
+            )) {
                 return Err(format!(
                     "DUT {name} shares a serial endpoint with another DUT"
                 ));
@@ -72,7 +69,10 @@ impl EngineRegistry {
             .into_iter()
             .map(|config| {
                 let name = config.get_str_or("DUT_NAME", "default");
-                let endpoint = (config.dev_host_ip(), config.serial_target());
+                let endpoint = Arc::new(std::sync::Mutex::new((
+                    config.dev_host_ip(),
+                    config.serial_target(),
+                )));
                 let engine = new_shared_engine(config);
                 let snapshot = engine
                     .try_lock()
@@ -92,6 +92,8 @@ impl EngineRegistry {
             .collect();
         Ok(Self {
             entries: Arc::new(entries),
+            reconcile_gate: Arc::new(tokio::sync::Mutex::new(())),
+            restart_tasks: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             tasks: crate::task_manager::TaskManager::new(),
             inventory_config: Some(config.clone()),
         })
@@ -105,11 +107,15 @@ impl EngineRegistry {
             .to_string();
         let capabilities = crate::mcp_handler::DutCapabilities::from_engine(&engine);
         let inventory_config = engine.try_lock().ok().map(|engine| engine.config.clone());
-        let endpoint = inventory_config
-            .as_ref()
-            .map(|config| (config.dev_host_ip(), config.serial_target()))
-            .unwrap_or_default();
+        let endpoint = Arc::new(std::sync::Mutex::new(
+            inventory_config
+                .as_ref()
+                .map(|config| (config.dev_host_ip(), config.serial_target()))
+                .unwrap_or_default(),
+        ));
         Self {
+            reconcile_gate: Arc::new(tokio::sync::Mutex::new(())),
+            restart_tasks: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             inventory_config,
             tasks: crate::task_manager::TaskManager::new(),
             entries: Arc::new(BTreeMap::from([(
@@ -172,13 +178,12 @@ impl EngineRegistry {
 
     /// Legacy process-wide signals cannot identify one DUT. Consume them
     /// without changing any engine in multi-DUT mode; use targeted WS instead.
-    pub fn spawn_takeover_signals(&self) {
+    pub fn spawn_takeover_signals(&self) -> Option<tokio::task::JoinHandle<()>> {
         if !self.is_multi() {
-            crate::serial_engine::spawn_human_takeover_signals(self.first().engine.clone());
-            return;
+            return crate::serial_engine::spawn_human_takeover_signals(self.first().engine.clone());
         }
         #[cfg(unix)]
-        tokio::spawn(async {
+        let handle = tokio::spawn(async {
             use tokio::signal::unix::{SignalKind, signal};
             let (Ok(mut yield_signal), Ok(mut resume_signal)) = (
                 signal(SignalKind::user_defined1()),
@@ -194,15 +199,24 @@ impl EngineRegistry {
                 );
             }
         });
+        #[cfg(unix)]
+        {
+            Some(handle)
+        }
+        #[cfg(not(unix))]
+        {
+            None
+        }
     }
 
-    /// Revoke only endpoints absent from the saved configuration. The request
+    /// Reload edited endpoints and revoke endpoints absent from the saved configuration. The request
     /// names the exact config, so a colliding control port cannot affect a
     /// different project, regardless of the server's working directory.
     pub async fn reconcile_saved_config(
         &self,
         path: &std::path::Path,
     ) -> Result<Vec<String>, String> {
+        let _gate = self.reconcile_gate.lock().await;
         let config = self
             .inventory_config
             .as_ref()
@@ -216,7 +230,19 @@ impl EngineRegistry {
         {
             return Err("Configuration belongs to a different project or TEST session".into());
         }
-        let saved = crate::config::parse_config_file(expected)?;
+        // Zero-DUT-tolerant parse: an explicitly empty dev_hosts array (the
+        // wizard's zero-host end state) must release every endpoint, while
+        // any real parse error still fails loudly.
+        let saved = crate::config::parse_config_file_allow_empty(expected)?;
+        let mut desired: BTreeMap<_, _> = config
+            .managed_dut_configs_allow_empty()?
+            .into_iter()
+            .map(|config| (config.get_str_or("DUT_NAME", "default"), config))
+            .collect();
+        // Validate before releasing any current endpoint.
+        for config in desired.values() {
+            config.validate().map_err(|errors| errors.join("; "))?;
+        }
         let endpoints: HashSet<_> = saved
             .duts
             .iter()
@@ -224,17 +250,88 @@ impl EngineRegistry {
             .map(|dut| endpoint_identity(&dut.dev_host_ip, &dut.serial_port))
             .collect();
         let mut released = Vec::new();
-        for dut in self.entries.values() {
-            let (host, port) = &dut.endpoint;
-            if !endpoints.contains(&endpoint_identity(host, port)) {
-                dut.engine.lock().await.retire_from_project().await;
+        let mut restart = Vec::new();
+        for (name, dut) in self.entries.iter() {
+            // Unchanged DUTs may be executing long commands. Read the endpoint
+            // snapshot without waiting for their engine locks.
+            let (host, port) = dut
+                .endpoint
+                .lock()
+                .map_err(|_| "Endpoint snapshot lock poisoned")?
+                .clone();
+            if let Some(config) = desired.remove(name)
+                && (endpoint_identity(&host, &port)
+                    != endpoint_identity(&config.dev_host_ip(), &config.serial_target())
+                    || dut.engine.flags.removed.load(Ordering::Acquire))
+            {
+                let mut engine = dut.engine.lock().await;
+                engine.retire_from_project().await;
+                released.push(format!("{host}:{port}"));
+                // Every handler retains this SharedEngine and its flags. Swap
+                // the stopped engine in place so existing MCP sessions follow
+                // the saved port rather than an obsolete engine instance.
+                let mut replacement = crate::serial_engine::SerialEngine::new(config);
+                engine
+                    .state
+                    .transfer_state_change_hook(&mut replacement.state);
+                replacement.flags = dut.engine.flags.clone();
+                replacement
+                    .flags
+                    .startup_in_progress
+                    .store(true, Ordering::Release);
+                replacement.flags.removed.store(false, Ordering::Release);
+                *dut.endpoint
+                    .lock()
+                    .map_err(|_| "Endpoint snapshot lock poisoned")? = (
+                    replacement.config.dev_host_ip(),
+                    replacement.config.serial_target(),
+                );
+                *engine = replacement;
+                drop(engine);
+                restart.push(dut.engine.clone());
+            } else if !endpoints.contains(&endpoint_identity(&host, &port)) {
+                let mut engine = dut.engine.lock().await;
+                engine.retire_from_project().await;
                 released.push(format!("{host}:{port}"));
             }
+        }
+        // Release every old endpoint before claiming replacements, including
+        // configurations that exchange ports between boards.
+        let mut tasks = self.restart_tasks.lock().await;
+        tasks.retain(|task| !task.is_finished());
+        for engine in restart {
+            tasks.push(tokio::spawn(async move {
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(35),
+                    crate::serial_engine::start_shared(engine.clone()),
+                )
+                .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => {
+                        tracing::warn!(%error, "Could not connect to saved serial endpoint")
+                    }
+                    Err(_) => crate::serial_engine::record_startup_timeout(&engine, 35).await,
+                }
+            }));
         }
         Ok(released)
     }
 
     pub async fn stop(&self) {
+        let _gate = self.reconcile_gate.lock().await;
+        // A pending reload must never start a connection after shutdown.
+        let tasks = std::mem::take(&mut *self.restart_tasks.lock().await);
+        for task in &tasks {
+            task.abort();
+        }
+        for task in tasks {
+            if let Err(error) = task.await
+                && !error.is_cancelled()
+            {
+                tracing::error!(%error, "Serial reload task failed");
+            }
+        }
         futures_util::future::join_all(self.entries.values().map(|dut| async {
             dut.engine.lock().await.stop().await;
         }))
@@ -269,10 +366,8 @@ fn normalize_path(path: &std::path::Path) -> std::path::PathBuf {
 /// Compare effective endpoints independently of numeric spelling.
 pub fn endpoint_identity(host: &str, port: &str) -> (String, String) {
     (
-        host.parse::<std::net::IpAddr>()
-            .map_or_else(|_| host.to_string(), |ip| ip.to_string()),
-        port.parse::<u16>()
-            .map_or_else(|_| port.to_string(), |port| port.to_string()),
+        crate::lock_manager::canonical_host(host),
+        crate::lock_manager::canonical_target(port),
     )
 }
 
@@ -361,6 +456,138 @@ mod tests {
             assert!(EngineRegistry::from_config(&cfg).is_err());
             assert!(!project.path().join(".dut-serial/shared/logs").exists());
         }
+    }
+
+    #[tokio::test]
+    async fn stopping_during_reload_does_not_start_a_late_connection() {
+        let project = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mut document = json!({
+            "lock_dir":project.path().join("locks"), "serial":{"baudrate":115200},
+            "dev_hosts":[{"ip":"127.0.0.1","duts":[
+                {"dut_name":"board","serial":{"port":if port == 2002 {2003} else {2002}},"control":{"dev_ctrl":"none"}}
+            ]}]
+        });
+        let cfg = config(project.path(), document.clone());
+        let registry = EngineRegistry::from_config(&cfg).unwrap();
+        document["dev_hosts"][0]["duts"][0]["serial"]["port"] = json!(port);
+        let path = cfg.config_path.as_ref().unwrap();
+        std::fs::write(path, document.to_string()).unwrap();
+        registry.reconcile_saved_config(path).await.unwrap();
+        registry.stop().await;
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), listener.accept())
+                .await
+                .is_err()
+        );
+        assert!(!registry.first().engine.lock().await.owns_serial_lock());
+    }
+
+    #[tokio::test]
+    async fn saving_a_new_port_reconnects_the_existing_engine() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        async fn device() -> (u16, tokio::task::JoinHandle<()>) {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let task = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                stream.write_all(b"root@board:~# ").await.unwrap();
+                let mut buffer = [0; 4096];
+                while let Ok(count) = stream.read(&mut buffer).await {
+                    if count == 0 {
+                        break;
+                    }
+                    if stream.write_all(&buffer[..count]).await.is_err()
+                        || stream.write_all(b"\r\nroot@board:~# ").await.is_err()
+                    {
+                        break;
+                    }
+                }
+            });
+            (port, task)
+        }
+        let project = tempfile::tempdir().unwrap();
+        let (old_port, old_device) = device().await;
+        let (new_port, new_device) = device().await;
+        let mut document = json!({
+            "lock_dir":project.path().join("locks"), "serial":{"baudrate":115200},
+            "dev_hosts":[{"ip":"127.0.0.1","duts":[
+                {"dut_name":"board","serial":{"port":old_port},"control":{"dev_ctrl":"none"}}
+            ]}]
+        });
+        let cfg = config(project.path(), document.clone());
+        let registry = EngineRegistry::from_config(&cfg).unwrap();
+        let existing = registry.select(Some("board")).unwrap().engine.clone();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            crate::serial_engine::start_shared(existing.clone()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(existing.lock().await.owns_serial_lock());
+        let notifications = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let notified = notifications.clone();
+        existing
+            .lock()
+            .await
+            .set_state_change_hook(Box::new(move |_| {
+                notified.fetch_add(1, Ordering::Relaxed);
+            }));
+
+        document["dev_hosts"][0]["duts"][0]["serial"]["port"] = json!(new_port);
+        let path = cfg.config_path.as_ref().unwrap();
+        std::fs::write(path, document.to_string()).unwrap();
+        assert_eq!(
+            registry.reconcile_saved_config(path).await.unwrap(),
+            vec![format!("127.0.0.1:{old_port}")]
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while existing.flags.startup_in_progress.load(Ordering::Acquire) {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(Arc::ptr_eq(
+            &existing.flags,
+            &registry.select(Some("board")).unwrap().engine.flags
+        ));
+        {
+            let engine = existing.lock().await;
+            assert_eq!(engine.config.serial_target(), new_port.to_string());
+            assert!(engine.owns_serial_lock());
+            assert!(!engine.flags.removed.load(Ordering::Acquire));
+        }
+        let lock_dir = project.path().join("locks");
+        assert_eq!(
+            crate::lock_manager::endpoint_lock_owner(&crate::lock_manager::endpoint_lock_path(
+                "127.0.0.1",
+                &old_port.to_string(),
+                lock_dir.to_str().unwrap()
+            )),
+            None
+        );
+        assert!(
+            notifications.load(Ordering::Relaxed) >= 2,
+            "inventory notifications survive the reload"
+        );
+        assert!(
+            registry
+                .reconcile_saved_config(path)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a repeated save keeps the new connection"
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(2), old_device)
+            .await
+            .unwrap()
+            .unwrap();
+        registry.stop().await;
+        new_device.abort();
+        let _ = new_device.await;
     }
 
     #[test]

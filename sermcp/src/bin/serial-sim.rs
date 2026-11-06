@@ -314,8 +314,8 @@ fn split_statements(line: &str) -> Vec<&str> {
     let mut in_double = false;
     for (i, c) in line.char_indices() {
         match c {
-            '\'' if !in_double => in_single = !in_single,
-            '"' if !in_single => in_double = !in_double,
+            '\'' if !in_double => in_single.toggle(),
+            '"' if !in_single => in_double.toggle(),
             ';' if !in_single && !in_double => {
                 statements.push(&line[start..i]);
                 start = i + c.len_utf8();
@@ -344,8 +344,8 @@ fn shell_expand_words(arg: &str, status: u32) -> Vec<String> {
     let mut chars = arg.chars().peekable();
     while let Some(c) = chars.next() {
         match c {
-            '\'' if !in_double => in_single = !in_single,
-            '"' if !in_single => in_double = !in_double,
+            '\'' if !in_double => in_single.toggle(),
+            '"' if !in_single => in_double.toggle(),
             '$' if !in_single && chars.peek() == Some(&'?') => {
                 chars.next();
                 cur.push_str(&status.to_string());

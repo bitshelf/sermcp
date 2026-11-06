@@ -60,18 +60,6 @@ fn default_false() -> bool {
 
 // ── commands ─────────────────────────────────────────────────────────────────
 
-/// `serial_send_command` — send a shell command to the target and return output.
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct SendCommandArgs {
-    /// Shell command to execute on the target.
-    pub command: String,
-    /// Positive timeout in seconds, including time spent queued.
-    #[serde(default = "default_timeout_90")]
-    #[schemars(default = "default_timeout_90")]
-    #[schemars(range(min = 1))]
-    pub timeout: i64,
-}
-
 fn default_timeout_90() -> i64 {
     90
 }
@@ -80,7 +68,8 @@ fn default_exec_mode() -> ExecMode {
     ExecMode::Auto
 }
 
-/// `serial_uboot_command` — send a raw command at the U-Boot prompt (=> ).
+/// `serial_exec(mode=uboot)` internals — send a raw command at the U-Boot
+/// prompt (=> ).
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct UbootCommandArgs {
     /// U-Boot command (e.g. 'version', 'help', 'printenv').
@@ -266,7 +255,7 @@ pub struct WaitPatternArgs {
     #[serde(default = "default_timeout_60")]
     #[schemars(default = "default_timeout_60")]
     pub timeout: i64,
-    /// Optional action (e.g. send_ctrl_c).
+    /// Optional action (e.g. send_interrupt).
     pub action: Option<String>,
 }
 
@@ -280,9 +269,9 @@ fn default_timeout_60() -> i64 {
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct PollLogsArgs {
     /// Byte-offset cursor echoed back from a previous poll's `since` response
-    /// field. Resume polling from this cursor to receive only new output
-    /// (log rotation resets the cursor transparently). Omit for the server's
-    /// own positional cursor.
+    /// field. Supply it on each call to page through the raw log. If the
+    /// cursor is past EOF, reading restarts at byte zero. Omit for the
+    /// server's shared cursor into the filtered log.
     pub since: Option<f64>,
     /// Long-poll timeout in seconds: block up to this long waiting for new
     /// output (0 = single non-blocking check).

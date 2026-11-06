@@ -32,11 +32,15 @@ impl McpHandler {
                 json!({"success":false,"error":"delay_ms must be non-negative"}),
             ));
         }
-        let mut eng = self.engine.lock().await;
         // Gap #7: unknown button/action or backend failure → isError:true.
         Ok(tool_result(
-            eng.control_button(&a.button, &a.action, a.delay_ms.map(|v| v as u64))
-                .await,
+            crate::serial_engine::control_button_shared(
+                &self.engine,
+                &a.button,
+                &a.action,
+                a.delay_ms.map(|v| v as u64),
+            )
+            .await,
         ))
     }
 

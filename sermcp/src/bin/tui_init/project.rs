@@ -342,6 +342,10 @@ impl<B: Backend, E: EventSource> FormTui<B, E> {
                     .unwrap_or_else(|| report.deployed_dir.display().to_string())
             ));
         }
+        // Release previews before the saved project engine claims the edited
+        // endpoint. Only children started by this form are stopped here.
+        self.state.pane.detach();
+        self.mcp.stop_spawned();
         let mut outcome = finish_init(self, opts, prepared, answers)?;
         if !selection.agents.is_empty() {
             self.state.note = Some((

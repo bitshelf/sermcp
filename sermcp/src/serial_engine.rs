@@ -131,10 +131,12 @@ pub struct SerialEngine {
     pub commands: CommandQueue,
     pub config: Config,
     running: bool,
+    power_runtime: crate::managed_power::PowerRuntime,
+    control_requests: tokio_util::task::TaskTracker,
     /// Set after cleanup so repeated HTTP shutdown paths are true no-ops.
     stopped: bool,
-    read_handle: Option<tokio::task::JoinHandle<()>>,
-    watchdog_handle: Option<tokio::task::JoinHandle<()>>,
+    read_handle: Option<tokio::task::JoinHandle<!>>,
+    watchdog_handle: Option<tokio::task::JoinHandle<!>>,
     host: String,
     serial_target: String,
     login_user: String,
@@ -149,8 +151,7 @@ pub struct SerialEngine {
     /// username can re-match the login regex within one prompt instance.
     last_login_send: Option<std::time::Instant>,
     pub interrupt_char: u8,
-    /// File position tracking for poll_logs
-    poll_position: u64,
+    pub(crate) log_poll: Arc<Mutex<LogPollCursor>>,
     /// Reconnection manager with exponential backoff.
     reconnect: ReconnectManager,
     /// WebSocket broadcast: serial output relayed to dutabo clients.
@@ -178,13 +179,11 @@ pub struct SerialEngine {
     /// Trailing incomplete line held while filtering the ser2net banner.
     /// This is per engine/DUT; parser state must never leak across engines.
     ser2net_partial: Vec<u8>,
-    log_wire: crate::serial_term::wire::WireDecoder,
+    heartbeat: crate::heartbeat::Monitor,
     /// Last payload cursor examined by the similarity-only watchdog hint.
     last_boot_hint_cursor: u64,
     /// Set by `record_serial_data` when the persisted stream itself contained
     /// the boot prefix (`write_serial` already split the log at that byte).
-    /// A BootStart event arriving with this false means the stage detector
-    /// recognized a prefix the boundary detector could not.
     persistence_split_boot: bool,
     /// True only after this process atomically acquires the host:port lock.
     /// Non-owner MCP instances must not release the lock or publish `stopped`.
@@ -200,21 +199,6 @@ struct Ser2netBanner {
     port: String,
     device: String,
     baudrate: Option<u32>,
-}
-
-/// RAII holder for the relay endpoint lock acquired by the learn cycle:
-/// released on every exit path (early error, capture done, panic unwind)
-/// without manual bookkeeping.
-struct RelayLockGuard {
-    host: String,
-    port: String,
-    lock_dir: String,
-}
-
-impl Drop for RelayLockGuard {
-    fn drop(&mut self) {
-        crate::lock_manager::release_lock(&self.host, &self.port, &self.lock_dir);
-    }
 }
 
 impl SerialEngine {
@@ -265,7 +249,7 @@ impl SerialEngine {
                 config.get("DUT_NAME"),
                 config.boot_window_secs(),
             ),
-            logs: LogManager::new(
+            logs: LogManager::new_background(
                 &project_dir,
                 config.max_archived_logs(),
                 config.max_log_file_size_mb(),
@@ -274,6 +258,8 @@ impl SerialEngine {
             commands: CommandQueue::new(),
             config,
             running: false,
+            power_runtime: crate::managed_power::PowerRuntime::default(),
+            control_requests: tokio_util::task::TaskTracker::new(),
             stopped: false,
             read_handle: None,
             watchdog_handle: None,
@@ -284,7 +270,7 @@ impl SerialEngine {
             login_attempts: 0,
             last_login_send: None,
             interrupt_char,
-            poll_position: 0,
+            log_poll: Arc::default(),
             reconnect: ReconnectManager::new(),
             ws_tx: None,
             monitor_tx: tokio::sync::broadcast::channel(256).0,
@@ -293,7 +279,7 @@ impl SerialEngine {
             serial_error,
             ser2net_banner: None,
             ser2net_partial: Vec::new(),
-            log_wire: crate::serial_term::wire::WireDecoder::for_log(false),
+            heartbeat: crate::heartbeat::Monitor::default(),
             last_boot_hint_cursor: 0,
             persistence_split_boot: false,
             owns_serial_lock: false,
@@ -324,6 +310,9 @@ impl SerialEngine {
             return Err("DUT removed from project".into());
         }
         self.stopped = false;
+        if self.power_runtime.is_closed() {
+            self.power_runtime = crate::managed_power::PowerRuntime::default();
+        }
         tracing::Span::current().record("host", &self.host);
         tracing::Span::current().record("target", &self.serial_target);
         let project_dir = self
@@ -415,11 +404,8 @@ impl SerialEngine {
         // 2. Write the PID file
         self.state.write_pid(&project_dir, &dut_dir);
 
-        // 3. Set write_fn for CommandQueue
-        let write_tx = self.console.write_sender();
-        self.commands.set_write_fn(Box::new(move |data| {
-            write_tx.try_send_command(data.to_vec()).ok();
-        }));
+        // 3. Bind the command queue to the console sender.
+        self.bind_command_writer();
 
         // 4. Ensure the log file is open (no rotation — the board may have been running for a while)
         self.logs.ensure_current_file();
@@ -490,6 +476,7 @@ impl SerialEngine {
 
     fn latch_endpoint_fault(&mut self, code: &str, message: String) {
         tracing::error!("[AGENT-NOTIFY] {code}: {message}");
+        self.persist_console_pending();
         self.console.close();
         self.reconnect_after = None;
         self.commands.cancel_all();
@@ -534,8 +521,13 @@ impl SerialEngine {
                 "endpoint ownership requires explicit recovery",
             ));
         }
+        self.persist_console_pending();
+        if !self.logs.retry_pending() {
+            return Err(std::io::Error::other("serial log persistence failed"));
+        }
         self.commands.reset_stream_decoder();
         let result = self.console.connect_audited(timeout_secs).await;
+        self.persist_console_pending();
         if let Err(error) = &result
             && let Some(failure) = error
                 .get_ref()
@@ -553,43 +545,15 @@ impl SerialEngine {
     }
 
     /// Claim serial ownership (used by the serial_claim MCP tool).
-    ///
-    /// Relay endpoint mutex (multi-agent isolation): the relay is physical
-    /// power/reset control — two agents pulsing concurrently would reboot
-    /// each other's DUT. Same lock dir as the serial lock, different key
-    /// prefix (`relay:<ip>`); the lock is held only for the single pulse and
-    /// conflicts fail immediately.
-    pub fn try_acquire_relay_lock(&self) -> Result<(), serde_json::Value> {
-        if self.flags.removed.load(Ordering::Acquire) {
-            return Err(Self::removed_error());
-        }
-        let host = self.config.relay_ip();
-        let port = self.config.relay_port().to_string();
-        if let Some(owner_pid) =
-            lock_manager::acquire_lock(&format!("relay:{host}"), &port, &self.config.lock_dir())
-        {
-            return Err(serde_json::json!({
-                "success": false,
-                "code": "relay_endpoint_busy",
-                "owner_pid": owner_pid,
-                "error": format!("Relay endpoint {host}:{port} is held by another live MCP process ({owner_pid})"),
-                "hint": "Another agent's server controls this DUT's relay; wait, or use serial_verify_relay to inspect",
-            }));
-        }
-        Ok(())
-    }
-
-    /// Release the relay endpoint lock (only when this process holds it).
-    pub fn release_relay_lock(&self) {
-        let host = self.config.relay_ip();
-        let port = self.config.relay_port().to_string();
-        lock_manager::release_lock(&format!("relay:{host}"), &port, &self.config.lock_dir());
-    }
-
-    /// Claim serial ownership (used by the serial_claim MCP tool).
     pub async fn claim_serial(&mut self) -> serde_json::Value {
+        if self.in_manual_takeover() {
+            return Self::dutabo_session_error();
+        }
         if self.flags.removed.load(Ordering::Acquire) {
             return Self::removed_error();
+        }
+        if self.stopped || self.power_runtime.is_closed() {
+            return serde_json::json!({"success":false,"code":"engine_stopped","error":"Engine is stopping"});
         }
         self.stopped = false;
         let lock_dir = self.config.lock_dir();
@@ -630,24 +594,9 @@ impl SerialEngine {
             self.owns_serial_lock = true;
             self.flags.owns_serial_lock.store(true, Ordering::Relaxed);
             self.flags.serial_owner_pid.store(0, Ordering::Relaxed);
-
-            // Install the command-queue write path. A server that started
-            // under a conflicting lock returned early from connect() BEFORE
-            // the startup path installed it (deliberately — a non-owner must
-            // never write to the serial line), so the claim — the designed
-            // recovery from exactly that state — has to install it here, or
-            // every subsequent serial_send_command is silently dropped
-            // ("Command cancelled").
-            let write_tx = self.console.write_sender();
-            self.commands.set_write_fn(Box::new(move |data| {
-                write_tx.try_send_command(data.to_vec()).ok();
-            }));
         }
         // Fault recovery issues a fresh sender; old producers remain revoked.
-        let write_tx = self.console.write_sender();
-        self.commands.set_write_fn(Box::new(move |data| {
-            write_tx.try_send_command(data.to_vec()).ok();
-        }));
+        self.bind_command_writer();
         // Write the new mcp.pid
         let project_dir = self
             .config
@@ -679,7 +628,7 @@ impl SerialEngine {
     /// stay alive and wait for SIGUSR2 to resume. A non-owner receiving the
     /// signal is a no-op (never releases someone else's lock).
     pub async fn yield_serial_for_human(&mut self) {
-        if self.flags.removed.load(Ordering::Acquire) {
+        if self.flags.removed.load(Ordering::Acquire) || !self.manual_takeover_available() {
             return;
         }
         // The lock file is the authority dutabo consulted when it sent the
@@ -709,18 +658,30 @@ impl SerialEngine {
         );
         if let Some(h) = self.read_handle.take() {
             h.abort();
+            if let Err(error) = h.await
+                && !error.is_cancelled()
+            {
+                tracing::error!(%error, "Engine background task failed");
+            }
         }
         if let Some(h) = self.watchdog_handle.take() {
             h.abort();
+            if let Err(error) = h.await
+                && !error.is_cancelled()
+            {
+                tracing::error!(%error, "Engine background task failed");
+            }
         }
+        self.begin_manual_session();
+        self.drain_console_before_close().await;
         self.logs.flush_sync();
+        self.persist_console_pending();
         self.console.close();
         self.owns_serial_lock = false;
         let lock_dir = self.config.lock_dir();
         lock_manager::release_lock(&self.host, &self.serial_target, &lock_dir);
         self.flags.owns_serial_lock.store(false, Ordering::Relaxed);
         self.flags.serial_owner_pid.store(0, Ordering::Relaxed);
-        self.begin_manual_session();
     }
 
     /// SIGUSR2: after the dutabo direct session ends, resume ownership
@@ -728,6 +689,14 @@ impl SerialEngine {
     /// lock, degrade to `serial_endpoint_busy` honestly — never kill a live
     /// process.
     pub async fn resume_serial(&mut self) {
+        if self.stopped
+            || self.power_runtime.is_closed()
+            || !self.in_manual_takeover()
+            || self.owns_serial_lock
+            || self.ws_tx.is_some()
+        {
+            return;
+        }
         if self.flags.removed.load(Ordering::Acquire) {
             return;
         }
@@ -745,6 +714,7 @@ impl SerialEngine {
             self.flags
                 .serial_owner_pid
                 .store(conflicting, Ordering::Relaxed);
+            self.state.transition(TargetState::Disconnected);
             self.serial_error = Some(serde_json::json!({
                 "code": "serial_endpoint_busy",
                 "message": "Serial endpoint busy after dutabo resume",
@@ -758,6 +728,7 @@ impl SerialEngine {
         self.flags.owns_serial_lock.store(true, Ordering::Relaxed);
         self.flags.serial_owner_pid.store(0, Ordering::Relaxed);
         self.serial_error = None;
+        self.bind_command_writer();
         match self.connect_serial(5).await {
             Ok(()) => {
                 self.probe_initial_state().await;
@@ -779,15 +750,14 @@ impl SerialEngine {
         if self.flags.removed.load(Ordering::Acquire) {
             return Self::removed_error();
         }
-        if self.state.current() == TargetState::Dutabo {
-            return serde_json::json!({"success": false, "code": "dutabo_session",
-                "error": "Serial console owned by interactive dutabo session; end it first"});
+        if self.in_manual_takeover() {
+            return Self::dutabo_session_error();
         }
         if !self.console.is_open() {
             return serde_json::json!({"success": false, "code": "not_connected",
                 "error": "Serial console not connected", "hint": "Wait for reconnect or call serial_claim"});
         }
-        match self.console.set_baud(baud).await {
+        match self.set_console_baud(baud).await {
             Ok(actual) => {
                 self.config
                     .values
@@ -829,12 +799,8 @@ impl SerialEngine {
         capture_secs: f64,
         use_reset: bool,
     ) -> serde_json::Value {
-        if self.state.current() == TargetState::Dutabo {
-            return serde_json::json!({
-                "success": false,
-                "code": "dutabo_session",
-                "error": "Serial console owned by interactive dutabo session; end it first"
-            });
+        if self.in_manual_takeover() {
+            return Self::dutabo_session_error();
         }
         if !self.console.is_open() {
             return serde_json::json!({
@@ -850,18 +816,12 @@ impl SerialEngine {
         let mut backend = self.build_power_control();
         let has_reset = use_reset && backend.has_button(Button::Reset);
 
-        if has_reset {
-            if let Err(rejection) = self.try_acquire_relay_lock() {
-                return rejection;
-            }
-            if let Err(e) = backend.press(Button::Reset).await {
-                self.release_relay_lock();
-                return serde_json::json!({
-                    "success": false,
-                    "code": "reset_press_failed",
-                    "error": format!("reset press failed via {}: {e}", backend.name())
-                });
-            }
+        if has_reset && let Err(e) = backend.press(Button::Reset).await {
+            return serde_json::json!({
+                "success": false,
+                "code": "reset_press_failed",
+                "error": format!("reset press failed via {}: {e}", backend.name())
+            });
         }
 
         // Recreate the text/log only AFTER reset is asserted. Drain stale
@@ -870,20 +830,16 @@ impl SerialEngine {
             self.mark_boot_cycle();
         }
         for _ in 0..3 {
-            match self
-                .console
-                .read_available(Duration::from_millis(100), 4096)
-                .await
-            {
+            match self.read_console(Duration::from_millis(100), 4096).await {
                 Ok(data) if !data.is_empty() => self.record_serial_data(&data),
                 _ => break,
             }
         }
 
-        if rfc2217 && let Err(e) = self.console.set_baud(baud).await {
+        if rfc2217 && let Err(e) = self.set_console_baud(baud).await {
             if has_reset {
                 let release = backend.release(Button::Reset).await;
-                self.release_relay_lock();
+
                 if let Err(release_err) = release {
                     return serde_json::json!({
                         "success": false,
@@ -904,14 +860,12 @@ impl SerialEngine {
             let hold_ms = self.config.reset_time_ms().max(500);
             tokio::time::sleep(Duration::from_millis(hold_ms)).await;
             if let Err(e) = backend.release(Button::Reset).await {
-                self.release_relay_lock();
                 return serde_json::json!({
                     "success": false,
                     "code": "reset_release_failed",
                     "error": format!("reset release failed via {}: {e}", backend.name())
                 });
             }
-            self.release_relay_lock();
         } else {
             self.console.write_raw(b"\r").await;
         }
@@ -931,8 +885,7 @@ impl SerialEngine {
         // A test must not leave later U-Boot/reference probes at a candidate
         // rate. Restore the server's configured rate after sampling.
         let restore_error = if rfc2217 && configured_baud.is_some_and(|old| old != baud) {
-            self.console
-                .set_baud(configured_baud.unwrap_or(baud))
+            self.set_console_baud(configured_baud.unwrap_or(baud))
                 .await
                 .err()
                 .map(|e| e.to_string())
@@ -1012,14 +965,27 @@ impl SerialEngine {
         if self.stopped {
             return;
         }
-        self.stopped = true;
         self.running = false;
+        self.power_runtime.shutdown().await;
+        self.stopped = true;
         if let Some(h) = self.read_handle.take() {
             h.abort();
+            if let Err(error) = h.await
+                && !error.is_cancelled()
+            {
+                tracing::error!(%error, "Engine background task failed");
+            }
         }
         if let Some(h) = self.watchdog_handle.take() {
             h.abort();
+            if let Err(error) = h.await
+                && !error.is_cancelled()
+            {
+                tracing::error!(%error, "Engine background task failed");
+            }
         }
+        self.drain_console_before_close().await;
+        self.persist_console_pending();
         self.console.close();
         self.logs.close();
         if self.owns_serial_lock {
@@ -1052,8 +1018,8 @@ impl SerialEngine {
     /// Store the background task handles (called after mcp/mcp_http spawns them)
     pub fn set_background_tasks(
         &mut self,
-        read_handle: tokio::task::JoinHandle<()>,
-        watchdog_handle: tokio::task::JoinHandle<()>,
+        read_handle: tokio::task::JoinHandle<!>,
+        watchdog_handle: tokio::task::JoinHandle<!>,
     ) {
         self.read_handle = Some(read_handle);
         self.watchdog_handle = Some(watchdog_handle);
@@ -1089,7 +1055,7 @@ impl SerialEngine {
                 return Ok(Vec::new());
             }
             let poll = remaining.min(EXPECT_POLL);
-            match self.console.read_available(poll, 4096).await {
+            match self.read_console(poll, 4096).await {
                 Ok(data) if !data.is_empty() => {
                     self.record_serial_data(&data);
                     if Self::has_probe_response(&data) {
@@ -1114,10 +1080,10 @@ impl SerialEngine {
     /// No hardcoded sleeps — poll loop returns as soon as data arrives.
     #[tracing::instrument(skip(self), fields(result))]
     async fn probe_initial_state(&mut self) {
-        self.log_wire = crate::serial_term::wire::WireDecoder::for_log(false);
+        self.heartbeat = crate::heartbeat::Monitor::default();
         let _start_state = self.state.current();
         // Step 1: non-blocking drain of kernel buffer
-        match self.console.read_available(PROBE_POLL, 4096).await {
+        match self.read_console(PROBE_POLL, 4096).await {
             Ok(data) if !data.is_empty() => {
                 self.record_serial_data(&data);
                 let hex_preview = hex_preview(&data, 128);
@@ -1151,6 +1117,7 @@ impl SerialEngine {
                 let filtered = strip_ser2net_banner(&data, &mut self.ser2net_partial);
                 if Self::has_probe_response(&filtered) {
                     let events = self.detector.feed(&filtered);
+                    self.heartbeat.shell_ready = events.iter().any(|e| matches!(e, BootEvent::Stage(s) if matches!(s.as_str(), "shell" | "android_shell")));
                     self.state.on_activity();
 
                     if Self::is_boot_complete(&events) {
@@ -1177,6 +1144,7 @@ impl SerialEngine {
                 match self.send_and_expect("\r").await {
                     Ok(d2) if !d2.is_empty() => {
                         let e2 = self.detector.feed(&d2);
+                        self.heartbeat.shell_ready = e2.iter().any(|e| matches!(e, BootEvent::Stage(s) if matches!(s.as_str(), "shell" | "android_shell")));
                         self.state.on_activity();
                         if Self::is_boot_complete(&e2) {
                             self.state.transition(TargetState::Active);
@@ -1207,6 +1175,7 @@ impl SerialEngine {
                 match self.send_and_expect("\r").await {
                     Ok(d2) if !d2.is_empty() => {
                         let e2 = self.detector.feed(&d2);
+                        self.heartbeat.shell_ready = e2.iter().any(|e| matches!(e, BootEvent::Stage(s) if matches!(s.as_str(), "shell" | "android_shell")));
                         self.state.on_activity();
                         if Self::is_boot_complete(&e2) {
                             self.state.transition(TargetState::Active);
@@ -1262,7 +1231,8 @@ impl SerialEngine {
         if !self.running {
             return;
         }
-        if !self.check_endpoint_identity() {
+        // Check the writer snapshot without waiting behind disk operations.
+        if !self.check_endpoint_identity() || self.logs.storage_failed() {
             return;
         }
         // Always drain pending writes
@@ -1276,8 +1246,7 @@ impl SerialEngine {
         if !self.console.is_open() && matches!(cur, TargetState::Active | TargetState::Booting) {
             // Probe the socket once — if it returns an error, handle it now.
             match self
-                .console
-                .read_available(std::time::Duration::from_millis(0), 128)
+                .read_console(std::time::Duration::from_millis(0), 128)
                 .await
             {
                 Ok(data) => self.record_serial_data(&data),
@@ -1345,27 +1314,34 @@ impl SerialEngine {
         tokio::select! {
             readable = self.console.wait_readable(Duration::from_millis(100)) => {
                 if !readable {
+                    let sent = self.send_idle_heartbeat();
+                    self.console.drain_writes().await;
+                    if sent {
+                        self.heartbeat.dispatched();
+                    }
+                    // The background writer commits even when UART is idle.
+                    self.logs.poll_persistence();
                     return;
                 }
             }
             _ = self.console.wait_writable() => {
+                crate::relay_trace!("write_wake");
                 self.console.drain_writes().await;
                 return;
             }
         }
         // Data ready, read and process it
-        match self
-            .console
-            .read_available(Duration::from_millis(0), 4096)
-            .await
-        {
+        match self.read_console(Duration::from_millis(0), 4096).await {
             Ok(data) if !data.is_empty() => {
+                crate::relay_trace!(bytes = data.len(), "engine_rx");
                 // Broadcast to WebSocket clients (dutabo serial) and to
-                // passive monitor subscribers (no manual-session claim).
+                // passive monitor subscribers BEFORE persistence: the
+                // interactive relay must never queue behind disk persistence.
                 if let Some(ref tx) = self.ws_tx {
                     let _ = tx.send(data.clone());
                 }
                 let _ = self.monitor_tx.send(data.clone());
+                self.record_serial_data(&data);
                 // Log raw hex for debugging: first 64 bytes of each read
                 let hex_preview = hex_preview(&data, 64);
                 tracing::info!(len = data.len(), hex = %hex_preview, "Serial read");
@@ -1376,11 +1352,11 @@ impl SerialEngine {
                 if responsive {
                     self.state.on_activity();
                 }
-                self.record_serial_data(&data);
                 // Human terminal ownership is exclusive. Continue relaying and
                 // logging bytes, but do not run Agent detectors, auto-login,
                 // command markers, heartbeat actions, or state transitions.
-                if self.state.current() == TargetState::Dutabo {
+                if self.in_manual_takeover() {
+                    self.logs.poll_persistence();
                     return;
                 }
                 self.maybe_detect_shutdown(&data);
@@ -1424,6 +1400,8 @@ impl SerialEngine {
                         self.state.transition(TargetState::Disconnected);
                     }
                 }
+                // Only the synchronous fallback needs a commit here.
+                self.logs.poll_persistence();
             }
             Ok(_) => {
                 self.commands.check_timeouts();
@@ -1506,7 +1484,16 @@ impl SerialEngine {
         let cur = self.state.current();
 
         // Close the dead connection so the next reconnect attempt starts clean.
+        self.persist_console_pending();
         self.console.close();
+
+        // End the relay before any reconnect can send a probe. The old
+        // WebSocket's cleanup cannot release a subsequent manual session.
+        if self.in_manual_takeover() {
+            self.clear_ws_tx();
+            self.state.transition(TargetState::Disconnected);
+            return;
+        }
 
         // ═══════════════════════════════════════════════════════════════════
         // Fast-retry guard: prevent ping-pong when ser2net accepts TCP but
@@ -1570,7 +1557,34 @@ impl SerialEngine {
         );
     }
 
-    /// Watchdog iteration (called periodically by a dedicated spawned task)
+    /// Called only after a read-readiness timeout, never from the watchdog.
+    fn send_idle_heartbeat(&mut self) -> bool {
+        self.heartbeat.expire();
+        if self.in_manual_takeover()
+            || self.state.current() != TargetState::Active
+            || self.commands.is_busy()
+            || self.console.has_pending_writes()
+            || !self.console.is_open()
+            || !self
+                .heartbeat
+                .due(Duration::from_secs(self.config.hang_timeout().max(1)))
+        {
+            return false;
+        }
+        let (id, command) = self.heartbeat.prepare(
+            self.config
+                .values
+                .get("HEARTBEAT_COMMAND")
+                .map(String::as_str),
+        );
+        if self.console.sendline(&command) {
+            self.heartbeat.sent(id);
+            return true;
+        }
+        false
+    }
+
+    /// Inspect timeouts without injecting commands into a busy serial stream.
     pub fn watchdog_once(&mut self) {
         if !self.check_endpoint_identity() {
             return;
@@ -1594,10 +1608,19 @@ impl SerialEngine {
                 _ => {}
             }
         }
-        if self.state.current() == TargetState::Dutabo {
+        if self.in_manual_takeover() {
             return;
         }
-        self.state.check_hang();
+        // Telemetry timeouts cannot establish the physical power state.
+        if self.state.current() == TargetState::Booting {
+            self.state.check_hang();
+        }
+        if self.heartbeat.expire() {
+            tracing::warn!(
+                missed = self.heartbeat.missed,
+                "Serial heartbeat timed out; power state unknown"
+            );
+        }
         let cur = self.state.current();
         // A DUT-off verdict (probe silence) means the power cycle already
         // happened — re-arm the boundary detector so the next power-on's DDR
@@ -1607,23 +1630,8 @@ impl SerialEngine {
         if cur == TargetState::DutOff {
             self.logs.expect_boot();
         }
-        // Heartbeat probe: no data for a long time in booting/active state
-        if self.state.heartbeat_pending
-            && (cur == TargetState::Active || cur == TargetState::Booting)
-            && self.console.is_open()
-        {
-            tracing::info!("Heartbeat probe");
-            // A probe counts as "sent" only when it was actually enqueued —
-            // a dropped probe keeps `heartbeat_pending` true so the next
-            // tick retries, and can never count toward the DUT-off verdict.
-            if self.console.sendline("") {
-                self.state.mark_probe_sent();
-            } else {
-                tracing::warn!(
-                    "Heartbeat probe dropped (write channel full); will retry next tick"
-                );
-            }
-        }
+        // Sending belongs to the read loop, after a read-readiness timeout.
+        // A busy UART therefore always drains before a probe is considered.
         // Flush the detector buffer every 1s (prompts without \n)
         if self.state.last_data_elapsed().as_secs() >= 1 {
             let events = self.detector.flush_line_buf();
@@ -1631,6 +1639,7 @@ impl SerialEngine {
                 if let BootEvent::Stage(ref s) = event
                     && crate::dut_state::is_shell_stage(s)
                 {
+                    self.heartbeat.shell_ready = matches!(s.as_str(), "shell" | "android_shell");
                     self.state.transition(TargetState::Active);
                 }
             }
@@ -1667,16 +1676,10 @@ impl SerialEngine {
         for event in events {
             match event {
                 BootEvent::BootStart => {
-                    // DDR/SPL appearing = board rebooted = new boot cycle.
-                    // Persistence normally located the byte boundary already
-                    // (`record_serial_data` → `write_serial`). When it did not,
-                    // the stage detector recognized a prefix the boundary
-                    // detector could not (learner/regex divergence) — split at
-                    // chunk granularity so the cycle is still archived instead
-                    // of merging every later cycle into one file.
-                    if !self.persistence_split_boot {
-                        self.logs.mark_boot_start();
-                    }
+                    self.heartbeat = crate::heartbeat::Monitor::default();
+                    // Analysis events can lag behind the raw prefix or arise
+                    // from similarity. Only the byte-offset boundary detector
+                    // may split persisted logs; chunk ends are not boundaries.
                     let cur = self.state.current();
                     self.logs.truncate_unclassified();
                     tracing::info!("BootStart: new boot cycle (was {:?})", cur);
@@ -1686,6 +1689,7 @@ impl SerialEngine {
                     self.state.transition(TargetState::Booting);
                 }
                 BootEvent::RebootStart => {
+                    self.heartbeat = crate::heartbeat::Monitor::default();
                     // Reboot initiated by the DUT itself (reboot command / watchdog / crash auto-restart).
                     // Re-arm detection so the next SPL/DDR reports the booting transition.
                     // Otherwise a real reboot is swallowed by
@@ -1722,6 +1726,8 @@ impl SerialEngine {
                     }
                 }
                 BootEvent::Stage(stage) => {
+                    self.heartbeat.shell_ready =
+                        matches!(stage.as_str(), "shell" | "android_shell");
                     let new_state = if matches!(stage.as_str(), "uboot" | "autoboot") {
                         Some(TargetState::UBoot)
                     } else if crate::dut_state::is_shell_stage(&stage) {
@@ -1748,17 +1754,74 @@ impl SerialEngine {
 
     // ── MCP Tool interface ──
 
+    /// Apply storage backpressure to every engine-owned socket reader, not
+    /// just the background loop. The disk owner retries failures independently;
+    /// pending_bytes includes bytes queued but not yet durably committed.
+    async fn read_console(
+        &mut self,
+        timeout: Duration,
+        max_size: usize,
+    ) -> std::io::Result<Vec<u8>> {
+        if self.logs.storage_failed() {
+            tokio::time::sleep(timeout.min(Duration::from_millis(100))).await;
+            return Ok(Vec::new());
+        }
+        self.console.read_available(timeout, max_size).await
+    }
+
+    /// Drain bytes already available at orderly shutdown. A bounded deadline
+    /// allows stopping a continuously transmitting source; bytes sent after
+    /// the connection closes are outside this capture session.
+    async fn drain_console_before_close(&mut self) {
+        self.persist_console_pending();
+        let deadline = std::time::Instant::now() + Duration::from_millis(100);
+        while self.console.is_open() && std::time::Instant::now() < deadline {
+            if !self.logs.retry_pending() {
+                break;
+            }
+            match self.console.read_available(Duration::ZERO, 4096).await {
+                Ok(data) if !data.is_empty() => self.record_serial_data(&data),
+                _ => break,
+            }
+        }
+    }
+
+    fn persist_console_pending(&mut self) {
+        let data = self.console.take_pending_received();
+        self.record_serial_data(&data);
+    }
+
+    async fn set_console_baud(&mut self, baud: u32) -> Result<u32, SerialError> {
+        self.persist_console_pending();
+        if !self.logs.retry_pending() {
+            return Err(SerialError::Io(std::io::Error::other(
+                "serial log persistence failed",
+            )));
+        }
+        let result = self.console.set_baud(baud).await;
+        self.persist_console_pending();
+        result
+    }
+
     /// A single persistence path for all UART readers, including probes,
     /// reset validation drains and capture loops. Quiet prompts are persisted
     /// immediately; line-based analysis must never gate disk writes.
     fn record_serial_data(&mut self, data: &[u8]) {
-        let mut payload = Vec::with_capacity(data.len());
-        self.log_wire.decode(data, &mut payload);
-        if payload.is_empty() {
+        // Count reception before text/banner buffering, including blank bytes
+        // and incomplete prompts. Buffered transport greetings can only defer
+        // a probe; they never count as a successful telemetry response.
+        if !data.is_empty() {
+            self.heartbeat.last_rx = std::time::Instant::now();
+        }
+        if data.is_empty() {
             return;
         }
-        self.persistence_split_boot = self.logs.write_serial(&payload);
+        // Persist before any banner, text or heartbeat filtering. A partial
+        // banner-looking prefix is still evidence even if the connection ends.
+        self.persistence_split_boot = self.logs.write_serial(data);
+        self.heartbeat.receive(data);
         if self.persistence_split_boot {
+            self.heartbeat = crate::heartbeat::Monitor::default();
             // Re-arm once per observed physical prefix, before feeding stage
             // events. Do not reset again on BootStart, which would split DDR/SPL.
             self.detector.reset_cycle();
@@ -1863,6 +1926,22 @@ impl SerialEngine {
         command: &str,
         timeout: f64,
     ) -> tokio::sync::oneshot::Receiver<crate::command_queue::CommandResult> {
+        if self.in_manual_takeover() {
+            // Defense in depth under the MCP guard: never enqueue marker-echo
+            // traffic while a human session owns the port. Resolve
+            // immediately (mirroring the queue-full rejection) instead of
+            // letting the command time out against a silent read loop.
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let _ = tx.send(crate::command_queue::CommandResult {
+                output: "(rejected — serial is taken over by dutabo interactive session)"
+                    .to_string(),
+                exit_code: None,
+                timed_out: false,
+                truncated: false,
+                latency_ms: 0,
+            });
+            return rx;
+        }
         let rx = self.commands.execute(command.to_string(), timeout);
         if self.flags.removed.load(Ordering::Acquire) {
             self.commands.cancel_all();
@@ -1895,8 +1974,8 @@ impl SerialEngine {
     /// `log_path`.
     pub fn log_path_string(&self) -> String {
         self.logs
-            .current_path()
-            .map(|p| p.to_string_lossy().to_string())
+            .live_read_target()
+            .map(|p| p.path.to_string_lossy().to_string())
             .unwrap_or_default()
     }
 
@@ -1915,6 +1994,9 @@ impl SerialEngine {
             "command_count": self.state.command_count(),
             "error_count": self.state.error_count(),
             "pending_commands": self.commands.pending_len(),
+            "heartbeat": self.heartbeat.state(),
+            "full_log_path": self.logs.current_path(),
+            "log_persistence": self.logs.persistence_status(),
         });
         if let Some(banner) = &self.ser2net_banner {
             state["ser2net"] = serde_json::to_value(banner).unwrap_or_default();
@@ -1982,8 +2064,8 @@ impl SerialEngine {
         let archives = self.logs.list_archives();
         let current = self
             .logs
-            .current_path()
-            .map(|p| p.to_string_lossy().to_string())
+            .live_read_target()
+            .map(|p| p.path.to_string_lossy().to_string())
             .unwrap_or_default();
         serde_json::json!({
             "archives": archives.iter().map(|a| serde_json::json!({
@@ -1992,17 +2074,18 @@ impl SerialEngine {
                 "size_bytes": a.size_bytes,
             })).collect::<Vec<_>>(),
             "current": current,
+            "current_full": self.logs.current_path(),
         })
     }
 
     /// Power cycle target via relay: OFF → wait (≥ power_off_ms) → ON.
     pub async fn power_cycle_target(&mut self, wait_boot: bool) -> serde_json::Value {
+        if self.in_manual_takeover() {
+            return Self::dutabo_session_error();
+        }
         let mut backend = self.build_power_control();
         if !backend.has_button(Button::Power) {
             return self.power_control_failure("power");
-        }
-        if let Err(rejection) = self.try_acquire_relay_lock() {
-            return rejection;
         }
         // Remember the state before the cycle: if the relay backend errors
         // out, roll back so a possibly-dark DUT isn't reported as "booting".
@@ -2016,7 +2099,7 @@ impl SerialEngine {
             .await
         {
             self.state.transition(prev_state);
-            self.release_relay_lock();
+
             return serde_json::json!({
                 "success": false,
                 "error": format!("Power cycle failed via {}: {error} Relay state unknown — DUT may be unpowered; run serial_verify_relay.", backend.name()),
@@ -2024,16 +2107,12 @@ impl SerialEngine {
         }
 
         if !wait_boot {
-            self.release_relay_lock();
             return serde_json::json!({
                 "success": true,
                 "new_boot_number": self.logs.boot_number(),
                 "log_path": self.log_path_string(),
             });
         }
-
-        // Pulse done — the relay lock only guards the physical pulse.
-        self.release_relay_lock();
 
         // Wait for login prompt
         let result = self.wait_pattern_internal_opts("login:", 120.0, true).await;
@@ -2058,12 +2137,11 @@ impl SerialEngine {
         failure_retry: usize,
         failure_retry_interval: f64,
     ) -> serde_json::Value {
-        if let Err(rejection) = self.try_acquire_relay_lock() {
-            return rejection;
+        if self.in_manual_takeover() {
+            return Self::dutabo_session_error();
         }
         let mut backend = self.build_power_control();
         if !backend.has_button(Button::Reset) {
-            self.release_relay_lock();
             return self.power_control_failure("reset");
         }
         // Immediate state transition (don't wait for relay).
@@ -2071,7 +2149,7 @@ impl SerialEngine {
         self.state.transition(TargetState::Booting);
         if let Err(e) = backend.pulse(Button::Reset, 500).await {
             self.state.transition(prev_state);
-            self.release_relay_lock();
+
             return serde_json::json!({
                 "success": false,
                 "error": format!("reset control failed via {}: {e} Relay state unknown — DUT may be held in reset; run serial_verify_relay.", backend.name()),
@@ -2082,7 +2160,6 @@ impl SerialEngine {
         self.detector.reset_cycle();
 
         if !wait_boot {
-            self.release_relay_lock();
             return serde_json::json!({
                 "success": true,
                 "new_boot_number": self.logs.boot_number(),
@@ -2097,7 +2174,6 @@ impl SerialEngine {
             attempts += 1;
             let result = self.wait_pattern_internal_opts("login:", 120.0, true).await;
             if result["matched"].as_bool().unwrap_or(false) {
-                self.release_relay_lock();
                 return serde_json::json!({
                     "success": true,
                     "new_boot_number": self.logs.boot_number(),
@@ -2107,7 +2183,6 @@ impl SerialEngine {
                 });
             }
             if attempts >= failure_retry {
-                self.release_relay_lock();
                 return serde_json::json!({
                     "success": true,
                     "new_boot_number": self.logs.boot_number(),
@@ -2166,6 +2241,9 @@ impl SerialEngine {
         if self.flags.removed.load(Ordering::Acquire) {
             return Err("DUT removed from project".into());
         }
+        if self.in_manual_takeover() {
+            return Err("Serial console owned by interactive dutabo session; end it first".into());
+        }
         self.state.transition(TargetState::Booting);
         let ch = self.interrupt_char;
         let mut backend = self.build_power_control();
@@ -2210,6 +2288,9 @@ impl SerialEngine {
     /// with the lock released between calls so the read loop can process
     /// U-Boot banners and trigger watchers).
     pub async fn flood_one(&mut self) {
+        if self.in_manual_takeover() {
+            return;
+        }
         if self.console.is_open() {
             self.console.write_raw(&[self.interrupt_char]).await;
         }
@@ -2295,42 +2376,13 @@ impl SerialEngine {
         }
     }
 
-    /// Incrementally fetch new output (file-position based)
-    pub fn poll_logs(&mut self) -> serde_json::Value {
-        let path = match self.logs.current_path() {
-            Some(p) => p.to_path_buf(),
-            None => {
-                return serde_json::json!({"lines": [], "since": 0});
-            }
-        };
-
-        match std::fs::metadata(&path) {
-            Ok(meta) => {
-                let size = meta.len();
-                if size <= self.poll_position {
-                    return serde_json::json!({"lines": [], "since": self.poll_position});
-                }
-                match std::fs::File::open(&path) {
-                    Ok(mut file) => {
-                        use std::io::{Read, Seek, SeekFrom};
-                        file.seek(SeekFrom::Start(self.poll_position)).ok();
-                        let bytes_to_read = (size - self.poll_position) as usize;
-                        let mut buf = vec![0u8; bytes_to_read];
-                        let n = file.read(&mut buf).unwrap_or(0);
-                        buf.truncate(n);
-                        self.poll_position = size;
-                        let content = String::from_utf8_lossy(&buf);
-                        let lines: Vec<&str> = content.lines().collect();
-                        serde_json::json!({
-                            "lines": lines,
-                            "since": self.poll_position,
-                        })
-                    }
-                    Err(_) => serde_json::json!({"lines": [], "since": self.poll_position}),
-                }
-            }
-            Err(_) => serde_json::json!({"lines": [], "since": self.poll_position}),
-        }
+    #[cfg(test)]
+    fn poll_logs(&mut self) -> serde_json::Value {
+        let target = self.logs.live_read_target();
+        self.log_poll
+            .try_lock()
+            .unwrap()
+            .read_page(target.as_ref().map(|target| target.path.as_path()))
     }
 
     /// Append key anchor lines to reference boot log and hot-reload StageLearner.
@@ -2416,6 +2468,9 @@ impl SerialEngine {
         quick: bool,
         use_power: bool,
     ) -> serde_json::Value {
+        if self.in_manual_takeover() {
+            return Self::dutabo_session_error();
+        }
         if self.flags.removed.load(Ordering::Acquire) {
             return Self::removed_error();
         }
@@ -2490,6 +2545,9 @@ impl SerialEngine {
         reference_override: Option<&std::path::Path>,
         cycles: Option<usize>,
     ) -> serde_json::Value {
+        if self.in_manual_takeover() {
+            return Self::dutabo_session_error();
+        }
         let dut_dir = self.config.dut_dir();
         let learn_dir = std::path::PathBuf::from(&dut_dir).join("learn");
         let ref_log = self.config.reference_log();
@@ -2540,6 +2598,9 @@ impl SerialEngine {
     /// output. This catches a responsive relay wired to the wrong channel.
     #[tracing::instrument(skip(self))]
     pub async fn verify_relay(&mut self) -> serde_json::Value {
+        if self.in_manual_takeover() {
+            return Self::dutabo_session_error();
+        }
         if self.flags.removed.load(Ordering::Acquire) {
             return Self::removed_error();
         }
@@ -2571,11 +2632,7 @@ impl SerialEngine {
                 "backend": power_ctrl.name(),
             });
         }
-        if let Err(rejection) = self.try_acquire_relay_lock() {
-            return rejection;
-        }
         if let Err(e) = power_ctrl.press(Button::Reset).await {
-            self.release_relay_lock();
             return serde_json::json!({
                 "success": false,
                 "verified": false,
@@ -2589,11 +2646,7 @@ impl SerialEngine {
         // bytes already queued before the press.
         self.mark_boot_cycle();
         for _ in 0..3 {
-            match self
-                .console
-                .read_available(Duration::from_millis(100), 4096)
-                .await
-            {
+            match self.read_console(Duration::from_millis(100), 4096).await {
                 Ok(data) if !data.is_empty() => self.record_serial_data(&data),
                 _ => break,
             }
@@ -2603,10 +2656,7 @@ impl SerialEngine {
         let mut held_output = Vec::new();
         let mut held_partial = Vec::new();
         while tokio::time::Instant::now() < quiet_deadline {
-            if let Ok(data) = self
-                .console
-                .read_available(Duration::from_millis(100), 4096)
-                .await
+            if let Ok(data) = self.read_console(Duration::from_millis(100), 4096).await
                 && !data.is_empty()
             {
                 self.record_serial_data(&data);
@@ -2622,7 +2672,7 @@ impl SerialEngine {
                 .await
                 .err()
                 .map(|error| error.to_string());
-            self.release_relay_lock();
+
             return serde_json::json!({
                 "success": false,
                 "verified": false,
@@ -2635,7 +2685,6 @@ impl SerialEngine {
         }
 
         if let Err(e) = power_ctrl.release(Button::Reset).await {
-            self.release_relay_lock();
             return serde_json::json!({
                 "success": false,
                 "verified": false,
@@ -2644,7 +2693,6 @@ impl SerialEngine {
                 "backend": power_ctrl.name(),
             });
         }
-        self.release_relay_lock();
 
         // One meaningful line proves that release produced fresh UART data.
         // Keep the 8s deadline for boards with a slow first byte, but stop
@@ -2678,7 +2726,7 @@ impl SerialEngine {
         })
     }
 
-    /// Control a button (press/release/pulse) via the power control abstraction.
+    /// Control a button through a tracked, channel-scoped hardware session.
     pub async fn control_button(
         &mut self,
         button: &str,
@@ -2697,60 +2745,36 @@ impl SerialEngine {
             }
         };
 
-        let mut backend = self.build_power_control();
-        if !backend.has_button(btn) {
-            return self.power_control_failure(button);
-        }
-        if let Err(rejection) = self.try_acquire_relay_lock() {
-            return rejection;
-        }
+        let backend = match self.prepare_power_control(btn) {
+            Ok(backend) => backend,
+            Err(error) => return error,
+        };
+        execute_button(backend, btn, button, action, delay_ms).await
+    }
 
-        match action {
-            // Feedback-confirming variants: Ok is returned only when the
-            // HARDWARE reports the new state — a lost command (rapid
-            // consecutive switching, flaky ser2net) is retried underneath
-            // instead of silently dropped.
-            "press" => match backend.press_verified(btn).await {
-                Ok(()) => {
-                    self.release_relay_lock();
-                    serde_json::json!({"success": true, "button": button, "action": "press", "backend": backend.name()})
-                }
-                Err(e) => {
-                    self.release_relay_lock();
-                    serde_json::json!({"success": false, "error": format!("{e}")})
-                }
-            },
-            "release" => match backend.release_verified(btn).await {
-                Ok(()) => {
-                    self.release_relay_lock();
-                    serde_json::json!({"success": true, "button": button, "action": "release", "backend": backend.name()})
-                }
-                Err(e) => {
-                    self.release_relay_lock();
-                    serde_json::json!({"success": false, "error": format!("{e}")})
-                }
-            },
-            "pulse" => {
-                let ms = delay_ms.unwrap_or(500);
-                match backend.pulse(btn, ms).await {
-                    Ok(()) => {
-                        self.release_relay_lock();
-                        serde_json::json!({"success": true, "button": button, "action": "pulse", "delay_ms": ms, "backend": backend.name()})
-                    }
-                    Err(e) => {
-                        self.release_relay_lock();
-                        serde_json::json!({"success": false, "error": format!("{e}")})
-                    }
-                }
-            }
-            _ => {
-                self.release_relay_lock();
-                serde_json::json!({
-                    "success": false,
-                    "error": format!("Unknown action: {action}. Valid: press, release, pulse")
-                })
-            }
+    pub(crate) fn prepare_power_control(
+        &self,
+        button: Button,
+    ) -> Result<crate::managed_power::ManagedPower, serde_json::Value> {
+        if self.flags.removed.load(Ordering::Acquire) {
+            return Err(Self::removed_error());
         }
+        // Choke point for every relay path (power cycle, reset, buttons,
+        // verify, learning): the agent must not disturb the DUT while a
+        // human's interactive session owns the console.
+        if self.in_manual_takeover() {
+            return Err(Self::dutabo_session_error());
+        }
+        if self.stopped || self.power_runtime.is_closed() {
+            return Err(
+                serde_json::json!({"success":false,"code":"engine_stopped","error":"Engine is stopping"}),
+            );
+        }
+        let backend = self.build_power_control();
+        if !backend.has_button(button) {
+            return Err(self.power_control_failure(button.as_str()));
+        }
+        Ok(backend)
     }
 
     // ── Internal learning helpers ───────────────────────────────────────
@@ -2783,21 +2807,25 @@ impl SerialEngine {
     /// factory; unknown names yield the disabled backend. The ch340 plugin
     /// is built-in; future backends (SNMP PDU, GPIO, ...) register
     /// themselves without touching this code.
-    fn build_power_control(&self) -> Box<dyn PowerControl> {
-        crate::power_control::build_backend(&PowerControlConfig {
-            backend: self.config.relay_type(),
-            host: self.config.relay_ip(),
-            port: self.config.relay_port(),
-            channels: ButtonChannels {
-                reset: self.config.reset_channel(),
-                download: self.config.download_channel(),
-                power: self.config.power_channel(),
-                power_key: self.config.power_key_channel(),
+    pub(crate) fn build_power_control(&self) -> crate::managed_power::ManagedPower {
+        crate::managed_power::ManagedPower::new(
+            PowerControlConfig {
+                backend: self.config.relay_type(),
+                host: self.config.relay_ip(),
+                port: self.config.relay_port(),
+                channels: ButtonChannels {
+                    reset: self.config.reset_channel(),
+                    download: self.config.download_channel(),
+                    power: self.config.power_channel(),
+                    power_key: self.config.power_key_channel(),
+                },
+                reset_time_ms: self.config.reset_time_ms(),
+                power_off_time_ms: self.config.power_off_time_ms(),
+                dut_name: self.config.get_str_or("DUT_NAME", "default"),
             },
-            reset_time_ms: self.config.reset_time_ms(),
-            power_off_time_ms: self.config.power_off_time_ms(),
-            dut_name: self.config.get_str_or("DUT_NAME", "default"),
-        })
+            self.config.lock_dir(),
+            self.power_runtime.clone(),
+        )
     }
 
     pub(crate) fn power_control_configured(&self) -> bool {
@@ -2859,7 +2887,7 @@ impl SerialEngine {
     /// The unified structured body every control tool returns when no power
     /// control is configured. Tool-level isError (NOT a JSON-RPC error):
     /// the tool ran and answered a domain question — a soft failure.
-    fn power_control_failure(&self, button: &str) -> serde_json::Value {
+    pub(crate) fn power_control_failure(&self, button: &str) -> serde_json::Value {
         let name = self.config.get_str_or("DUT_NAME", "default");
         let (reason, error) = self.power_control_reason();
         serde_json::json!({
@@ -2885,6 +2913,9 @@ impl SerialEngine {
         if self.flags.removed.load(Ordering::Acquire) {
             return Self::removed_error();
         }
+        if self.in_manual_takeover() {
+            return Self::dutabo_session_error();
+        }
         let bytes = data.as_bytes().to_vec();
         let len = bytes.len();
         let _ = self.console.write_sender().try_send(bytes);
@@ -2896,10 +2927,58 @@ impl SerialEngine {
         self.console.write_sender()
     }
 
+    /// True while an interactive `dutabo serial` session owns the console.
+    /// Either signal is enough: the lock-free guard flag mirrors the state
+    /// for the MCP layer, and checking both prevents drift if one path ever
+    /// misses a transition. Every serial-write and relay entry point must
+    /// reject while this holds — the human drives the port exclusively.
+    pub fn in_manual_takeover(&self) -> bool {
+        self.flags.dutabo_taken.load(Ordering::Relaxed) != 0
+            || self.state.current() == TargetState::Dutabo
+    }
+
+    /// Admit a control request under the same mutex as manual takeover.
+    /// The token stays alive across awaits and may move into a detached task.
+    pub(crate) fn begin_control_request(
+        &self,
+    ) -> Result<tokio_util::task::task_tracker::TaskTrackerToken, serde_json::Value> {
+        if self.flags.removed.load(Ordering::Acquire) {
+            return Err(Self::removed_error());
+        }
+        if self.in_manual_takeover() {
+            return Err(Self::dutabo_session_error());
+        }
+        Ok(self.control_requests.token())
+    }
+
+    pub(crate) fn manual_takeover_available(&self) -> bool {
+        !self.in_manual_takeover()
+            && self.control_requests.is_empty()
+            && self.power_runtime.is_idle()
+            && !self.commands.is_busy()
+    }
+
+    fn bind_command_writer(&mut self) {
+        let sender = self.console.write_sender();
+        self.commands.set_write_fn(Box::new(move |data| {
+            sender.try_send_command(data.to_vec()).ok();
+        }));
+    }
+
+    /// Rejection payload shared by every engine-level takeover guard.
+    pub(crate) fn dutabo_session_error() -> serde_json::Value {
+        serde_json::json!({
+            "success": false,
+            "code": "dutabo_session",
+            "error": "Serial console owned by interactive dutabo session; end it first"
+        })
+    }
+
     /// Block Agent tools as soon as a human WebSocket takeover begins, before
     /// any terminal byte is written or stale input is drained.
     pub fn begin_manual_session(&mut self) {
-        self.commands.reset_stream_decoder();
+        self.commands.cancel_all();
+        self.console.revoke_write_senders();
         self.state
             .transition(crate::state_manager::TargetState::Dutabo);
         self.state.write_dutabo_forced();
@@ -2932,14 +3011,35 @@ impl SerialEngine {
 
     /// Set WebSocket broadcast channel for dutabo serial relay.
     /// Transitions state to Dutabo so the statusline reflects "in use".
-    pub fn set_ws_tx(&mut self, tx: tokio::sync::broadcast::Sender<Vec<u8>>) {
+    pub fn set_ws_tx(&mut self, tx: tokio::sync::broadcast::Sender<Vec<u8>>) -> bool {
+        if !self.manual_takeover_available() {
+            return false;
+        }
         self.ws_tx = Some(tx);
         self.begin_manual_session();
+        true
+    }
+
+    pub(crate) async fn finish_manual_ws(
+        &mut self,
+        session: &tokio::sync::broadcast::WeakSender<Vec<u8>>,
+    ) {
+        if let Some(sender) = session.upgrade()
+            && self
+                .ws_tx
+                .as_ref()
+                .is_some_and(|current| current.same_channel(&sender))
+        {
+            self.console.drain_writes().await;
+            self.clear_ws_tx();
+        }
     }
 
     /// Clear WebSocket broadcast channel and restore to Active.
     pub fn clear_ws_tx(&mut self) {
         self.ws_tx = None;
+        self.console.revoke_write_senders();
+        self.bind_command_writer();
         if !self.flags.removed.load(Ordering::Acquire) && !self.endpoint_fault_latched() {
             self.state
                 .transition(crate::state_manager::TargetState::Active);
@@ -3184,29 +3284,6 @@ impl SerialEngine {
         learner: &ConnectionLearner,
         use_power: bool,
     ) -> Result<Vec<u8>, String> {
-        // Relay endpoint lock: the learn cycle spans seconds (press, hold,
-        // capture) and MUST hold the relay exclusively — every other relay
-        // operation (any MCP's serial_button/verify/reset) acquires the
-        // same lock and will be told the relay is busy instead of silently
-        // interleaving CH340 frames (the "Port already in use"/lost-command
-        // class of failures).
-        let lock_dir = self.config.lock_dir();
-        let lock_host = format!("relay:{}", self.config.relay_ip());
-        if let Some(owner) =
-            lock_manager::acquire_lock(&lock_host, &self.config.relay_port().to_string(), &lock_dir)
-        {
-            return Err(format!(
-                "relay endpoint busy: held by another live process (pid {owner}) — \
-                 the reference learn needs exclusive relay access"
-            ));
-        }
-        let _relay_guard = RelayLockGuard {
-            host: lock_host,
-            port: self.config.relay_port().to_string(),
-            lock_dir,
-        };
-        // Start the configured hardware cycle. Reset can be held while stale
-        // bytes are drained; power uses the backend's OFF-wait-ON pulse.
         let mut backend = self.build_power_control();
         let cycle_button = if use_power {
             Button::Power
@@ -3223,11 +3300,7 @@ impl SerialEngine {
                 .map_err(|error| format!("Power-off failed via {}: {error}", backend.name()))?;
             self.mark_boot_cycle();
             for _ in 0..3 {
-                match self
-                    .console
-                    .read_available(Duration::from_millis(100), 4096)
-                    .await
-                {
+                match self.read_console(Duration::from_millis(100), 4096).await {
                     Ok(data) if !data.is_empty() => self.record_serial_data(&data),
                     _ => break,
                 }
@@ -3270,11 +3343,7 @@ impl SerialEngine {
             // and drain bytes queued from the previous boot before release.
             self.mark_boot_cycle();
             for _ in 0..3 {
-                match self
-                    .console
-                    .read_available(Duration::from_millis(100), 4096)
-                    .await
-                {
+                match self.read_console(Duration::from_millis(100), 4096).await {
                     Ok(data) if !data.is_empty() => self.record_serial_data(&data),
                     _ => break,
                 }
@@ -3482,14 +3551,14 @@ impl SerialEngine {
             }
 
             let read_timeout = remaining.min(std::time::Duration::from_millis(500));
-            match self.console.read_available(read_timeout, 4096).await {
+            match self.read_console(read_timeout, 4096).await {
                 Ok(data) if !data.is_empty() => {
                     last_data = tokio::time::Instant::now();
+                    self.record_serial_data(&data);
                     let clean = crate::serial_engine::strip_ser2net_banner(
                         &data,
                         &mut self.ser2net_partial,
                     );
-                    self.record_serial_data(&data);
                     self.state.on_activity();
                     let events = self.detector.feed(&clean);
                     self.handle_boot_events(events).await;
@@ -3714,8 +3783,11 @@ fn parse_ser2net_banner(data: &[u8]) -> Option<Ser2netBanner> {
 fn endpoint_conflict(config: &Config) -> Option<serde_json::Value> {
     let relay_port = config.relay_port();
     if relay_port == 0
-        || config.serial_target() != relay_port.to_string()
-        || config.dev_host_ip() != config.relay_ip()
+        || crate::engine_registry::endpoint_identity(&config.dev_host_ip(), &config.serial_target())
+            != crate::engine_registry::endpoint_identity(
+                &config.relay_ip(),
+                &relay_port.to_string(),
+            )
     {
         return None;
     }
@@ -3810,6 +3882,115 @@ pub fn new_shared_engine(config: crate::config::Config) -> SharedEngine {
     SharedEngine { inner, flags }
 }
 
+async fn execute_button(
+    mut backend: crate::managed_power::ManagedPower,
+    btn: Button,
+    button: &str,
+    action: &str,
+    delay_ms: Option<u64>,
+) -> serde_json::Value {
+    match action {
+        // Feedback-confirming variants: Ok is returned only when the
+        // HARDWARE reports the new state — a lost command (rapid
+        // consecutive switching, flaky ser2net) is retried underneath
+        // instead of silently dropped.
+        "press" => match backend.press_verified(btn).await {
+            Ok(()) => {
+                backend.keep_pressed().await;
+
+                serde_json::json!({"success": true, "button": button, "action": "press", "backend": backend.name()})
+            }
+            Err(e) => {
+                serde_json::json!({"success": false, "error": format!("{e}")})
+            }
+        },
+        "release" => match backend.release_verified(btn).await {
+            Ok(()) => {
+                serde_json::json!({"success": true, "button": button, "action": "release", "backend": backend.name()})
+            }
+            Err(e) => {
+                serde_json::json!({"success": false, "error": format!("{e}")})
+            }
+        },
+        "pulse" => {
+            let ms = delay_ms.unwrap_or(500);
+            match backend.pulse(btn, ms).await {
+                Ok(()) => {
+                    serde_json::json!({"success": true, "button": button, "action": "pulse", "delay_ms": ms, "backend": backend.name()})
+                }
+                Err(e) => {
+                    serde_json::json!({"success": false, "error": format!("{e}")})
+                }
+            }
+        }
+        _ => {
+            serde_json::json!({
+                "success": false,
+                "error": format!("Unknown action: {action}. Valid: press, release, pulse")
+            })
+        }
+    }
+}
+
+/// Execute a button operation without monopolizing the serial engine mutex.
+pub async fn control_button_shared(
+    engine: &SharedEngine,
+    button: &str,
+    action: &str,
+    delay_ms: Option<u64>,
+) -> serde_json::Value {
+    let btn = match button {
+        "reset" => Button::Reset,
+        "download" => Button::Download,
+        "power_key" => Button::PowerKey,
+        _ => {
+            return serde_json::json!({
+                "success": false,
+                "error": format!("Unknown button: {button}. Valid: reset, download, power_key")
+            });
+        }
+    };
+
+    let backend = match engine.lock().await.prepare_power_control(btn) {
+        Ok(backend) => backend,
+        Err(error) => return error,
+    };
+    execute_button(backend, btn, button, action, delay_ms).await
+}
+
+/// Pulse one channel while other channels and serial reads remain available.
+pub async fn pulse_shared(engine: &SharedEngine, button: Button) -> serde_json::Value {
+    let (mut backend, delay, previous) = {
+        let mut eng = engine.lock().await;
+        let backend = match eng.prepare_power_control(button) {
+            Ok(backend) => backend,
+            Err(error) => return error,
+        };
+        let delay = if button == Button::Power {
+            eng.config.power_off_time_ms()
+        } else {
+            500
+        };
+        let previous = eng.state.current();
+        eng.state.transition(TargetState::Booting);
+        eng.logs.expect_boot();
+        eng.detector.reset_cycle();
+        (backend, delay, previous)
+    };
+    let result = backend.pulse(button, delay).await;
+    // Stop may hold the engine mutex while draining hardware workers. The
+    // control session must end before we acquire that mutex again.
+    drop(backend);
+    let mut eng = engine.lock().await;
+    if let Err(error) = result {
+        if eng.state.current() == TargetState::Booting {
+            eng.state.transition(previous);
+        }
+        return serde_json::json!({"success":false,"error":format!("{} failed: {error}; relay state may be unknown",button.as_str()),"new_boot_number":eng.logs.boot_number()});
+    }
+    serde_json::json!({"success":true,"new_boot_number":eng.logs.boot_number(),"log_path":eng.log_path_string()})
+}
+
 /// Start the engine, then attach the transport-independent read/watchdog
 /// loops. The caller should spawn this future so MCP discovery is available
 /// while the initial serial probe is still running.
@@ -3847,25 +4028,26 @@ pub async fn start_shared(engine: SharedEngine) -> Result<(), String> {
 /// This is also used after `serial_claim` succeeds in an MCP instance that
 /// originally started while another live task owned the endpoint.
 pub async fn ensure_background_tasks(engine: SharedEngine) {
-    {
-        let mut eng = engine.lock().await;
-        let read_running = eng
-            .read_handle
-            .as_ref()
-            .is_some_and(|handle| !handle.is_finished());
-        let watchdog_running = eng
-            .watchdog_handle
-            .as_ref()
-            .is_some_and(|handle| !handle.is_finished());
-        if read_running && watchdog_running {
-            return;
-        }
-        if let Some(handle) = eng.read_handle.take() {
-            handle.abort();
-        }
-        if let Some(handle) = eng.watchdog_handle.take() {
-            handle.abort();
-        }
+    let mut eng = engine.lock().await;
+    if eng.stopped || !eng.running || !eng.owns_serial_lock() {
+        return;
+    }
+    let read_running = eng
+        .read_handle
+        .as_ref()
+        .is_some_and(|handle| !handle.is_finished());
+    let watchdog_running = eng
+        .watchdog_handle
+        .as_ref()
+        .is_some_and(|handle| !handle.is_finished());
+    if read_running && watchdog_running {
+        return;
+    }
+    if let Some(handle) = eng.read_handle.take() {
+        handle.abort();
+    }
+    if let Some(handle) = eng.watchdog_handle.take() {
+        handle.abort();
     }
 
     let read_engine = engine.clone();
@@ -3874,7 +4056,11 @@ pub async fn ensure_background_tasks(engine: SharedEngine) {
             let mut eng = read_engine.lock().await;
             eng.read_loop_iter().await;
             drop(eng);
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            // Pace only the fast-return paths (backoff arming, storage
+            // failure, keystroke-drain); parked iterations already waited
+            // up to 100ms in select. This sleep is the floor for relayed
+            // keystroke echo — keep it small.
+            tokio::time::sleep(Duration::from_millis(2)).await;
         }
     });
     let watchdog_engine = engine.clone();
@@ -3885,10 +4071,7 @@ pub async fn ensure_background_tasks(engine: SharedEngine) {
             watchdog_engine.lock().await.watchdog_once();
         }
     });
-    engine
-        .lock()
-        .await
-        .set_background_tasks(read_handle, watchdog_handle);
+    eng.set_background_tasks(read_handle, watchdog_handle);
 }
 
 /// Install SIGUSR1/SIGUSR2 handlers for `dutabo serial` direct takeover.
@@ -3900,11 +4083,11 @@ pub async fn ensure_background_tasks(engine: SharedEngine) {
 ///
 /// Unix-only; on other platforms this is a no-op. Wired for both HTTP and
 /// stdio processes because either transport may own the physical endpoint.
-pub fn spawn_human_takeover_signals(engine: SharedEngine) {
+pub fn spawn_human_takeover_signals(engine: SharedEngine) -> Option<tokio::task::JoinHandle<()>> {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{SignalKind, signal};
-        let _installed = tokio::spawn(async move {
+        let installed = tokio::spawn(async move {
             let mut yield_sig = match signal(SignalKind::user_defined1()) {
                 Ok(sig) => sig,
                 Err(error) => {
@@ -3931,11 +4114,13 @@ pub fn spawn_human_takeover_signals(engine: SharedEngine) {
                 }
             }
         });
-        // Detached on purpose: the handler lives for the whole MCP process;
-        // process exit tears it down.
+        Some(installed)
     }
     #[cfg(not(unix))]
-    let _ = &engine;
+    {
+        let _ = &engine;
+        None
+    }
 }
 
 pub async fn record_startup_timeout(engine: &SharedEngine, seconds: u64) {
@@ -3950,6 +4135,76 @@ pub async fn record_startup_timeout(engine: &SharedEngine, seconds: u64) {
         .lock()
         .await
         .set_startup_error(format!("Serial startup timed out after {seconds}s"));
+}
+
+/// Byte cursor and identity of the last inode read by a positional poll.
+#[derive(Default)]
+pub(crate) struct LogPollCursor {
+    position: u64,
+    file_identity: Option<(u64, u64)>,
+}
+
+impl LogPollCursor {
+    pub(crate) fn at(position: u64) -> Self {
+        Self {
+            position,
+            file_identity: None,
+        }
+    }
+
+    pub(crate) fn read_page(&mut self, path: Option<&std::path::Path>) -> serde_json::Value {
+        use std::io::{Read, Seek, SeekFrom};
+        use std::os::unix::fs::MetadataExt;
+
+        const MAX_POLL_BYTES: u64 = 64 * 1024;
+        let Some(path) = path else {
+            return serde_json::json!({"lines": [], "since": self.position});
+        };
+
+        let result = (|| -> std::io::Result<serde_json::Value> {
+            // Inspect the opened inode, not a pathname that can change before
+            // open. Only bytes actually returned advance the public cursor.
+            let mut file = std::fs::File::open(path)?;
+            let meta = file.metadata()?;
+            let identity = (meta.dev(), meta.ino());
+            let rotated = self.file_identity.is_some_and(|prior| prior != identity)
+                || meta.len() < self.position;
+            if rotated {
+                self.position = 0;
+            }
+            self.file_identity = Some(identity);
+            file.seek(SeekFrom::Start(self.position))?;
+            let limit = meta.len().saturating_sub(self.position).min(MAX_POLL_BYTES);
+            let mut buf = Vec::with_capacity(limit as usize);
+            // read_to_end handles short reads; take bounds both allocation and
+            // work even when the current cycle has accumulated for months.
+            file.take(limit).read_to_end(&mut buf)?;
+            if self.position + (buf.len() as u64) < meta.len()
+                && let Some(tail) = buf.utf8_chunks().last()
+                && let Err(error) = std::str::from_utf8(tail.invalid())
+                && error.error_len().is_none()
+            {
+                // Leave a code point split by the page limit for the next
+                // request. Invalid source bytes still use the lossy text view.
+                buf.truncate(buf.len() - tail.invalid().len());
+            }
+            self.position += buf.len() as u64;
+            let content = String::from_utf8_lossy(&buf);
+            Ok(serde_json::json!({
+                "lines": content.lines().collect::<Vec<_>>(),
+                "content": content,
+                "since": self.position,
+                "more": self.position < meta.len(),
+                "rotated": rotated,
+            }))
+        })();
+        match result {
+            Ok(value) => value,
+            Err(error) => serde_json::json!({
+                "lines": [], "since": self.position, "error": error.to_string(),
+            }),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -3973,6 +4228,44 @@ mod tests {
             ".dut-serial",
             lock_dir.to_str().unwrap(),
         )
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_background_installation_is_owned_and_stop_is_terminal() {
+        let tmp = TempDir::new().unwrap();
+        let engine = new_shared_engine(create_test_config(tmp.path()));
+        {
+            let mut eng = engine.lock().await;
+            assert!(
+                lock_manager::acquire_lock(&eng.host, &eng.serial_target, &eng.config.lock_dir())
+                    .is_none()
+            );
+            eng.running = true;
+            eng.owns_serial_lock = true;
+        }
+        let installs: Vec<_> = (0..32)
+            .map(|_| {
+                let engine = engine.clone();
+                tokio::spawn(async move {
+                    ensure_background_tasks(engine).await;
+                })
+            })
+            .collect();
+        for task in installs {
+            task.await.unwrap();
+        }
+        engine.lock().await.stop().await;
+        ensure_background_tasks(engine.clone()).await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while Arc::strong_count(&engine.inner) != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("untracked engine tasks survived stop");
+        let eng = engine.lock().await;
+        assert!(eng.read_handle.is_none());
+        assert!(eng.watchdog_handle.is_none());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4191,10 +4484,7 @@ mod tests {
             assert_eq!(engine.claim_serial().await["code"], "dut_removed");
             engine.resume_serial().await;
             assert!(engine.start().await.is_err());
-            assert_eq!(
-                engine.try_acquire_relay_lock().unwrap_err()["code"],
-                "dut_removed"
-            );
+            assert!(engine.power_runtime.is_closed());
             engine.clear_ws_tx();
             assert!(!engine.console.is_open());
             assert_eq!(engine.state.current(), TargetState::Stopped);
@@ -4410,31 +4700,6 @@ mod tests {
         assert!(String::from_utf8_lossy(&response).contains("root@dut:/#"));
         server.await.unwrap();
         engine.console.close();
-    }
-
-    #[test]
-    fn relay_lock_guard_releases_the_prefixed_lock_key() {
-        let tmp = TempDir::new().unwrap();
-        let lock_dir = tmp.path().to_str().unwrap().to_string();
-        let lock_host = "relay:192.0.2.1".to_string();
-        let port = "2000".to_string();
-
-        assert_eq!(
-            crate::lock_manager::acquire_lock(&lock_host, &port, &lock_dir),
-            None
-        );
-        {
-            let _guard = RelayLockGuard {
-                host: lock_host.clone(),
-                port: port.clone(),
-                lock_dir: lock_dir.clone(),
-            };
-        }
-        assert_eq!(
-            crate::lock_manager::acquire_lock(&lock_host, &port, &lock_dir),
-            None
-        );
-        crate::lock_manager::release_lock(&lock_host, &port, &lock_dir);
     }
 
     #[tokio::test]
@@ -4707,30 +4972,166 @@ mod tests {
         );
     }
 
+    /// Engine-level takeover defense: while a human session owns the port,
+    /// command queueing, raw writes, and every relay path must reject (or
+    /// no-op) immediately. The MCP guard is the first line; this is the
+    /// second for any caller that reaches the engine directly.
     #[tokio::test]
-    async fn boot_start_without_persisted_boundary_still_archives_cycle() {
+    async fn manual_takeover_blocks_command_queue_raw_writes_and_relay_paths() {
         let tmp = TempDir::new().unwrap();
         let mut engine = SerialEngine::new(create_test_config(tmp.path()));
-        // Payload without any regex-matched boot prefix: the stage detector
-        // (learner mode) can still report BootStart while `write_serial` found
-        // no boundary to split at.
-        engine.record_serial_data(b"idle shell output\nmore idle output\n");
-        engine.logs.flush_sync();
-        assert!(!engine.persistence_split_boot);
+        engine.begin_manual_session();
+        assert!(engine.in_manual_takeover());
 
+        // Command queueing resolves immediately with a rejection instead of
+        // waiting out the timeout against the silenced read loop.
+        let rx = engine.queue_command("reboot", 0.5);
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), rx)
+            .await
+            .expect("takeover rejection must not hang")
+            .expect("receiver not dropped");
+        assert!(result.output.contains("taken over by dutabo"));
+        assert_eq!(result.exit_code, None);
+        assert!(!result.timed_out);
+
+        // Raw writes reject with the shared dutabo_session payload.
+        let raw = engine.send_raw("reboot\n");
+        assert_eq!(raw["code"], "dutabo_session");
+        assert_eq!(raw["success"], false);
+
+        // Relay paths reject through the prepare_power_control choke point.
+        let button = engine.control_button("reset", "pulse", None).await;
+        assert_eq!(button["code"], "dutabo_session");
+        assert_eq!(button["success"], false);
+        assert!(matches!(
+            engine.do_relay_reset(InterruptStrategy::Flood).await,
+            Err(e) if e.contains("dutabo")
+        ));
+
+        // The interactive session ends → the guards fall open again.
+        engine.clear_ws_tx();
+        assert!(!engine.in_manual_takeover());
+        assert_eq!(engine.send_raw("ls\n")["success"], true);
+    }
+
+    #[tokio::test]
+    async fn websocket_takeover_excludes_agent_operations_and_rotates_senders() {
+        let tmp = TempDir::new().unwrap();
+        let mut engine = SerialEngine::new(create_test_config(tmp.path()));
+        engine.bind_command_writer();
+        let old_agent = engine.get_write_sender();
+        let (ws, _) = tokio::sync::broadcast::channel(8);
+        let old_session = ws.downgrade();
+
+        let control = engine.begin_control_request().unwrap();
+        assert!(!engine.set_ws_tx(ws.clone()));
+        drop(control);
+        let relay = engine.build_power_control();
+        assert!(!engine.set_ws_tx(ws.clone()));
+        drop(relay);
+
+        let command = engine.queue_command("echo pending", 60.0);
+        assert!(!engine.set_ws_tx(ws.clone()));
+        engine.commands.cancel_all();
+        assert!(command.await.is_err());
+        assert!(engine.set_ws_tx(ws));
+        assert_eq!(
+            engine.begin_control_request().unwrap_err()["code"],
+            "dutabo_session"
+        );
+        assert!(old_agent.try_send(b"old probe".to_vec()).is_err());
+        assert!(engine.console.poll_pending_write().is_none());
+        assert_eq!(engine.verify_relay().await["code"], "dutabo_session");
+        let human = engine.get_write_sender();
+        assert!(human.try_send(b"human input".to_vec()).is_ok());
+        assert_eq!(engine.console.poll_pending_write().unwrap(), b"human input");
+
+        engine.finish_manual_ws(&old_session).await;
+        assert!(human.try_send(b"stale human input".to_vec()).is_err());
+        assert!(engine.begin_control_request().is_ok());
+        let _command = engine.queue_command("echo resumed", 60.0);
+        let queued = engine.console.poll_pending_write().unwrap();
+        assert!(String::from_utf8_lossy(&queued).contains("echo resumed"));
+        engine.commands.cancel_all();
+
+        let (next, _) = tokio::sync::broadcast::channel(8);
+        assert!(engine.set_ws_tx(next));
+        engine.finish_manual_ws(&old_session).await;
+        assert!(
+            engine.in_manual_takeover(),
+            "stale cleanup must not release a new session"
+        );
+    }
+
+    #[tokio::test]
+    async fn delayed_boot_analysis_never_splits_the_middle_of_a_line() {
+        let tmp = TempDir::new().unwrap();
+        let mut engine = SerialEngine::new(create_test_config(tmp.path()));
+        let first = b"DDR Version first\nU-Boot SPL first\nINFO:    by";
+        engine.record_serial_data(first);
         engine.handle_boot_events(vec![BootEvent::BootStart]).await;
-        let archives = engine.logs.list_archives();
-        assert_eq!(archives.len(), 1);
-        let archived = std::fs::read(engine.logs.log_dir().join(&archives[0].filename)).unwrap();
-        assert_eq!(archived, b"idle shell output\nmore idle output\n");
-
-        // The next cycle's data goes to the fresh current log.
-        engine.record_serial_data(b"next cycle payload\n");
+        engine.record_serial_data(b"pass memory repair\n");
+        assert!(!engine.persistence_split_boot);
+        engine.handle_boot_events(vec![BootEvent::BootStart]).await;
         engine.logs.flush_sync();
+        assert!(engine.logs.list_archives().is_empty());
+        let expected = [first.as_slice(), b"pass memory repair\n"].concat();
         assert_eq!(
             std::fs::read(engine.logs.current_path().unwrap()).unwrap(),
-            b"next cycle payload\n"
+            expected
         );
+        engine.record_serial_data(b"DDR Version second\n");
+        engine.logs.flush_sync();
+        let archives = engine.logs.list_archives();
+        assert_eq!(archives.len(), 1);
+        assert_eq!(
+            std::fs::read(engine.logs.log_dir().join(&archives[0].filename)).unwrap(),
+            expected
+        );
+    }
+
+    #[tokio::test]
+    async fn orderly_stop_persists_receive_tail_without_another_read_iteration() {
+        use tokio::io::AsyncWriteExt;
+
+        let tmp = TempDir::new().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = create_test_config(tmp.path());
+        config.values.insert(
+            "SERIAL_PORT".into(),
+            listener.local_addr().unwrap().port().to_string(),
+        );
+        let mut engine = SerialEngine::new(config);
+        engine.console.connect().await.unwrap();
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let payload = b"last diagnostic before stop\x00\xff\r\n";
+        socket.write_all(payload).await.unwrap();
+        assert!(engine.console.wait_readable(Duration::from_secs(1)).await);
+        engine.stop().await;
+        assert_eq!(
+            std::fs::read(engine.logs.log_dir().join("full.full.log")).unwrap(),
+            payload
+        );
+    }
+
+    #[tokio::test]
+    async fn raw_logs_preserve_banner_like_prefix_and_binary_bytes_on_stop() {
+        for payload in [
+            b"s".as_slice(),
+            b"ser2net port diagnostic",
+            b"ser2net port 7\r\n\x00\xff",
+        ] {
+            let tmp = TempDir::new().unwrap();
+            let mut engine = SerialEngine::new(create_test_config(tmp.path()));
+            for byte in payload {
+                engine.record_serial_data(std::slice::from_ref(byte));
+            }
+            engine.stop().await;
+            assert_eq!(
+                std::fs::read(engine.logs.log_dir().join("full.full.log")).unwrap(),
+                payload
+            );
+        }
     }
 
     #[test]
@@ -4868,6 +5269,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn poll_logs_pages_large_cycles_without_losing_utf8_or_skipping_replacements() {
+        let tmp = TempDir::new().unwrap();
+        let mut engine = SerialEngine::new(create_test_config(tmp.path()));
+        let path = engine.logs.live_read_target().unwrap().path;
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let payload = format!("{}完整日志\n{}\n", "x".repeat(65535), "y".repeat(100_000));
+        std::fs::write(&path, payload.as_bytes()).unwrap();
+        let mut observed = String::new();
+        loop {
+            let page = engine.poll_logs();
+            let content = page["content"].as_str().unwrap();
+            assert!(content.len() <= 65536);
+            observed.push_str(content);
+            assert_eq!(page["since"].as_u64().unwrap(), observed.len() as u64);
+            if page["more"] == false {
+                break;
+            }
+        }
+        assert_eq!(observed, payload);
+
+        let replacement = path.with_extension("replacement");
+        let next_payload = format!("next cycle\n{}\n", "z".repeat(payload.len() + 10));
+        std::fs::write(&replacement, next_payload.as_bytes()).unwrap();
+        std::fs::rename(&replacement, &path).unwrap();
+        let page = engine.poll_logs();
+        assert_eq!(page["rotated"], true);
+        assert!(
+            page["content"]
+                .as_str()
+                .unwrap()
+                .starts_with("next cycle\n")
+        );
+
+        std::fs::write(&path, b"truncated cycle\n").unwrap();
+        let page = engine.poll_logs();
+        assert_eq!(page["rotated"], true);
+        assert_eq!(page["content"], "truncated cycle\n");
+    }
+
+    #[tokio::test]
     async fn test_reset_target_no_relay() {
         let tmp = TempDir::new().unwrap();
         let config = create_test_config(tmp.path());
@@ -4890,7 +5331,9 @@ mod tests {
     async fn test_power_cycle_relay_down_rolls_back_state() {
         let tmp = TempDir::new().unwrap();
         let mut config = create_test_config(tmp.path());
-        config.values.insert("RELAY_TYPE".into(), "ch340".into());
+        config
+            .values
+            .insert("RELAY_TYPE".into(), "ch340-relay".into());
         config.values.insert("RELAY_IP".into(), "127.0.0.1".into());
         // Closed port: the relay connect is refused immediately.
         config.values.insert("RELAY_PORT".into(), "59998".into());
@@ -4937,16 +5380,6 @@ mod tests {
 
         // Should not panic even when not running
         engine.watchdog_once();
-    }
-
-    #[tokio::test]
-    async fn test_read_loop_iter_not_running() {
-        let tmp = TempDir::new().unwrap();
-        let config = create_test_config(tmp.path());
-        let mut engine = SerialEngine::new(config);
-
-        // Should return immediately when not running
-        engine.read_loop_iter().await;
     }
 
     /// Smoke test: queue_command returns a valid receiver and check_timeouts resolves it
@@ -5222,6 +5655,11 @@ mod tests {
         );
         assert_eq!(conflict, Some(holder_pid));
 
+        // Queued claims cannot revive a stopped lifecycle. An explicit start
+        // can reopen the engine before retrying ownership acquisition.
+        assert_eq!(second.claim_serial().await["code"], "engine_stopped");
+        second.start().await.unwrap();
+
         holder.kill().unwrap();
         let _ = holder.wait();
 
@@ -5353,18 +5791,16 @@ mod tests {
         let mut engine = SerialEngine::new(config);
 
         engine.state.transition(TargetState::Active);
-        let root_state = tmp.path().join(".dut-serial/target-state");
-        let root_cache = tmp.path().join(".dut-serial/statusline-cache");
         let dut_state = tmp.path().join(".dut-serial/dut-x/target-state");
         let dut_cache = tmp.path().join(".dut-serial/dut-x/statusline-cache");
-        for path in [&root_state, &root_cache, &dut_state, &dut_cache] {
+        for path in [&dut_state, &dut_cache] {
             assert!(path.exists(), "{} must exist before stop", path.display());
         }
         assert!(!engine.owns_serial_lock);
 
         engine.stop().await;
 
-        for path in [&root_state, &root_cache, &dut_state, &dut_cache] {
+        for path in [&dut_state, &dut_cache] {
             assert!(
                 !path.exists(),
                 "{} must be deleted on stop even without the endpoint lock",
@@ -5398,80 +5834,92 @@ mod tests {
         assert_eq!(engine.state.current(), TargetState::Dutabo);
     }
 
-    /// Booting + silence past hang_timeout must request a probe and the
-    /// watchdog must enqueue a blank-line probe on the write channel.
     #[test]
-    fn test_watchdog_sends_probe_in_booting_state() {
+    fn idle_heartbeat_requires_shell_and_silence_and_idle_command_queue() {
         let tmp = TempDir::new().unwrap();
-        let mut config = create_test_config(tmp.path());
-        config.values.insert("HANG_TIMEOUT".into(), "0".into());
+        let config = create_test_config(tmp.path());
         let mut engine = SerialEngine::new(config);
         engine.running = true;
         engine.console.set_open_for_test(true);
-        engine.state.transition(TargetState::Booting);
-        std::thread::sleep(std::time::Duration::from_millis(50));
-
-        engine.watchdog_once();
-
-        let write = engine.console.poll_pending_write();
-        assert_eq!(
-            write.as_deref(),
-            Some(&b"\n"[..]),
-            "watchdog must enqueue a blank-line probe while booting"
-        );
-        assert!(
-            !engine.state.heartbeat_pending,
-            "sending the probe clears the pending flag"
-        );
-        assert_eq!(engine.state.current(), TargetState::Booting);
+        engine.state.transition(TargetState::Active);
+        engine.heartbeat.age_for_test(Duration::from_secs(120));
+        engine.send_idle_heartbeat();
+        assert!(engine.console.poll_pending_write().is_none());
+        engine.heartbeat.shell_ready = true;
+        engine.record_serial_data(b"\r\n ");
+        engine.send_idle_heartbeat();
+        assert!(engine.console.poll_pending_write().is_none());
+        engine.heartbeat.age_for_test(Duration::from_secs(120));
+        engine.commands.set_write_fn(Box::new(|_| {}));
+        let rx = engine.queue_command("sleep 10", 30.0);
+        engine.send_idle_heartbeat();
+        assert!(engine.console.poll_pending_write().is_none());
+        engine.commands.cancel_all();
+        drop(rx);
+        engine.send_idle_heartbeat();
+        let sent = engine.console.poll_pending_write().unwrap();
+        assert!(String::from_utf8(sent).unwrap().contains("__SMCMD1_"));
+        engine.send_idle_heartbeat();
+        assert!(engine.console.poll_pending_write().is_none());
     }
 
-    /// A probe that could NOT be enqueued (write channel full) must NOT be
-    /// marked as sent — the pre-rework watchdog marked every probe "sent"
-    /// even when `sendline` silently dropped it, so three dropped probes
-    /// could declare a healthy DUT DUT-off with zero bytes ever reaching it.
     #[test]
-    fn test_watchdog_dropped_probe_is_not_marked_sent() {
+    fn configured_heartbeat_executes_and_can_be_removed_offline() {
         let tmp = TempDir::new().unwrap();
         let mut config = create_test_config(tmp.path());
-        config.values.insert("HANG_TIMEOUT".into(), "0".into());
+        config.values.insert(
+            "HEARTBEAT_COMMAND".into(),
+            "printf 'project-ready'; printf 'diagnostic' >&2; exit 7".into(),
+        );
         let mut engine = SerialEngine::new(config);
         engine.running = true;
         engine.console.set_open_for_test(true);
-        engine.state.transition(TargetState::Booting);
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        engine.state.transition(TargetState::Active);
+        engine.heartbeat.shell_ready = true;
+        engine.heartbeat.age_for_test(Duration::from_secs(120));
+        assert!(engine.send_idle_heartbeat());
+        let command = engine.console.poll_pending_write().unwrap();
+        let output = std::process::Command::new("sh")
+            .args(["-c", std::str::from_utf8(&command).unwrap().trim_end()])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        engine.heartbeat.receive(&output.stdout);
+        let state = engine.heartbeat.state();
+        assert_eq!(state["status"], "command_failed");
+        assert_eq!(state["sample"]["exit_code"], 7);
+        assert_eq!(state["sample"]["output"], "project-readydiagnostic");
+        let mut wire = b"root# ".to_vec();
+        wire.extend_from_slice(&command);
+        wire.extend_from_slice(&output.stdout);
+        wire.extend_from_slice(b"kernel diagnostic\n");
+        let mut clean = Vec::new();
+        crate::heartbeat::filter_log(wire.as_slice(), &mut clean).unwrap();
+        let clean = String::from_utf8(clean).unwrap();
+        assert!(clean.starts_with("root# "));
+        assert!(clean.ends_with("kernel diagnostic\n"));
+        assert!(!clean.contains("SMCMD"));
+        assert!(!clean.contains("SMHB"));
+        assert!(!clean.contains("project-ready"));
+    }
 
-        // Saturate the bounded write channel: every probe enqueue must fail.
+    #[test]
+    fn dropped_heartbeat_does_not_start_response_deadline() {
+        let tmp = TempDir::new().unwrap();
+        let mut engine = SerialEngine::new(create_test_config(tmp.path()));
+        engine.running = true;
+        engine.console.set_open_for_test(true);
+        engine.state.transition(TargetState::Active);
+        engine.heartbeat.shell_ready = true;
+        engine.heartbeat.age_for_test(Duration::from_secs(120));
         let sender = engine.console.write_sender();
         while sender.try_send(vec![0u8]).is_ok() {}
-
-        engine.watchdog_once();
-
-        assert!(
-            engine.state.heartbeat_pending,
-            "a dropped probe must stay pending so the watchdog retries it"
-        );
-        assert_eq!(
-            engine.state.heartbeat_missed(),
-            0,
-            "a probe that never reached the DUT must never count toward DUT-off"
-        );
-        assert_eq!(engine.state.current(), TargetState::Booting);
-
-        // Once the channel frees up, the next tick must deliver the probe and
-        // only then mark it sent.
+        engine.send_idle_heartbeat();
+        assert_eq!(engine.heartbeat.state()["status"], "not_probed");
         while engine.console.poll_pending_write().is_some() {}
-        engine.watchdog_once();
-        assert_eq!(
-            engine.console.poll_pending_write().as_deref(),
-            Some(&b"\n"[..]),
-            "after the channel frees up the probe must be enqueued"
-        );
-        assert!(
-            !engine.state.heartbeat_pending,
-            "a successfully enqueued probe clears the pending flag"
-        );
-        assert_eq!(engine.state.current(), TargetState::Booting);
+        engine.send_idle_heartbeat();
+        assert!(engine.console.poll_pending_write().is_some());
+        assert_eq!(engine.heartbeat.state()["status"], "pending");
     }
 
     /// Booting with recent data must produce no unsolicited prompt writes —
@@ -6051,7 +6499,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port().to_string();
-        for disabled in ["none", "disabled", " NONE "] {
+        for disabled in ["none", " NONE "] {
             let mut engine = engine_with(
                 tmp.path(),
                 &[

@@ -433,16 +433,6 @@ fn test_probe_dependency_graph_blocks_invalid_upstream_fields() {
         ports: vec![3000].into(),
         reference_log_path: "reference.log".into(),
         use_power: false,
-        #[cfg(feature = "direct-dut-probe")]
-        direct: DirectResetCycleProbe {
-            relay_host: "127.0.0.1".into(),
-            relay_port: 2000,
-            channel: 1,
-            serial_host: "127.0.0.1".into(),
-            serial_port: 2002,
-            save_path: "reference.log".into(),
-            reset_hold_ms: 10,
-        },
     };
     let dependencies = probe_dependencies(
         &FieldKey::DutAdvanced(0, 0, "monitor.reference_log"),
@@ -579,16 +569,6 @@ fn test_wrong_dev_host_blocks_dut_relay_and_reference_calls() {
                 ports: vec![0].into(),
                 reference_log_path: "unused".into(),
                 use_power: false,
-                #[cfg(feature = "direct-dut-probe")]
-                direct: DirectResetCycleProbe {
-                    relay_host: "127.0.0.1".into(),
-                    relay_port: 0,
-                    channel: 1,
-                    serial_host: "127.0.0.1".into(),
-                    serial_port: 0,
-                    save_path: "unused".into(),
-                    reset_hold_ms: 1,
-                },
             },
         ),
     ];
@@ -820,12 +800,10 @@ fn test_dev_ctrl_save_then_reinit_prefills() {
   // "serial":  { "port": 41000, "baudrate": 1500000, "rfc2217": false },
   // "target":  { "login_user": "root", "login_prompt": "" },
   // "uboot":   { "interrupt_char": "ctrl_c", "interrupt_strategy": "flood" },
-  // "relay":   { "type": "ch340", "reset_ch": 1, "power_off_time_ms": 3000 },
+  // "relay":   { "type": "ch340-relay", "reset_ch": 1, "power_off_time_ms": 3000 },
   // "monitor": { "hang_timeout": 60, "max_archived_logs": 10, "crash_keywords": ["Kernel panic"] },
   // "flash":   { "tool": "upgrade_tool", "upload_dir": "/tmp" },
   // "control": { "dev_ctrl": "" },
-  // "reference_log": "",       // back-compat top-level key (overrides monitor.reference_log)
-  // "dut_dir": ".dut-serial",  // back-compat top-level key
   // "lock_dir": "/tmp/sermcp/locks"   // top-level ONLY — never valid inside a dut
 }
 "#;
@@ -2506,18 +2484,6 @@ fn test_tab_and_ctrl_emacs_navigation_still_works() {
 // whole section while the relay buffers survive (per-DUT).
 
 #[test]
-fn classify_legacy_relay_type_normalizes_only_usb_relay() {
-    assert_eq!(normalize_relay_type("usb-relay"), "ch340-relay");
-    assert_eq!(normalize_relay_type(" USB-RELAY "), "ch340-relay");
-    // Unknown and current names pass through byte-for-byte: no silent
-    // case rewriting beyond the one retired alias.
-    assert_eq!(normalize_relay_type("ch340"), "ch340");
-    assert_eq!(normalize_relay_type("ch340-relay"), "ch340-relay");
-    assert_eq!(normalize_relay_type("none"), "none");
-    assert_eq!(normalize_relay_type("mystery"), "mystery");
-}
-
-#[test]
 fn test_relay_gate_prefills_yes_from_existing_relay() {
     let _guard = lock_env();
     let tmp = tempfile::TempDir::new().unwrap();
@@ -2534,7 +2500,7 @@ fn test_relay_gate_prefills_yes_from_existing_relay() {
         {
           "dut_name": "dut1",
           "serial": { "port": 41002 },
-          "relay": { "type": "usb-relay", "port": 2011, "reset_ch": 2 }
+          "relay": { "type": "ch340-relay", "port": 2011, "reset_ch": 2 }
         },
         { "dut_name": "dut2", "serial": { "port": 41003 } }
       ]
@@ -2557,9 +2523,6 @@ fn test_relay_gate_prefills_yes_from_existing_relay() {
             .values
             .get(&FieldKey::DutRelayType(0, 0))
             .map(String::as_str),
-        // The legacy `usb-relay` backend no longer exists; seeding must
-        // repair it to the surviving equivalent, not round-trip a value
-        // that config validation rejects at server start.
         Some("ch340-relay")
     );
     assert_eq!(
@@ -2636,149 +2599,35 @@ fn test_zero_hosts_hides_dut_controls() {
 // ── Select fields / editor ─────────────────────────────────────────
 
 #[test]
-fn test_select_field_cycle_digit_jump_free_text() {
+fn relay_type_select_cycles_and_accepts_only_valid_shortcuts() {
     let mut state = create_state(&quick());
-    state.focus = FocusSlot::Field(FieldKey::DutRelayType(0, 0));
-    let options: Vec<String> = state
+    let field = FieldKey::DutRelayType(0, 0);
+    state.focus = FocusSlot::Field(field.clone());
+    let options = state
         .fields
         .iter()
-        .find(|f| f.key == FieldKey::DutRelayType(0, 0))
+        .find(|candidate| candidate.key == field)
         .unwrap()
         .options
         .clone();
-    assert!(!options.is_empty());
-    handle_form_key(&mut state, key(KeyCode::Down));
-    assert_eq!(
-        state
-            .values
-            .get(&FieldKey::DutRelayType(0, 0))
-            .map(String::as_str),
-        Some(options[0].as_str())
-    );
-    handle_form_key(&mut state, key(KeyCode::Down));
-    assert_eq!(
-        state
-            .values
-            .get(&FieldKey::DutRelayType(0, 0))
-            .map(String::as_str),
-        Some(options[1].as_str())
-    );
-    handle_form_key(&mut state, key(KeyCode::Up));
-    assert_eq!(
-        state
-            .values
-            .get(&FieldKey::DutRelayType(0, 0))
-            .map(String::as_str),
-        Some(options[0].as_str())
-    );
-    handle_form_key(&mut state, chr('3'));
-    assert_eq!(
-        state
-            .values
-            .get(&FieldKey::DutRelayType(0, 0))
-            .map(String::as_str),
-        Some(options[2].as_str())
-    );
-    handle_form_key(&mut state, chr('x'));
-    assert_eq!(
-        state
-            .values
-            .get(&FieldKey::DutRelayType(0, 0))
-            .map(String::as_str),
-        Some(options[2].as_str()),
-        "STRICT select: 'x' is ignored — the value stays on the option"
-    );
-    handle_form_key(&mut state, chr('y'));
-    assert_eq!(
-        state
-            .values
-            .get(&FieldKey::DutRelayType(0, 0))
-            .map(String::as_str),
-        Some(options[2].as_str()),
-        "STRICT select: 'y' is ignored too — the value never changes"
-    );
-}
 
-#[test]
-fn test_select_field_digits_insert_during_free_text() {
-    let mut state = create_state(&quick());
-    state.focus = FocusSlot::Field(FieldKey::DutRelayType(0, 0));
-    let options: Vec<String> = state
-        .fields
-        .iter()
-        .find(|f| f.key == FieldKey::DutRelayType(0, 0))
-        .unwrap()
-        .options
-        .clone();
-    assert!(
-        options.len() < 9,
-        "the out-of-range digit case needs fewer than 9 options"
-    );
-    handle_form_key(&mut state, chr('1'));
+    for (input, expected) in [
+        (key(KeyCode::Down), &options[0]),
+        (key(KeyCode::Down), &options[1]),
+        (key(KeyCode::Up), &options[0]),
+        (chr('2'), &options[1]),
+        (chr('9'), &options[1]),
+        (chr('0'), &options[1]),
+        (chr('x'), &options[1]),
+    ] {
+        handle_form_key(&mut state, input);
+        assert_eq!(state.values.get(&field), Some(expected));
+    }
     assert_eq!(
-        state
-            .values
-            .get(&FieldKey::DutRelayType(0, 0))
-            .map(String::as_str),
-        Some(options[0].as_str()),
-        "empty buffer: digit 1 jumps to the first option"
+        state.editors.get(&field).unwrap().0,
+        options[1].chars().count()
     );
-    handle_form_key(&mut state, chr('c'));
-    handle_form_key(&mut state, chr('h'));
-    handle_form_key(&mut state, chr('3'));
-    assert_eq!(
-        state
-            .values
-            .get(&FieldKey::DutRelayType(0, 0))
-            .map(String::as_str),
-        Some(options[2].as_str()),
-        "STRICT select: 'c'/'h' are ignored, digit 3 jumps to options[2]"
-    );
-    handle_form_key(&mut state, chr('4'));
-    assert_eq!(
-        state
-            .values
-            .get(&FieldKey::DutRelayType(0, 0))
-            .map(String::as_str),
-        Some(options[3].as_str()),
-        "STRICT select: digit 4 is the options[3] shortcut"
-    );
-    handle_form_key(&mut state, chr('0'));
-    assert_eq!(
-        state
-            .values
-            .get(&FieldKey::DutRelayType(0, 0))
-            .map(String::as_str),
-        Some(options[3].as_str()),
-        "STRICT select: '0' is ignored — only options are settable"
-    );
-    assert_eq!(
-        state
-            .editors
-            .get(&FieldKey::DutRelayType(0, 0))
-            .copied()
-            .unwrap()
-            .0,
-        options[3].chars().count(),
-        "cursor sits at the picked option's end"
-    );
-    assert_eq!(
-        state.focus,
-        FocusSlot::Field(FieldKey::DutRelayType(0, 0)),
-        "focus never moved"
-    );
-    // Out-of-range digit: silently ignored — the choice set is
-    // CLOSED , nothing ever seeds the buffer.
-    let mut state = create_state(&quick());
-    state.focus = FocusSlot::Field(FieldKey::DutRelayType(0, 0));
-    let out = char::from_digit(options.len() as u32 + 1, 10).unwrap();
-    handle_form_key(&mut state, chr(out));
-    handle_form_key(&mut state, chr('r'));
-    assert_eq!(
-        state.values.get(&FieldKey::DutRelayType(0, 0)),
-        None,
-        "STRICT select: out-of-range digit and free chars are ignored"
-    );
+    assert_eq!(state.focus, FocusSlot::Field(field));
 }
 
 #[test]
@@ -3709,65 +3558,6 @@ fn test_save_button_and_footer_hints_hidden_by_default() {
 // dut name / dev_ctrl (no separate type row) / login pass / (ms)
 // units / supported controller types hint.
 
-/// `first_reference_lines`: N meaningful lines, CR/blank stripped —
-/// the exact window the relay cycle saves as the similarity seed.
-#[cfg(feature = "direct-dut-probe")]
-#[test]
-fn test_first_reference_lines_window() {
-    let raw = b"\r\nser2net port tcp\r\nU-Boot 2023.10\r\n\r\nDRAM: 2 GiB\r\n";
-    let lines = first_reference_lines(raw, 50);
-    assert_eq!(lines, ["ser2net port tcp", "U-Boot 2023.10", "DRAM: 2 GiB"]);
-    assert_eq!(first_reference_lines(raw, 2).len(), 2, "bounded window");
-}
-
-/// RFC 2217 SET_BAUDRATE acknowledgement parsing (big-endian rate,
-/// terminated by IAC SE).
-#[cfg(feature = "direct-dut-probe")]
-#[test]
-fn test_rfc2217_baud_ack_parsing() {
-    let ack = [0xff, 0xfa, 44, 101, 0x00, 0x16, 0xe3, 0x60, 0xff, 0xf0];
-    assert_eq!(rfc2217_baud_ack(&ack), Some(1_500_000));
-    // Buried in negotiation traffic.
-    let noisy = [0xffu8, 0xfb, 0x2c]
-        .iter()
-        .copied()
-        .chain(ack)
-        .collect::<Vec<_>>();
-    assert_eq!(rfc2217_baud_ack(&noisy), Some(1_500_000));
-    assert_eq!(rfc2217_baud_ack(&[0xff, 0xfb, 0x2c]), None);
-    assert_eq!(rfc2217_baud_ack(b""), None);
-}
-
-/// The per-channel relay liveness probe: a fake ch340 relay answers
-/// the STATUS packet → Ok; a silent listener → Err.
-#[cfg(feature = "direct-dut-probe")]
-#[test]
-fn test_relay_channel_status_probe() {
-    use std::io::{Read, Write};
-    use std::net::TcpListener;
-    let l = TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = l.local_addr().unwrap().port();
-    std::thread::spawn(move || {
-        let (mut sock, _) = l.accept().unwrap();
-        let mut b = [0u8; 4];
-        sock.read_exact(&mut b).unwrap();
-        // Echo a status reply (any bytes count as a live relay).
-        sock.write_all(&[0xa0, b[1], 0x05, 0x00]).unwrap();
-    });
-    assert_eq!(
-        probe_relay_channel_status("127.0.0.1", port, 1),
-        ProbeMark::Ok
-    );
-    // Nothing listening → Err.
-    let dead = TcpListener::bind("127.0.0.1:0").unwrap();
-    let dead_port = dead.local_addr().unwrap().port();
-    drop(dead);
-    assert_eq!(
-        probe_relay_channel_status("127.0.0.1", dead_port, 1),
-        ProbeMark::Err
-    );
-}
-
 /// dev_ctrl = ch340-relay makes the relay port and the reset test
 /// MANDATORY: a missing port fails both rows (✗), never skips
 /// (user rule).
@@ -3952,7 +3742,7 @@ fn test_serial_port_is_mandatory_and_none_ctrl_skips_relay_tests() {
 #[test]
 fn test_mcp_ports_for_dut_uses_project_singleton_port() {
     let cwd = std::path::Path::new("/tmp/example-project");
-    let per_dut = sermcp::ports::project_dut_mcp_port(cwd, "board1");
+    let per_dut = sermcp::ports::project_mcp_port(cwd);
     let project = sermcp::ports::project_mcp_port(cwd);
     let ports = mcp_ports_for_dut(cwd, "board1");
     assert_eq!(per_dut, project, "DUT entries share the project MCP port");
@@ -4078,35 +3868,6 @@ fn test_mcp_routing_arms_reference_and_uboot_rows() {
     );
 }
 
-/// The strict prompt check: boot-log debris containing "=>" never
-/// matches; only a trailing standalone "=>" line does.
-#[cfg(feature = "direct-dut-probe")]
-#[test]
-fn test_ends_at_uboot_prompt_strict() {
-    assert!(ends_at_uboot_prompt(
-        b"U-Boot 2023.10\r\nboard=>something\r\n=> "
-    ));
-    assert!(!ends_at_uboot_prompt(b"board=>something\r\nbooting..."));
-    assert!(!ends_at_uboot_prompt(
-        b"=> in the middle\r\nmore output\r\n"
-    ));
-    assert!(!ends_at_uboot_prompt(b""));
-}
-
-/// Interrupt-char parsing mirrors Config::uboot_interrupt_char.
-#[cfg(feature = "direct-dut-probe")]
-#[test]
-fn test_parse_interrupt_char() {
-    assert_eq!(parse_interrupt_char("ctrl+c"), 0x03);
-    assert_eq!(parse_interrupt_char("ctrl_c"), 0x03);
-    assert_eq!(parse_interrupt_char("0x03"), 0x03);
-    assert_eq!(parse_interrupt_char("2"), b'2');
-    assert_ne!(parse_interrupt_char("2"), 0x02);
-    assert_eq!(parse_interrupt_char("c"), b'c');
-    assert_eq!(parse_interrupt_char("0x1b"), 0x1b);
-    assert_eq!(parse_interrupt_char("junk"), 0x03);
-}
-
 #[test]
 fn test_software_uboot_probe_passes_ctrl_c_from_the_form() {
     let args = uboot_probe_arguments("ctrl_c", true);
@@ -4122,86 +3883,6 @@ fn test_hardware_uboot_probe_passes_interrupt_char_from_the_form() {
     assert_eq!(args["restart"], "hardware");
     assert_eq!(args["interrupt_char"], "0x03");
     assert_eq!(args["flood_duration_secs"], 10.0);
-}
-
-/// U-Boot interrupt probe against local fakes: the fake serial emits
-/// an autoboot countdown after release and stops at `=>` ONLY when it
-/// receives the interrupt char — proving the flood works end-to-end.
-#[cfg(feature = "direct-dut-probe")]
-#[test]
-fn test_uboot_interrupt_probe_stops_at_prompt() {
-    use std::io::{Read, Write};
-    use std::net::TcpListener;
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
-
-    let relay_l = TcpListener::bind("127.0.0.1:0").unwrap();
-    let serial_l = TcpListener::bind("127.0.0.1:0").unwrap();
-    let relay_port = relay_l.local_addr().unwrap().port();
-    let serial_port = serial_l.local_addr().unwrap().port();
-    let released = Arc::new(AtomicBool::new(false));
-
-    let rel = released.clone();
-    std::thread::spawn(move || {
-        let (mut sock, _) = relay_l.accept().unwrap();
-        let mut b = [0u8; 4];
-        while let Ok(n) = sock.read(&mut b) {
-            if n == 0 {
-                break;
-            }
-            if b[2] == sermcp::power_control::RELAY_OP_OFF {
-                rel.store(true, Ordering::SeqCst);
-            }
-        }
-    });
-    std::thread::spawn(move || {
-        let (mut sock, _) = serial_l.accept().unwrap();
-        let _ = sock.set_read_timeout(Some(std::time::Duration::from_millis(50)));
-        let mut sink = [0u8; 256];
-        while !released.load(Ordering::SeqCst) {
-            let _ = sock.read(&mut sink);
-        }
-        // Boot output INCLUDING debris that merely contains "=>" —
-        // the loose old check false-passed on this (field-observed: a
-        // fake test).
-        sock.write_all(b"U-Boot 2023.10\r\nboard=>something debris\r\n")
-            .unwrap();
-        sock.write_all(b"Hit any key to stop autoboot: 3 2 1\r\n")
-            .unwrap();
-        // ...and stop ONLY on the interrupt char (0x03).
-        let mut stopped = false;
-        loop {
-            match sock.read(&mut sink) {
-                Ok(n) if n > 0 => {
-                    if !stopped && sink[..n].contains(&0x03) {
-                        stopped = true;
-                        sock.write_all(b"\r\n=> ").unwrap();
-                    } else if stopped {
-                        // Interactive proof: a command gets a REAL
-                        // U-Boot reply + a fresh prompt.
-                        sock.write_all(b"\r\nU-Boot 2023.10 (Jan 01 2025)\r\n=> ")
-                            .unwrap();
-                    }
-                }
-                _ => {}
-            }
-        }
-    });
-
-    let mark = probe_uboot_interrupt(
-        "127.0.0.1",
-        relay_port,
-        1,
-        "127.0.0.1",
-        serial_port,
-        0x03,
-        50,
-    );
-    assert_eq!(
-        mark,
-        ProbeMark::Ok,
-        "flood stopped autoboot AND the interactive version reply proved the command line"
-    );
 }
 
 /// When the relay reset channel is configured, the EMPTY
@@ -4330,26 +4011,6 @@ fn test_reference_log_grays_until_test_passes() {
     );
 }
 
-/// Real boots vary in volatile values (DDR training results, counts)
-/// but keep identical structure — the masked stability gate passes
-/// them (field-observed: unmasked never reached 0.93).
-#[cfg(feature = "direct-dut-probe")]
-#[test]
-fn test_reference_stability_masks_volatile_values() {
-    let a = "DDR 2f85f4b2d4 cym 25/07/17-09:48.04,fwver: v1.09\nch0 ttot10\nch1 ttot16\nIn\nlpddr5 nt 512\n";
-    let b = "DDR 9a12cc77e1 cym 25/07/17-11:02.31,fwver: v1.09\nch0 ttot12\nch1 ttot16\nIn\nlpddr5 nt 512\n";
-    let c = "DDR 4477ab9055 cym 25/07/17-14:22.59,fwver: v1.09\nch0 ttot10\nch1 ttot18\nIn\nlpddr5 nt 512\n";
-    assert!(
-        reference_is_stable(&[a.into(), b.into(), c.into()]),
-        "structure-identical boots with volatile values are stable"
-    );
-    let d = "U-Boot 2023.10\nDRAM: 2 GiB\nKernel cmdline boot=mmc\n";
-    assert!(
-        !reference_is_stable(&[a.into(), d.into()]),
-        "genuinely different outputs are NOT stable"
-    );
-}
-
 #[test]
 fn test_ssh_host_key_change_detection_is_narrow() {
     assert!(ssh_host_key_changed(
@@ -4363,102 +4024,6 @@ fn test_ssh_host_key_change_detection_is_narrow() {
         b"ssh: connect to host host.invalid port 22: Connection refused\n"
     ));
     assert!(!ssh_host_key_changed(b"Host key verification failed.\n"));
-}
-
-/// The press-window noise judge ignores the ser2net connect banner
-/// and telnet IAC handshake; real board output counts as noise.
-#[cfg(feature = "direct-dut-probe")]
-#[test]
-fn test_meaningful_serial_noise_ignores_banner_and_iac() {
-    // Real capture shape: IAC negotiations + banner, nothing else.
-    let connect_only =
-        b"\xff\xfb\x03\xff\xfd\x03\r\nser2net port telnet(rfc2217),tcp,41002 device\r\n\r\n";
-    assert!(
-        !meaningful_serial_noise(connect_only),
-        "banner is not noise"
-    );
-    // Board output while pressed IS noise (wrong channel / no reset).
-    assert!(
-        meaningful_serial_noise(b"\r\nU-Boot 2023.10\r\n"),
-        "board talk is noise"
-    );
-    assert!(!meaningful_serial_noise(b""), "silence is silence");
-}
-
-/// Full relay reset cycle against local fakes: a fake relay (4-byte
-/// ch340 protocol) whose OFF triggers a fake serial to emit boot
-/// lines — press must observe silence, release must capture, and the
-/// first REFERENCE_LINES lines must land in the save file.
-#[cfg(feature = "direct-dut-probe")]
-#[test]
-fn test_relay_reset_cycle_saves_reference_log() {
-    use std::io::{Read, Write};
-    use std::net::TcpListener;
-    use std::sync::Arc;
-    use std::sync::atomic::Ordering;
-
-    let relay_l = TcpListener::bind("127.0.0.1:0").unwrap();
-    let serial_l = TcpListener::bind("127.0.0.1:0").unwrap();
-    let relay_port = relay_l.local_addr().unwrap().port();
-    let serial_port = serial_l.local_addr().unwrap().port();
-    // Fake relay: every OP_OFF bumps the release counter.
-    let releases = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let rel = releases.clone();
-    std::thread::spawn(move || {
-        let (mut sock, _) = relay_l.accept().unwrap();
-        let mut b = [0u8; 4];
-        while let Ok(n) = sock.read(&mut b) {
-            if n == 0 {
-                break;
-            }
-            if b[2] == sermcp::power_control::RELAY_OP_OFF {
-                rel.fetch_add(1, Ordering::SeqCst);
-            }
-        }
-    });
-    // Fake serial: silent while pressed; on EVERY release emit the
-    // same deterministic boot burst (3 cycles in the probe).
-    let rel = releases.clone();
-    std::thread::spawn(move || {
-        let (mut sock, _) = serial_l.accept().unwrap();
-        let _ = sock.set_read_timeout(Some(std::time::Duration::from_millis(50)));
-        let mut sink = [0u8; 1024];
-        let mut seen = 0usize;
-        loop {
-            let cur = rel.load(Ordering::SeqCst);
-            if cur > seen {
-                seen = cur;
-                let mut boot = String::new();
-                // A stale leftover LINE first — the probe's
-                // alignment step must drop it before the boot window.
-                boot.push_str("stale-leftover-line\r\n");
-                for i in 0..80 {
-                    boot.push_str(&format!("boot line {i:03}\r\n"));
-                }
-                if sock.write_all(boot.as_bytes()).is_err() {
-                    break;
-                }
-            }
-            let _ = sock.read(&mut sink);
-        }
-    });
-
-    let tmp = tempfile::TempDir::new().unwrap();
-    let save = tmp.path().join("dut-x/reference-boot.log");
-    let mark = probe_relay_reset_cycle(
-        "127.0.0.1",
-        relay_port,
-        1,
-        "127.0.0.1",
-        serial_port,
-        &save,
-        50,
-    );
-    assert_eq!(mark, ProbeMark::Ok, "press silent + release captured");
-    let saved = std::fs::read_to_string(&save).unwrap();
-    let count = saved.lines().count();
-    assert_eq!(count, REFERENCE_LINES, "exactly the reference window saved");
-    assert!(saved.starts_with("boot line 000"), "first boot line first");
 }
 
 /// User-visible blank under none: with dev_ctrl = none
@@ -5151,16 +4716,6 @@ fn reset_cycle_probe_surfaces_the_server_error() {
         .into(),
         reference_log_path: "/dev/null".into(),
         use_power: false,
-        #[cfg(feature = "direct-dut-probe")]
-        direct: DirectResetCycleProbe {
-            relay_host: "127.0.0.1".into(),
-            relay_port: 1,
-            channel: 1,
-            serial_host: "127.0.0.1".into(),
-            serial_port: 1,
-            save_path: std::path::PathBuf::from("/dev/null"),
-            reset_hold_ms: 1,
-        },
     };
     let outcome = run_probe_with_detail(target, &SshMemoInner::default());
     assert_eq!(outcome.mark, ProbeMark::Skip);
@@ -5786,6 +5341,81 @@ fn test_up_cycles_select_backwards_with_wrap() {
 // DURING a TEST run (because it blocks the temporary test server). Outside a run
 // the title stays plain: this project's own MCP holding the endpoint is
 // the normal state, not a warning. Matching is per (host ip, serial port).
+
+#[tokio::test(flavor = "current_thread")]
+async fn terminal_reuse_checks_live_endpoint_after_saved_config_changes() {
+    use std::io::{Read, Write};
+    let project = tempfile::tempdir().unwrap();
+    let runtime = project.path().join(".dut-serial");
+    std::fs::create_dir(&runtime).unwrap();
+    let saved = project.path().join(".target.jsonc");
+    std::fs::write(&saved, r#"{"serial":{"baudrate":115200},"dev_hosts":[{"ip":"192.168.1.105","duts":[{"dut_name":"yr3588","serial":{"port":2010}}]}]}"#).unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let pid = std::process::id();
+    std::fs::write(runtime.join("mcp.pid"), pid.to_string()).unwrap();
+    std::fs::write(
+        runtime.join("inventory.json"),
+        serde_json::json!({
+            "mcp_pid":pid,"mcp_http_port":port,"project_dir":project.path(),
+            "config_path":saved,"duts":[{"dut_name":"yr3588"}]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let server = std::thread::spawn(move || {
+        for (serial_port, owned, removed) in [
+            (2002, true, false),
+            (2010, false, true),
+            (2010, true, false),
+        ] {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(3)))
+                .unwrap();
+            let mut request = [0; 4096];
+            let count = stream.read(&mut request).unwrap();
+            assert!(
+                String::from_utf8_lossy(&request[..count])
+                    .starts_with("GET /health?dut=yr3588 HTTP/1.1")
+            );
+            let mut body = serde_json::json!({"serial":{
+                "host":"192.168.1.105","port":serial_port.to_string(),"owned":owned
+            }});
+            if removed {
+                body["serial_error"] = serde_json::json!({"code":"dut_removed"});
+            }
+            let body = body.to_string();
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+        }
+    });
+    let ports = DutPorts {
+        ports: vec![port],
+        dut: Some("yr3588".into()),
+        project: None,
+    };
+    // Disk configuration already says 2010; it cannot prove what the live
+    // server loaded before the edit.
+    assert!(!terminal_server_matches(
+        project.path(),
+        "yr3588",
+        &ports,
+        &saved
+    ));
+    assert!(!terminal_server_matches(
+        project.path(),
+        "yr3588",
+        &ports,
+        &saved
+    ));
+    assert!(terminal_server_matches(
+        project.path(),
+        "yr3588",
+        &ports,
+        &saved
+    ));
+    server.join().unwrap();
+}
 
 #[test]
 fn test_reuse_project_mcp_for_unchanged_form_and_preserve_owner() {
@@ -6690,41 +6320,4 @@ fn power_key_row_is_separate_and_survives_config_rendering() {
     let relay = parsed.dev_hosts[0].duts[0].relay.as_ref().unwrap();
     assert_eq!(relay.power_ch, Some(3));
     assert_eq!(relay.power_key_ch, Some(4));
-}
-
-#[test]
-fn power_key_alias_can_be_updated_and_removed_without_duplicate_fields() {
-    let _guard = lock_env();
-    let tmp = tempfile::TempDir::new().unwrap();
-    std::fs::write(
-        tmp.path().join(".target.jsonc"),
-        r#"{
-        "dev_hosts":[{"ip":"127.0.0.1","duts":[{
-            "dut_name":"board","serial":{"port":2002},
-            "control":{"dev_ctrl":"ch340-relay"},
-            "relay":{"power_ch":3,"power_key_channel":4}
-        }]}]
-    }"#,
-    )
-    .unwrap();
-    let prepared = prepare_init(tmp.path(), &quick()).unwrap();
-    for (value, expected) in [("2", Some(2)), ("0", None)] {
-        let mut state = FormState::new(
-            prepared.schema.clone(),
-            prepared.target_path.display().to_string(),
-        );
-        state.set_value(FieldKey::DutRelayPowerKey(0, 0), value.into());
-        let answers = resolve_answers(
-            &state.schema,
-            &state.submit_values(),
-            state.gate,
-            NamePolicy::ErrorOnCollision,
-        )
-        .unwrap();
-        let text = init::render_test_config(&prepared, &answers).unwrap();
-        let parsed = sermcp::config::parse_jsonc_text(&text).unwrap();
-        let relay = parsed.dev_hosts[0].duts[0].relay.as_ref().unwrap();
-        assert_eq!(relay.power_key_ch, expected);
-        assert_eq!(relay.power_ch, Some(3));
-    }
 }

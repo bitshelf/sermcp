@@ -24,12 +24,12 @@ pub const DEFAULT_MAX_LOG_FILE_SIZE_MB: u64 = 100;
 /// Resolve the power-control backend. Explicitly disabled `control.dev_ctrl`
 /// overrides `relay.type`; otherwise `relay.type` wins when present.
 /// When it is absent, `control.dev_ctrl` doubles as the selector — the only
-/// selectable values are the built-in ch340-relay, or none/disabled to
-/// disable power control entirely (usb-relay and the external
-/// dev-ctl program backend were removed).
+/// selectable values are the built-in ch340-relay, or none to disable power
+/// control entirely (usb-relay and the external dev-ctl program backend
+/// were removed).
 fn resolve_relay_type(relay_type: &str, dev_ctl: &str) -> String {
     let dev_ctl = dev_ctl.trim().to_ascii_lowercase();
-    if matches!(dev_ctl.as_str(), "none" | "disabled") {
+    if dev_ctl == "none" {
         return dev_ctl;
     }
     let explicit = relay_type.trim();
@@ -37,8 +37,8 @@ fn resolve_relay_type(relay_type: &str, dev_ctl: &str) -> String {
         return explicit.to_string();
     }
     match dev_ctl.as_str() {
-        "" => "ch340".into(),
-        "ch340" | "ch340-relay" | "none" | "disabled" => dev_ctl.to_ascii_lowercase(),
+        "" => "ch340-relay".into(),
+        "ch340-relay" => dev_ctl,
         // Anything else is NOT a valid backend selector anymore — hand it
         // back verbatim so validation rejects it as unsupported instead of
         // silently mapping it to the external program backend (removed).
@@ -576,12 +576,6 @@ pub struct JsoncSections {
     /// behavior; "uefi" is a not-yet-implemented stub (the wizard shows
     /// "Not implemented" when selected). Not yet consumed by the runtime.
     pub loader: Option<String>,
-    /// Backward-compat `reference_log` key (file top level or inside a
-    /// DUT). Overrides `monitor.reference_log` when both are set,
-    /// matching the historical global parser precedence.
-    pub reference_log: Option<String>,
-    /// Backward-compat `dut_dir` key (file top level or inside a DUT).
-    pub dut_dir: Option<String>,
 }
 
 /// Root `.target.jsonc` document. Top-level sections are GLOBAL fallbacks
@@ -610,10 +604,6 @@ pub struct TargetJsoncConfig {
     /// Boot loader type (global fallback): "uboot" | "uefi". "uefi" is a
     /// not-yet-implemented stub; "uboot" is the current behavior.
     pub loader: Option<String>,
-    /// Backward-compat `reference_log` key (top level).
-    pub reference_log: Option<String>,
-    /// Backward-compat `dut_dir` key (top level).
-    pub dut_dir: Option<String>,
     /// Top-level ONLY — never valid inside a DUT (denied by the DUT's own
     /// `deny_unknown_fields`).
     pub lock_dir: Option<String>,
@@ -658,10 +648,6 @@ pub struct JsoncDut {
     /// Boot loader type (DUT override): "uboot" | "uefi". "uefi" is a
     /// not-yet-implemented stub; "uboot" is the current behavior.
     pub loader: Option<String>,
-    /// Backward-compat `reference_log` key (inside a DUT).
-    pub reference_log: Option<String>,
-    /// Backward-compat `dut_dir` key (inside a DUT).
-    pub dut_dir: Option<String>,
 }
 
 #[derive(Default, Debug, Clone, serde::Deserialize)]
@@ -718,15 +704,11 @@ pub struct JsoncRelay {
     pub relay_type: Option<String>,
     pub port: Option<u16>,
     pub ip: Option<String>,
-    #[serde(alias = "reset_channel")]
     pub reset_ch: Option<u8>,
-    #[serde(alias = "download_channel")]
     pub download_ch: Option<u8>,
     /// Supply switching channel, distinct from the sleep/wake key.
-    #[serde(alias = "power_channel")]
     pub power_ch: Option<u8>,
     /// Momentary sleep/wake key channel.
-    #[serde(alias = "power_key_channel")]
     pub power_key_ch: Option<u8>,
     /// Minimum USB relay reset pulse time in ms. Overrides Cargo.toml
     /// default (3000). 0 or missing → use compile-time default.
@@ -735,9 +717,49 @@ pub struct JsoncRelay {
     pub power_off_time_ms: Option<u64>,
 }
 
+/// Editable heartbeat scripts; lists stop on the first failed command.
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[serde(untagged)]
+pub enum HeartbeatCommand {
+    Script(String),
+    Commands(Vec<String>),
+}
+
+impl HeartbeatCommand {
+    pub fn script(&self) -> String {
+        match self {
+            Self::Script(script) => script.clone(),
+            Self::Commands(commands) => commands
+                .iter()
+                .filter(|command| !command.trim().is_empty())
+                .map(|command| format!("{{\n{command}\n}}"))
+                .collect::<Vec<_>>()
+                .join(" &&\n"),
+        }
+    }
+
+    /// Accept a JSON array in the single-line editor, or a legacy shell script.
+    pub fn from_editor(value: &str) -> Self {
+        serde_json::from_str::<Vec<String>>(value)
+            .map(Self::Commands)
+            .unwrap_or_else(|_| Self::Script(value.to_owned()))
+    }
+
+    pub fn editor_value(&self) -> String {
+        match self {
+            Self::Script(script) => script.clone(),
+            Self::Commands(commands) => {
+                serde_json::to_string(commands).expect("serializing a string array cannot fail")
+            }
+        }
+    }
+}
+
 #[derive(Default, Debug, Clone, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct JsoncMonitor {
+    /// Optional POSIX-shell heartbeat probe; empty uses built-in telemetry.
+    pub heartbeat_command: Option<HeartbeatCommand>,
     pub hang_timeout: Option<u64>,
     pub hang_hysteresis: Option<u32>,
     pub boot_window_secs: Option<u64>,
@@ -752,8 +774,6 @@ pub struct JsoncMonitor {
     pub learner_crash_threshold: Option<f64>,
     /// Custom crash keywords for boot log scanning. Each string is matched as
     /// a substring (not regex). Defaults from Cargo.toml [package.metadata.learn].
-    /// The old spelling `crash_patterns` keeps parsing via the serde alias.
-    #[serde(alias = "crash_patterns")]
     pub crash_keywords: Option<Vec<String>>,
 }
 
@@ -763,16 +783,11 @@ pub struct JsoncFlash {
     pub full_image_cmd: Option<String>,
     pub kernel_image_cmd: Option<String>,
     pub loader_bin: Option<String>,
-    /// Legacy spelling of `download.loader_cmd` (migration fallback).
-    pub loader_cmd: Option<String>,
-    /// Legacy spelling of `download.list_devices_cmd`.
-    pub list_devices_cmd: Option<String>,
 }
 
 /// Download-mode entry overlay. Only the provider's platform commands
 /// are overlay-able here; a missing field uses the selected
-/// DownloadProvider's default. (Legacy `flash.loader_cmd` /
-/// `flash.list_devices_cmd` are read as a migration fallback.)
+/// DownloadProvider's default.
 #[derive(Default, Debug, Clone, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct JsoncDownload {
@@ -798,8 +813,6 @@ impl From<&TargetJsoncConfig> for JsoncSections {
             download: t.download.clone(),
             control: t.control.clone(),
             loader: t.loader.clone(),
-            reference_log: t.reference_log.clone(),
-            dut_dir: t.dut_dir.clone(),
         }
     }
 }
@@ -816,8 +829,6 @@ impl From<&JsoncDut> for JsoncSections {
             download: dut.download.clone(),
             control: dut.control.clone(),
             loader: dut.loader.clone(),
-            reference_log: dut.reference_log.clone(),
-            dut_dir: dut.dut_dir.clone(),
         }
     }
 }
@@ -903,10 +914,8 @@ impl JsoncSections {
             if let Some(ref v) = r.ip {
                 cfg.insert("RELAY_IP".into(), v.clone());
             }
-            // ch/channel spellings collapse into ONE field via the serde
-            // alias (both present = loud duplicate-field error). The
-            // ZERO-FILTERED rule applies on BOTH paths: an explicit 0 can
-            // never shadow a non-zero global channel.
+            // The ZERO-FILTERED rule applies on BOTH paths: an explicit 0
+            // can never shadow a non-zero global channel.
             if let Some(v) = r.reset_ch.filter(|&c| c > 0) {
                 cfg.insert("RESET_CHANNEL".into(), v.to_string());
             }
@@ -927,6 +936,9 @@ impl JsoncSections {
             }
         }
         if let Some(ref m) = self.monitor {
+            if let Some(command) = &m.heartbeat_command {
+                cfg.insert("HEARTBEAT_COMMAND".into(), command.script());
+            }
             if let Some(v) = m.hang_timeout {
                 cfg.insert("HANG_TIMEOUT".into(), v.to_string());
             }
@@ -967,15 +979,7 @@ impl JsoncSections {
             if let Some(ref v) = f.loader_bin {
                 cfg.insert("FLASH_LOADER_BIN".into(), v.clone());
             }
-            if let Some(ref v) = f.loader_cmd {
-                cfg.insert("FLASH_LOADER_CMD".into(), v.clone());
-            }
-            if let Some(ref v) = f.list_devices_cmd {
-                cfg.insert("FLASH_LIST_DEVICES_CMD".into(), v.clone());
-            }
         }
-        // The download overlay wins over the legacy flash spelling at the
-        // SAME level; the DUT/global merge order resolves the rest.
         if let Some(ref d) = self.download {
             if let Some(ref v) = d.loader_cmd {
                 cfg.insert("FLASH_LOADER_CMD".into(), v.clone());
@@ -989,13 +993,6 @@ impl JsoncSections {
         {
             cfg.insert("DEV_CTL".into(), v.clone());
         }
-        // Back-compat top-level/per-DUT keys override the section spelling.
-        if let Some(ref v) = self.reference_log {
-            cfg.insert("REFERENCE_LOG".into(), v.clone());
-        }
-        if let Some(ref v) = self.dut_dir {
-            cfg.insert("DUT_DIR".into(), v.clone());
-        }
         cfg
     }
 }
@@ -1003,43 +1000,10 @@ impl JsoncSections {
 // ── JSONC parsing ─────────────────────────────────────────────────────
 
 /// Parse JSONC text into the schema struct. Errors name the offending key
-/// (serde `deny_unknown_fields` / duplicate-field / type errors); the renamed
-/// TOML-era `alias` keys additionally get a what-to-do hint.
+/// (serde `deny_unknown_fields` / duplicate-field / type errors).
 pub fn parse_jsonc_text(text: &str) -> Result<TargetJsoncConfig, String> {
-    jsonc_parser::parse_to_serde_value::<TargetJsoncConfig>(text, &jsonc_options()).map_err(|e| {
-        let mut msg = format!("JSONC parse error: {e}");
-        // Quote-style-agnostic: jsonc_parser may render serde's field
-        // lists with backticks or apostrophes; the base error is
-        // normalized so both the probe and the caller see plain
-        // "unknown field <key>" text (the hint keeps its quotes). Two
-        // static probes pin the rejector's expected-fields list: only
-        // the dev-host struct's list contains `host_name`, only the DUT
-        // struct's contains `dut_name` — so a stray `alias` inside a
-        // DUT sub-section (e.g. `target`) gets neither hint and stays
-        // position-blind.
-        let base = msg.replace(['`', '\''], "");
-        let hint = if base.contains("unknown field alias")
-            && base.contains("expected one of host_name")
-        {
-            Some(
-                " — dev_hosts[].alias was renamed to host_name (optional display name); \
-                     rename the key in the file or re-run 'dutabo init' to regenerate",
-            )
-        } else if base.contains("unknown field alias") && base.contains("expected one of dut_name")
-        {
-            Some(
-                " — duts[].alias was renamed to dut_name (required, unique across ALL DUTs); \
-                     rename the key in the file or re-run 'dutabo init' to regenerate",
-            )
-        } else {
-            None
-        };
-        msg = base;
-        if let Some(hint) = hint {
-            msg.push_str(hint);
-        }
-        msg
-    })
+    jsonc_parser::parse_to_serde_value::<TargetJsoncConfig>(text, &jsonc_options())
+        .map_err(|e| format!("JSONC parse error: {e}"))
 }
 
 /// Parse JSONC text into a generic `serde_json::Value` (schema-less — used
@@ -1102,10 +1066,7 @@ fn flatten_global(t: &TargetJsoncConfig) -> HashMap<String, String> {
     // a single-DUT Config.values carries the full flat key set.
     if let Some(first) = t.dev_hosts.iter().find_map(|h| h.duts.first()) {
         cfg.insert("DUT_NAME".into(), first.dut_name.clone());
-        // Auto-derive dut_dir from the name if not explicitly set
-        if first.dut_dir.is_none() {
-            cfg.insert("DUT_DIR".into(), format!(".dut-serial/{}", first.dut_name));
-        }
+        cfg.insert("DUT_DIR".into(), format!(".dut-serial/{}", first.dut_name));
         cfg.extend(JsoncSections::from(first).to_map());
     }
     cfg
@@ -1135,9 +1096,21 @@ fn host_config(host: &JsoncDevHost) -> DevHostConfig {
 }
 
 /// Parse all dev hosts and DUT entries from a `.target.jsonc` file.
-/// If no DUTs exist anywhere, returns a single default DUT (never an empty
-/// Vec — the old invariant) attached to the first host.
+/// Every dev host must declare at least one DUT (`duts[]` is required by
+/// the schema); a config without DUTs is a configuration error.
 pub fn parse_config_file(path: &Path) -> Result<ConfigFile, String> {
+    parse_config_file_inner(path, false)
+}
+
+/// Zero-DUT-tolerant variant for the server reconcile path: an explicitly
+/// empty `dev_hosts` array (the wizard's zero-host end state) is a legal
+/// saved shape there, so it yields an empty `duts` vec instead of an error.
+/// Every other failure — including any parse error — still fails loudly.
+pub fn parse_config_file_allow_empty(path: &Path) -> Result<ConfigFile, String> {
+    parse_config_file_inner(path, true)
+}
+
+fn parse_config_file_inner(path: &Path, allow_empty: bool) -> Result<ConfigFile, String> {
     let t = read_and_parse(path)?;
 
     let global = flatten_file_globals(&t);
@@ -1149,14 +1122,12 @@ pub fn parse_config_file(path: &Path) -> Result<ConfigFile, String> {
             duts.push(dut_jsonc_to_config(dut, host, &global));
         }
     }
-    if duts.is_empty() {
-        let host = dev_hosts.first().cloned().unwrap_or_else(|| DevHostConfig {
-            ip: String::new(),
-            user: String::new(),
-            pass: String::new(),
-            host_name: String::new(),
-        });
-        duts.push(default_dut_config(&global, &host));
+    if duts.is_empty() && !allow_empty {
+        return Err(
+            "No DUTs configured: every dev_hosts[] entry needs a non-empty duts[] \
+             (run 'dutabo init' to generate one)"
+                .into(),
+        );
     }
 
     // Check for port conflicts between DUTs (warning only, preserved)
@@ -1183,86 +1154,9 @@ pub fn parse_config_file(path: &Path) -> Result<ConfigFile, String> {
 }
 
 /// Parse all DUT entries from a `.target.jsonc` file, returning a list of
-/// `DutConfig`. If no DUTs exist, returns a single default DUT with
-/// "default" name (or `TARGET_DUT_NAME`).
+/// `DutConfig`. Errors when the file declares no DUTs.
 pub fn parse_dut_configs(path: &Path) -> Result<Vec<DutConfig>, String> {
     parse_config_file(path).map(|config| config.duts)
-}
-
-/// Default DUT for configs without any `duts[]` (host fields resolved from
-/// the given host with the file-global fallback, section values from the
-/// global map only).
-fn default_dut_config(global: &HashMap<String, String>, host: &DevHostConfig) -> DutConfig {
-    let name = std::env::var("TARGET_DUT_NAME")
-        .map(|s| s.trim().to_string())
-        .ok()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "default".into());
-    let dut_dir = global
-        .get("DUT_DIR")
-        .cloned()
-        .unwrap_or_else(|| ".dut-serial".into());
-    let dev_host_ip = if host.ip.is_empty() {
-        global.get("DEV_HOST_IP").cloned().unwrap_or_default()
-    } else {
-        host.ip.clone()
-    };
-    let dev_host_user = if host.user.is_empty() {
-        global.get("DEV_HOST_USER").cloned().unwrap_or_default()
-    } else {
-        host.user.clone()
-    };
-    let dev_host_pass = if host.pass.is_empty() {
-        global.get("DEV_HOST_PASS").cloned().unwrap_or_default()
-    } else {
-        host.pass.clone()
-    };
-    DutConfig {
-        dut_name: name,
-        dev_host_ip,
-        dev_host_user,
-        dev_host_pass,
-        serial_port: global.get("SERIAL_PORT").cloned().unwrap_or_default(),
-        relay_ip: global.get("RELAY_IP").cloned().unwrap_or_default(),
-        relay_type: resolve_relay_type(
-            global.get("RELAY_TYPE").map(String::as_str).unwrap_or(""),
-            global.get("DEV_CTL").map(String::as_str).unwrap_or(""),
-        ),
-        dev_ctl: global.get("DEV_CTL").cloned().unwrap_or_default(),
-        relay_port: global
-            .get("RELAY_PORT")
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0),
-        reset_ch: global
-            .get("RESET_CHANNEL")
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0),
-        download_ch: global
-            .get("DOWNLOAD_CHANNEL")
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0),
-        power_ch: global
-            .get("POWER_CHANNEL")
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0),
-        power_key_ch: global
-            .get("POWER_KEY_CHANNEL")
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0),
-        power_off_time_ms: global
-            .get("POWER_OFF_TIME_MS")
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(3000)
-            .max(3000),
-        reference_log: global.get("REFERENCE_LOG").cloned().unwrap_or_default(),
-        dut_dir,
-        login_user: global.get("LOGIN_USER").cloned().unwrap_or_default(),
-        login_pass: global.get("LOGIN_PASS").cloned().unwrap_or_default(),
-        learner_stage_threshold: 0.0,
-        learner_crash_threshold: 0.0,
-        crash_patterns: Vec::new(),
-        section_values: HashMap::new(),
-    }
 }
 
 /// Flatten one nested DUT entry into a `DutConfig`, resolving every
@@ -1276,10 +1170,7 @@ fn dut_jsonc_to_config(
     // Must be built before the typed resolution below overrides select keys.
     let section_values = JsoncSections::from(dut).to_map();
     let name = dut.dut_name.clone();
-    let dut_dir = dut
-        .dut_dir
-        .clone()
-        .unwrap_or_else(|| format!(".dut-serial/{name}"));
+    let dut_dir = format!(".dut-serial/{name}");
 
     // serial.port: DUT value, else the file-global value; stays empty when
     // neither is set. Validation then reports the missing required field;
@@ -1307,8 +1198,7 @@ fn dut_jsonc_to_config(
                 .filter(|v| !v.is_empty())
                 .map(str::to_string)
                 .unwrap_or_default();
-        // ch/channel spellings collapse into ONE field via the serde alias;
-        // the ZERO-FILTERED rule applies here too — an explicit 0 inherits
+        // The ZERO-FILTERED rule applies here too — an explicit 0 inherits
         // the global channel instead of shadowing it (same rule the global
         // path uses).
         reset_ch = r.reset_ch.filter(|&c| c > 0).unwrap_or(0);
@@ -1358,10 +1248,6 @@ fn dut_jsonc_to_config(
     let mut learner_crash_threshold = 0.0f64;
     let mut crash_patterns: Vec<String> = Vec::new();
 
-    // reference_log precedence: dut.monitor.reference_log -> dut back-compat
-    // reference_log -> derived "{dut_dir}/reference-boot.log" -> global.
-    // The derivation is always non-empty, so the global value is effectively
-    // shadowed (preserved; do not 'fix').
     let mut reference_log = String::new();
     if let Some(ref m) = dut.monitor {
         reference_log = m.reference_log.clone().unwrap_or_default();
@@ -1370,13 +1256,10 @@ fn dut_jsonc_to_config(
         crash_patterns = m.crash_keywords.clone().unwrap_or_default();
     }
     if reference_log.is_empty() {
-        reference_log = match &dut.reference_log {
-            Some(s) => s.clone(),
-            None => format!("{dut_dir}/reference-boot.log"),
-        };
+        reference_log = global.get("REFERENCE_LOG").cloned().unwrap_or_default();
     }
     if reference_log.is_empty() {
-        reference_log = global.get("REFERENCE_LOG").cloned().unwrap_or_default();
+        reference_log = format!("{dut_dir}/reference-boot.log");
     }
 
     let login_user = dut
@@ -1469,7 +1352,7 @@ fn walk_up_for(file_name: &str) -> Option<PathBuf> {
 pub fn load_config() -> Config {
     let mut values = defaults();
     let path = match find_config_path() {
-        Ok(p) => p,
+        Ok(p) => p.map(|path| path.canonicalize().unwrap_or(path)),
         Err(e) => {
             tracing::error!("{e}");
             None
@@ -1495,9 +1378,7 @@ pub fn load_config() -> Config {
                                 // Per-DUT servers must write pid/state into the name
                                 // dir, never the project root. Without this, DUT_DIR
                                 // falls back to ".dut-serial" and the engine's
-                                // write_pid lands in .dut-serial/mcp.pid — which
-                                // check_project_singleton then mistakes for the
-                                // project singleton, blocking the stdio server.
+                                // write_pid lands over the project PID file.
                                 values.insert("DUT_DIR".into(), format!(".dut-serial/{name}"));
                             } else {
                                 tracing::warn!(
@@ -1556,28 +1437,52 @@ impl Config {
             .collect()
     }
 
+    /// Zero-DUT-tolerant variant (mirrors `parse_config_file_allow_empty`):
+    /// an explicitly empty dev_hosts array desires no engines. Parse errors
+    /// still fail loudly — an unreadable file must never look like "release
+    /// everything".
+    pub fn managed_dut_configs_allow_empty(&self) -> Result<Vec<Self>, String> {
+        let Some(path) = &self.config_path else {
+            return Ok(vec![self.clone()]);
+        };
+        if read_and_parse(path)?
+            .dev_hosts
+            .iter()
+            .all(|h| h.duts.is_empty())
+        {
+            return Ok(Vec::new());
+        }
+        self.managed_dut_configs()
+    }
+
     /// Validate required fields at startup. Returns Err with human-readable
     /// message listing all missing/invalid fields. Pattern from serial-mcp-server.
     pub fn validate(&self) -> Result<(), Vec<String>> {
         let mut errors: Vec<String> = Vec::new();
+        let heartbeat = self.get("HEARTBEAT_COMMAND");
+        if heartbeat.len() > crate::heartbeat::MAX_PROBE_BYTES || heartbeat.contains('\0') {
+            errors.push(format!(
+                "monitor.heartbeat_command: must contain no NUL and at most {} bytes",
+                crate::heartbeat::MAX_PROBE_BYTES
+            ));
+        }
 
         // A config file with an EXPLICIT empty dev_hosts array
         // (`"dev_hosts": []` — the wizard's zero-host answer) is a valid
         // end state: no hosts, so no DUTs (DUTs cannot exist without a
         // dev host). Only then is the missing host-ip NOT an error — a
-        // file with NO dev_hosts key at all still errors.
+        // file with NO dev_hosts key at all still errors. parse_config_file
+        // itself rejects a zero-DUT file, so the empty-shape probe parses
+        // the JSONC directly.
         let zero_hosts = self
             .config_path
             .as_ref()
             .filter(|p| p.exists())
             .is_some_and(|p| {
-                parse_config_file(p)
-                    .map(|parsed| {
-                        parsed.dev_hosts.is_empty()
-                            && std::fs::read_to_string(p)
-                                .is_ok_and(|text| text.contains("\"dev_hosts\""))
-                    })
-                    .unwrap_or(false)
+                std::fs::read_to_string(p).is_ok_and(|text| {
+                    text.contains("\"dev_hosts\"")
+                        && parse_jsonc_text(&text).is_ok_and(|parsed| parsed.dev_hosts.is_empty())
+                })
             });
 
         // Required: dev host IP
@@ -1677,9 +1582,12 @@ impl Config {
         }
         validate_uboot_interrupt_settings(&self.values, "uboot", &mut errors);
 
-        // Validate DUT configs if a config file is present
+        // Validate DUT configs if a config file is present. An explicitly
+        // empty dev_hosts array (the wizard's zero-host end state) has no
+        // DUTs by design and skips this section entirely.
         if let Some(ref p) = self.config_path
             && p.exists()
+            && !zero_hosts
         {
             match parse_dut_configs(p) {
                 Ok(duts) => {
@@ -1714,7 +1622,7 @@ impl Config {
                         if !dut.dev_ctl.is_empty()
                             && !matches!(
                                 dut.dev_ctl.trim().to_ascii_lowercase().as_str(),
-                                "ch340" | "ch340-relay" | "none" | "disabled"
+                                "ch340-relay" | "none"
                             )
                         {
                             errors.push(format!(
@@ -1727,6 +1635,16 @@ impl Config {
                         }
                         let mut values = self.values.clone();
                         values.extend(dut.section_values.clone());
+                        if let Some(command) = values.get("HEARTBEAT_COMMAND")
+                            && (command.len() > crate::heartbeat::MAX_PROBE_BYTES
+                                || command.contains('\0'))
+                        {
+                            errors.push(format!(
+                                "DUT '{}'.monitor.heartbeat_command: invalid length or NUL byte",
+                                dut.dut_name
+                            ));
+                        }
+
                         validate_uboot_interrupt_settings(
                             &values,
                             &format!("DUT '{}'.uboot", dut.dut_name),
@@ -1787,9 +1705,9 @@ fn validate_uboot_interrupt_settings(
 /// affects hint completeness, never the accepted set. Public: the
 /// `dutabo init` TUI uses it as the single source for its relay-type picker
 /// options. (usb-relay and the external dev-ctl backends were
-/// removed — only ch340-relay and none/disabled remain.)
+/// removed — only ch340-relay and none remain.)
 pub fn supported_relay_types() -> Vec<&'static str> {
-    ["ch340", "ch340-relay", "none", "disabled"]
+    ["ch340-relay", "none"]
         .into_iter()
         .filter(|name| crate::power_control::supports(name))
         .collect()
@@ -1837,8 +1755,6 @@ pub struct InventoryDut {
     pub ssh_user: String,
     pub serial_port: String,
     pub dut_dir: String,
-    /// Project HTTP MCP port, repeated for compatibility in each DUT entry.
-    pub mcp_port: u16,
     pub state: String,
     pub state_label: String,
     pub state_text: String,
@@ -1868,8 +1784,9 @@ pub struct InventoryJson {
     /// freshness: an inventory whose `written_at_unix` is older than
     /// `3 × heartbeat_secs` is STALE — the server died (or was killed -9,
     /// which leaves no cleanup hook), and the snapshot must not render as
-    /// live even if the pid was recycled. `null` = legacy server that only
-    /// writes on startup/state-change (no freshness contract).
+    /// live even if the pid was recycled. `null` = display-only snapshot
+    /// (`dutabo list --json`, `serial_list_duts`) that carries no
+    /// freshness contract and is never treated as a live server.
     pub heartbeat_secs: Option<u32>,
     /// The TARGET_DUT_NAME value when set AND found in `duts`; null otherwise.
     pub current_dut: Option<String>,
@@ -1917,11 +1834,6 @@ pub fn build_inventory_json(
     meta: InventoryMeta<'_>,
     state_for: impl Fn(&DutConfig) -> InventoryDutState,
 ) -> InventoryJson {
-    let project_dir = config
-        .project_dir
-        .as_deref()
-        .unwrap_or_else(|| Path::new("."));
-
     let current_dut = current_dut_name
         .filter(|name| duts.iter().any(|d| d.dut_name == *name))
         .map(str::to_string);
@@ -1948,7 +1860,6 @@ pub fn build_inventory_json(
                 ssh_user: dut.dev_host_user.clone(),
                 serial_port: dut.serial_port.clone(),
                 dut_dir: dut.dut_dir.clone(),
-                mcp_port: crate::ports::project_dut_mcp_port(project_dir, &dut.dut_name),
                 state: state.state,
                 state_label: state.state_label,
                 state_text: state.state_text,
@@ -2011,12 +1922,60 @@ mod tests {
     }
 
     #[test]
+    fn heartbeat_commands_inherit_override_and_validate() {
+        let tmp = TempDir::new().unwrap();
+        let path = write_jsonc(
+            tmp.path(),
+            r#"{
+            "monitor":{"heartbeat_command":["test -r /proc/uptime", "cat /proc/uptime"]},
+            "serial":{"port":1234,"baudrate":115200},
+            "dev_hosts":[{"ip":"localhost","duts":[
+                {"dut_name":"inherited"},
+                {"dut_name":"custom","monitor":{"heartbeat_command":"printf 'ready'"}},
+                {"dut_name":"builtin","monitor":{"heartbeat_command":""}},
+                {"dut_name":"empty-list","monitor":{"heartbeat_command":[]}}
+            ]}]
+        }"#,
+        );
+        let parsed = parse_config_file(&path).unwrap();
+        let global = parse_jsonc_config(&path).unwrap();
+        for (dut, expected) in parsed.duts.iter().zip([
+            "{\ntest -r /proc/uptime\n} &&\n{\ncat /proc/uptime\n}",
+            "printf 'ready'",
+            "",
+            "",
+        ]) {
+            assert_eq!(dut.to_config_map(&global)["HEARTBEAT_COMMAND"], expected);
+        }
+        for command in [
+            "x".repeat(crate::heartbeat::MAX_PROBE_BYTES + 1),
+            "bad\0command".into(),
+        ] {
+            let mut values = defaults();
+            values.insert("HEARTBEAT_COMMAND".into(), command);
+            let config = Config {
+                values,
+                config_path: None,
+                project_dir: None,
+                format: ConfigFormat::None,
+            };
+            assert!(
+                config
+                    .validate()
+                    .unwrap_err()
+                    .iter()
+                    .any(|e| e.contains("heartbeat_command"))
+            );
+        }
+    }
+
+    #[test]
     fn power_key_channel_inherits_independently_from_supply() {
         let tmp = TempDir::new().unwrap();
         let conf = write_jsonc(
             tmp.path(),
             r#"{
-            "relay": {"type":"ch340-relay","power_ch":3,"power_key_channel":4},
+            "relay": {"type":"ch340-relay","power_ch":3,"power_key_ch":4},
             "dev_hosts":[{"ip":"127.0.0.1","duts":[
                 {"dut_name":"inherit","relay":{"power_key_ch":0}},
                 {"dut_name":"override","relay":{"power_key_ch":2}}
@@ -2087,7 +2046,7 @@ mod tests {
   "serial": { "port": 9999 },
   "target": { "login_user": "admin", "login_pass": "secret" },
   "uboot": { "interrupt_char": "ctrl_c", "interrupt_strategy": "flood" },
-  "relay": { "port": 41001, "reset_channel": 1, "download_channel": 2 },
+  "relay": { "port": 41001, "reset_ch": 1, "download_ch": 2 },
   "monitor": { "hang_timeout": 120 }
 }"#,
         );
@@ -2215,8 +2174,7 @@ mod tests {
   "target": { "login_user": "root", "login_pass": "" },
   "uboot": { "interrupt_char": "ctrl_c", "interrupt_strategy": "flood" },
   "relay": { "type": "ch340-relay", "port": 41000 },
-  "monitor": { "hang_timeout": 60, "max_archived_logs": 10 },
-  "reference_log": ".dut-serial/reference-boot.log"
+  "monitor": { "hang_timeout": 60, "max_archived_logs": 10, "reference_log": ".dut-serial/reference-boot.log" }
 }"#,
         );
         let result = parse_dut_configs(&conf).unwrap();
@@ -2554,15 +2512,13 @@ mod tests {
         };
         assert_eq!(cfg.relay_type(), "ch340-relay");
         // The backend is REPLACEABLE: only the two selectable choices
-        // (ch340-relay / none) plus the legacy ch340 spelling resolve to
-        // built-ins (usb-relay and external program names were
-        // removed — unknown values pass through verbatim so validation
-        // rejects them as unsupported instead of treating them as programs).
+        // (ch340-relay / none) resolve to built-ins (usb-relay and external
+        // program names were removed — unknown values pass through verbatim
+        // so validation rejects them as unsupported instead of treating
+        // them as programs).
         for (dev_ctl, want) in [
-            ("ch340", "ch340"),
             ("ch340-relay", "ch340-relay"),
             ("none", "none"),
-            ("disabled", "disabled"),
             ("usb-relay", "usb-relay"),
             ("external-dev-ctl", "external-dev-ctl"),
             ("lab-pc-ctl", "lab-pc-ctl"),
@@ -2594,7 +2550,7 @@ mod tests {
 
     #[test]
     fn test_dev_ctrl_disabled_overrides_relay_config() {
-        for disabled in ["none", "disabled", " NONE ", " Disabled "] {
+        for disabled in ["none", " NONE "] {
             for global_control in [false, true] {
                 let tmp = TempDir::new().unwrap();
                 let control = serde_json::json!({ "dev_ctrl": disabled });
@@ -2887,7 +2843,7 @@ mod tests {
           "target": { "login_user": "root", "login_pass": "", "login_prompt": "", },
           "uboot": { "interrupt_char": "ctrl_c", "interrupt_strategy": "flood", },
           "relay": {
-            "type": "ch340",
+            "type": "ch340-relay",
             "port": 41000,
             "reset_ch": 1,
             "download_ch": 2,
@@ -3020,60 +2976,8 @@ mod tests {
     }
 
     #[test]
-    fn test_back_compat_reference_log_and_dut_dir() {
-        let tmp = TempDir::new().unwrap();
-        let conf = write_jsonc(
-            tmp.path(),
-            r#"{
-  "dev_hosts": [
-    {
-      "ip": "10.0.0.1",
-      "duts": [
-        {
-          "dut_name": "dut-x",
-          "reference_log": "/opt/custom-ref.log",
-          "dut_dir": "/opt/dut-x-dir",
-          "monitor": { "reference_log": ".dut-serial/ignored.log" }
-        }
-      ]
-    }
-  ],
-  "reference_log": "/opt/global-ref.log",
-  "dut_dir": "/opt/global-dir"
-}"#,
-        );
-        let duts = parse_dut_configs(&conf).unwrap();
-        let dut = &duts[0];
-        // Typed per-DUT precedence: monitor.reference_log first, back-compat
-        // reference_log only when monitor's is empty. In the FLAT map the
-        // back-compat key wins (to_map inserts it after the monitor
-        // spelling).
-        assert_eq!(
-            dut.reference_log, ".dut-serial/ignored.log",
-            "monitor.reference_log wins on the typed per-DUT chain"
-        );
-        assert_eq!(
-            dut.section_values.get("REFERENCE_LOG").unwrap(),
-            "/opt/custom-ref.log",
-            "back-compat reference_log wins in the flat map"
-        );
-        assert_eq!(dut.dut_dir, "/opt/dut-x-dir");
-        // The global map first carries the top-level back-compat keys, then
-        // first-DUT leakage overrides them with the first DUT's values.
-        let global = parse_jsonc_config(&conf).unwrap();
-        assert_eq!(
-            global.get("REFERENCE_LOG").unwrap(),
-            "/opt/custom-ref.log",
-            "first-DUT leakage overrides the top-level back-compat key"
-        );
-        assert_eq!(global.get("DUT_DIR").unwrap(), "/opt/dut-x-dir");
-    }
-
-    #[test]
-    fn test_reference_log_derivation_shadows_global() {
-        // No reference_log anywhere → derived "{dut_dir}/reference-boot.log"
-        // wins even when the global map HAS one (derivation is always
-        // non-empty, shadowing global — preserved).
+    fn test_reference_log_inherits_global() {
+        // Per-DUT settings inherit the global monitor reference.
         let tmp = TempDir::new().unwrap();
         let conf = write_jsonc(
             tmp.path(),
@@ -3081,11 +2985,11 @@ mod tests {
   "dev_hosts": [
     { "ip": "10.0.0.1", "duts": [ { "dut_name": "solo" } ] }
   ],
-  "reference_log": "/opt/global-ref.log"
+  "monitor": { "reference_log": "/opt/global-ref.log" }
 }"#,
         );
         let duts = parse_dut_configs(&conf).unwrap();
-        assert_eq!(duts[0].reference_log, ".dut-serial/solo/reference-boot.log");
+        assert_eq!(duts[0].reference_log, "/opt/global-ref.log");
     }
 
     #[test]
@@ -3111,9 +3015,9 @@ mod tests {
     }
   ],
   "serial": { "port": 9999 },
-  "relay": { "reset_channel": 2, "power_ch": 3, "power_off_time_ms": 5000 },
+  "relay": { "reset_ch": 2, "power_ch": 3, "power_off_time_ms": 5000 },
   // OLD `crash_patterns` spelling kept deliberately — alias regression coverage.
-  "monitor": { "learner_stage_threshold": 0.45, "crash_patterns": ["Kernel panic", "BUG:"] },
+  "monitor": { "learner_stage_threshold": 0.45, "crash_keywords": ["Kernel panic", "BUG:"] },
   "lock_dir": "/tmp/sermcp/locks"
 }"#,
         );
@@ -3257,44 +3161,6 @@ mod tests {
     }
 
     #[test]
-    fn test_monitor_crash_patterns_old_key_still_parses() {
-        // Back-compat contract: the old `crash_patterns` spelling keeps
-        // parsing via the serde alias after the rename to `crash_keywords`.
-        let tmp = TempDir::new().unwrap();
-        let conf = write_jsonc(
-            tmp.path(),
-            r#"{
-  "dev_hosts": [
-    { "ip": "10.0.0.1", "duts": [ { "dut_name": "d" } ] }
-  ],
-  "monitor": { "crash_patterns": ["Kernel panic", "BUG:"] }
-}"#,
-        );
-        let global = parse_jsonc_config(&conf).unwrap();
-        assert_eq!(global.get("CRASH_PATTERNS").unwrap(), "Kernel panic\nBUG:");
-    }
-
-    #[test]
-    fn test_monitor_both_spellings_is_duplicate_error() {
-        // Both spellings present → loud duplicate-field parse error
-        // (consistent with the relay ch/channel alias policy), never silent
-        // preference.
-        let tmp = TempDir::new().unwrap();
-        let conf = write_jsonc(
-            tmp.path(),
-            r#"{
-  "monitor": { "crash_patterns": ["A"], "crash_keywords": ["B"] }
-}"#,
-        );
-        let err = parse_jsonc_config(&conf).unwrap_err();
-        assert!(
-            err.contains("duplicate"),
-            "expected duplicate-field error, got: {err}"
-        );
-        assert!(err.contains("crash"), "error must name the key: {err}");
-    }
-
-    #[test]
     fn test_hang_hysteresis_zero_clamps_to_one() {
         let values = HashMap::from([("HANG_HYSTERESIS".into(), "0".into())]);
         let cfg = Config {
@@ -3308,7 +3174,7 @@ mod tests {
     }
 
     #[test]
-    fn test_target_dut_name_forced_dut_dir_overrides_explicit() {
+    fn test_target_dut_name_derives_dut_dir() {
         let _guard = ENV_MUTEX.lock().unwrap();
         let tmp = TempDir::new().unwrap();
         let conf = write_jsonc(
@@ -3318,7 +3184,7 @@ mod tests {
     {
       "ip": "10.0.0.1",
       "duts": [
-        { "dut_name": "dut-a", "dut_dir": "/explicit/a", "serial": { "port": 41000 } }
+        { "dut_name": "dut-a", "serial": { "port": 41000 } }
       ]
     }
   ]
@@ -3419,59 +3285,57 @@ mod tests {
     }
 
     #[test]
-    fn test_host_alias_key_is_rejected_loudly() {
-        // dev_hosts[].alias is the renamed TOML-era key — deny_unknown_fields
-        // must turn it into a loud parse error that names the key AND the
-        // new spelling, and says what to do about it.
-        let err = parse_jsonc_text(r#"{ "dev_hosts": [ { "alias": "old", "ip": "10.0.0.1" } ] }"#)
-            .unwrap_err();
-        assert!(err.contains("alias"), "error must name the key: {err}");
-        assert!(
-            err.contains("unknown field"),
-            "error must be a deny_unknown_fields rejection: {err}"
-        );
-        assert!(
-            err.contains("renamed to host_name"),
-            "error must name the NEW key: {err}"
-        );
-        assert!(
-            err.contains("re-run 'dutabo init'"),
-            "error must say what to do: {err}"
-        );
+    fn removed_key_spellings_are_rejected_as_unknown_fields() {
+        // Old key names (TOML-era `alias`, obsolete section spellings) are
+        // plain deny_unknown_fields rejections that name the offending key.
+        for text in [
+            r#"{ "dev_hosts": [ { "alias": "old", "ip": "10.0.0.1" } ] }"#,
+            r#"{ "dev_hosts": [ { "ip": "10.0.0.1", "duts": [ { "dut_name": "d", "alias": "x" } ] } ] }"#,
+        ] {
+            let err = parse_jsonc_text(text).unwrap_err();
+            assert!(
+                err.contains("unknown field"),
+                "must reject: {text} -> {err}"
+            );
+            assert!(err.contains("alias"), "error must name the key: {err}");
+        }
     }
 
     #[test]
-    fn test_stray_alias_in_dut_section_gets_dut_name_hint() {
-        // A DUT-level stray 'alias' is also a deny_unknown_fields rejection,
-        // but the hint must name the DUT-level new key (dut_name) — never
-        // the host-level one.
-        let err = parse_jsonc_text(
-            r#"{ "dev_hosts": [ { "ip": "10.0.0.1", "duts": [ { "dut_name": "d", "alias": "x" } ] } ] }"#,
-        )
-        .unwrap_err();
-        assert!(err.contains("unknown field"), "must still reject: {err}");
-        assert!(
-            err.contains("renamed to dut_name"),
-            "the DUT-level stray must name the NEW key: {err}"
+    fn config_without_duts_is_an_error() {
+        let tmp = TempDir::new().unwrap();
+        let conf = write_jsonc(
+            tmp.path(),
+            r#"{ "dev_hosts": [ { "ip": "10.0.0.1", "duts": [] } ] }"#,
         );
-        assert!(
-            !err.contains("host_name"),
-            "host-level advice must not leak into a DUT-level stray: {err}"
+        let err = parse_config_file(&conf).unwrap_err();
+        assert!(err.contains("No DUTs configured"), "{err}");
+    }
+
+    #[test]
+    fn allow_empty_variants_tolerate_zero_duts_but_not_parse_errors() {
+        let tmp = TempDir::new().unwrap();
+        let conf = write_jsonc(
+            tmp.path(),
+            r#"{ "dev_hosts": [ { "ip": "10.0.0.1", "duts": [] } ] }"#,
         );
-        // Position-blindness guard: an 'alias' inside a DUT sub-section
-        // gets NEITHER hint (neither struct's expected-list contains it).
-        let err = parse_jsonc_text(
-            r#"{ "dev_hosts": [ { "ip": "10.0.0.1", "duts": [ { "dut_name": "d", "target": { "alias": "x" } } ] } ] }"#,
-        )
-        .unwrap_err();
-        assert!(
-            err.contains("unknown field alias"),
-            "must still reject: {err}"
-        );
-        assert!(
-            !err.contains("renamed to"),
-            "no section-level hint for a sub-section stray: {err}"
-        );
+        // Explicitly empty dev_hosts: the reconcile-facing variants return
+        // an empty result instead of an error…
+        let saved = parse_config_file_allow_empty(&conf).unwrap();
+        assert!(saved.duts.is_empty());
+        assert_eq!(saved.dev_hosts.len(), 1);
+        let cfg = Config {
+            values: defaults(),
+            config_path: Some(conf.clone()),
+            project_dir: Some(tmp.path().to_path_buf()),
+            format: ConfigFormat::Jsonc,
+        };
+        assert!(cfg.managed_dut_configs_allow_empty().unwrap().is_empty());
+        // …while a genuinely unparseable file still fails loudly — an
+        // unreadable config must never look like "release everything".
+        std::fs::write(&conf, "{broken").unwrap();
+        assert!(parse_config_file_allow_empty(&conf).is_err());
+        assert!(cfg.managed_dut_configs_allow_empty().is_err());
     }
 
     #[test]
@@ -3484,23 +3348,6 @@ mod tests {
         let err = parse_dut_configs(&conf).unwrap_err();
         assert!(err.contains("dut_name"), "error must name the key: {err}");
     }
-
-    #[test]
-    fn test_duplicate_ch_alias_fields_rejected() {
-        // Both reset_ch AND reset_channel set → serde duplicate-field error.
-        let tmp = TempDir::new().unwrap();
-        let conf = write_jsonc(
-            tmp.path(),
-            r#"{
-  "dev_hosts": [
-    { "ip": "10.0.0.1", "duts": [ { "dut_name": "d", "relay": { "reset_ch": 1, "reset_channel": 2 } } ] }
-  ]
-}"#,
-        );
-        assert!(parse_dut_configs(&conf).is_err());
-    }
-
-    // ── TDD-5: number-or-string ────────────────────────────────────────
 
     #[test]
     fn test_port_number_or_string() {
@@ -3581,27 +3428,6 @@ mod tests {
     // ── TDD-6: ch/channel reconciliation on BOTH paths ─────────────────
 
     #[test]
-    fn test_ch_channel_alias_works_on_dut_path() {
-        // `reset_channel` populates reset_ch via the serde alias.
-        let tmp = TempDir::new().unwrap();
-        let conf = write_jsonc(
-            tmp.path(),
-            r#"{
-  "dev_hosts": [
-    {
-      "ip": "10.0.0.1",
-      "duts": [
-        { "dut_name": "d", "relay": { "reset_channel": 2 } }
-      ]
-    }
-  ]
-}"#,
-        );
-        let duts = parse_dut_configs(&conf).unwrap();
-        assert_eq!(duts[0].reset_ch, 2);
-    }
-
-    #[test]
     fn test_ch_zero_inherits_global_on_dut_path() {
         // Explicit 0 inherits the global channel instead of shadowing it
         // (zero-guarded on the per-DUT typed path).
@@ -3612,7 +3438,7 @@ mod tests {
   "dev_hosts": [
     { "ip": "10.0.0.1", "duts": [ { "dut_name": "d", "relay": { "reset_ch": 0 } } ] }
   ],
-  "relay": { "reset_channel": 2 }
+  "relay": { "reset_ch": 2 }
 }"#,
         );
         let duts = parse_dut_configs(&conf).unwrap();
@@ -3621,21 +3447,6 @@ mod tests {
             "explicit 0 must not shadow the global 2"
         );
     }
-
-    #[test]
-    fn test_ch_channel_alias_works_on_global_path() {
-        // One field plus the zero-filtered rule means the alias spelling
-        // always resolves correctly.
-        let tmp = TempDir::new().unwrap();
-        let conf = write_jsonc(
-            tmp.path(),
-            r#"{ "dev_hosts": [ { "ip": "10.0.0.1" } ], "relay": { "reset_channel": 2 } }"#,
-        );
-        let cfg = parse_jsonc_config(&conf).unwrap();
-        assert_eq!(cfg.get("RESET_CHANNEL").unwrap(), "2");
-    }
-
-    // ── TDD-7: validate() ──────────────────────────────────────────────
 
     #[test]
     fn test_interrupt_strategy_rejects_removed_values_and_requires_pattern() {
@@ -3685,7 +3496,10 @@ mod tests {
         // No host ip + port "0": only the host error (no double-error).
         let _guard = ENV_MUTEX.lock().unwrap();
         let tmp = TempDir::new().unwrap();
-        let conf = write_jsonc(tmp.path(), r#"{ "serial": { "port": 0 } }"#);
+        let conf = write_jsonc(
+            tmp.path(),
+            r#"{ "dev_hosts": [{ "duts": [{ "dut_name": "b", "serial": { "port": 0 } }] }] }"#,
+        );
         unsafe { std::env::set_var("TARGET_CONF", conf.to_str().unwrap()) };
         let cfg = load_config();
         unsafe { std::env::remove_var("TARGET_CONF") };
@@ -3812,7 +3626,7 @@ mod tests {
             "{relay_error}"
         );
         assert!(
-            !relay_error.contains("ch340") || crate::power_control::supports("ch340"),
+            !relay_error.contains("ch340-relay") || crate::power_control::supports("ch340-relay"),
             "text must match the compiled backend"
         );
     }
@@ -4025,35 +3839,19 @@ mod tests {
     // ── Edge cases: empty hosts / no DUTs / host containers ────────────
 
     #[test]
-    fn test_empty_dev_hosts_yields_default_dut() {
+    fn test_empty_dev_hosts_is_a_configuration_error() {
         let _guard = ENV_MUTEX.lock().unwrap();
         let tmp = TempDir::new().unwrap();
         let conf = write_jsonc(
             tmp.path(),
             r#"{ "dev_hosts": [], "serial": { "port": 41000 } }"#,
         );
-        let duts = parse_dut_configs(&conf).unwrap();
-        assert_eq!(duts.len(), 1, "never an empty Vec");
-        assert_eq!(duts[0].dut_name, "default");
-        assert_eq!(duts[0].serial_port, "41000");
+        let err = parse_dut_configs(&conf).unwrap_err();
+        assert!(err.contains("No DUTs configured"), "{err}");
     }
 
     #[test]
-    fn test_default_dut_uses_target_dut_name() {
-        let _guard = ENV_MUTEX.lock().unwrap();
-        let tmp = TempDir::new().unwrap();
-        let conf = write_jsonc(
-            tmp.path(),
-            r#"{ "dev_hosts": [], "serial": { "port": 41000 } }"#,
-        );
-        unsafe { std::env::set_var("TARGET_DUT_NAME", "solo-board") };
-        let duts = parse_dut_configs(&conf).unwrap();
-        unsafe { std::env::remove_var("TARGET_DUT_NAME") };
-        assert_eq!(duts[0].dut_name, "solo-board");
-    }
-
-    #[test]
-    fn test_hosts_without_duts_attaches_default_to_first_host() {
+    fn test_hosts_without_duts_are_a_configuration_error() {
         let tmp = TempDir::new().unwrap();
         let conf = write_jsonc(
             tmp.path(),
@@ -4064,11 +3862,8 @@ mod tests {
   ]
 }"#,
         );
-        let config = parse_config_file(&conf).unwrap();
-        assert_eq!(config.dev_hosts.len(), 2, "host registry keeps empty hosts");
-        assert_eq!(config.duts.len(), 1, "one default DUT on the first host");
-        assert_eq!(config.duts[0].dev_host_ip, "10.0.0.1");
-        assert_eq!(config.duts[0].dev_host_user, "u1");
+        let err = parse_config_file(&conf).unwrap_err();
+        assert!(err.contains("No DUTs configured"), "{err}");
     }
 
     #[test]
@@ -4090,20 +3885,6 @@ mod tests {
         assert_eq!(config.duts.len(), 1);
         assert_eq!(config.duts[0].dut_name, "only-dut");
         assert_eq!(config.dev_hosts.len(), 2);
-    }
-
-    #[test]
-    fn test_empty_duts_array_yields_default_dut() {
-        let _guard = ENV_MUTEX.lock().unwrap();
-        let tmp = TempDir::new().unwrap();
-        let conf = write_jsonc(
-            tmp.path(),
-            r#"{ "dev_hosts": [ { "ip": "10.0.0.1", "duts": [] } ] }"#,
-        );
-        let duts = parse_dut_configs(&conf).unwrap();
-        assert_eq!(duts.len(), 1);
-        assert_eq!(duts[0].dut_name, "default");
-        assert_eq!(duts[0].dev_host_ip, "10.0.0.1");
     }
 
     #[test]
@@ -4154,7 +3935,7 @@ mod tests {
       "user": "linaro",
       "duts": [
         { "dut_name": "dut-a", "serial": { "port": 41000 } },
-        { "dut_name": "dut-b", "serial": { "port": 41001 }, "dut_dir": "/opt/dut-b" }
+        { "dut_name": "dut-b", "serial": { "port": 41001 } }
       ]
     }
   ]
@@ -4212,27 +3993,20 @@ mod tests {
         assert_eq!(inv.duts[0].ssh_user, "linaro");
         assert_eq!(inv.duts[0].serial_port, "41000");
         assert_eq!(inv.duts[0].dut_dir, ".dut-serial/dut-a");
-        assert_eq!(
-            inv.duts[0].mcp_port,
-            crate::ports::project_dut_mcp_port(tmp.path(), "dut-a"),
-            "mcp_port must come from ports.rs, not a local copy"
-        );
         assert_eq!(inv.duts[0].state, "active");
         assert_eq!(inv.duts[0].state_text, "ANSI[active]");
         assert_eq!(inv.duts[0].age_secs, Some(42));
         assert!(inv.duts[0].critical);
 
         assert_eq!(inv.duts[1].dut_name, "dut-b");
-        assert_eq!(inv.duts[1].dut_dir, "/opt/dut-b");
+        assert_eq!(inv.duts[1].dut_dir, ".dut-serial/dut-b");
         assert_eq!(inv.duts[1].state, "crashed");
     }
 
     #[test]
-    fn test_inventory_json_omits_deleted_alias_keys() {
-        // Wire-shape pin: the inventory carries NO alias spelling anywhere
-        // (not the wire key `dut_alias`, not any `alias` JSON key), the
-        // host object gains `host_name` (ip fallback here), and the DUT's
-        // live identity key is `dut_name`.
+    fn test_inventory_json_wire_shape() {
+        // Wire-shape pin: the host object carries `host_name` (ip fallback
+        // here) and the DUT's live identity key is `dut_name`.
         let tmp = TempDir::new().unwrap();
         let conf = write_jsonc(tmp.path(), SIMPLE_FIXTURE);
         let parsed = parse_config_file(&conf).unwrap();
@@ -4258,16 +4032,8 @@ mod tests {
             |_| canned_state("active", false),
         );
         let text = serde_json::to_string(&inv).unwrap();
-        assert!(!text.contains("dev_host_alias"), "text: {text}");
-        assert!(!text.contains("dut_aliases"), "text: {text}");
-        assert!(!text.contains("dut_alias"), "text: {text}");
-        assert!(!text.contains("\"alias\""), "text: {text}");
         let value: serde_json::Value = serde_json::from_str(&text).unwrap();
         let host = &value["dev_hosts"][0];
-        assert!(
-            host.get("alias").is_none(),
-            "host alias key must be gone: {text}"
-        );
         assert_eq!(host["ip"], "host-a.invalid");
         // host_name is present (ip fallback — the fixture has no explicit
         // host_name key).

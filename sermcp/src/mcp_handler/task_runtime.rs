@@ -41,6 +41,11 @@ impl McpHandler {
         let parsed: ResetArgs = serde_json::from_value(args_value)
             .map_err(|error| ErrorData::invalid_params(error.to_string(), None))?;
 
+        let control = match self.engine.lock().await.begin_control_request() {
+            Ok(token) => token,
+            Err(error) => return Ok(CallToolResponse::Complete(text_error(error))),
+        };
+
         // SEP-2663 capability negotiation is request-scoped. A task must not
         // be created before this check: rmcp's response guard runs only after
         // the handler returns, which would be too late to prevent a reset.
@@ -56,6 +61,7 @@ impl McpHandler {
                 .unwrap_or("default"),
             "Reset triggered, waiting for boot to complete...",
             move |context| async move {
+                let _control = control;
                 let result = McpHandler::run_reset_sync(engine, &parsed, Some(&context)).await;
                 if result.get("cancelled").and_then(Value::as_bool) == Some(true) {
                     Err(TaskExit::Cancelled)
@@ -95,11 +101,8 @@ impl McpHandler {
                 return cancelled_reset_result();
             }
             attempts += 1;
-            let reset_result = {
-                let mut eng = engine.lock().await;
-                eng.reset_target(false, 1, args.failure_retry_interval)
-                    .await
-            };
+            let reset_result =
+                crate::serial_engine::pulse_shared(&engine, dut_ctrl::Button::Reset).await;
             if !reset_result["success"].as_bool().unwrap_or(false) || !args.wait_boot {
                 return reset_result;
             }
@@ -294,6 +297,9 @@ impl McpHandler {
     pub(super) async fn probe_after_command_timeout(&self) -> Value {
         let (console_tx, host, port, snapshot, was_open) = {
             let eng = self.engine.lock().await;
+            if eng.in_manual_takeover() {
+                return crate::serial_engine::SerialEngine::dutabo_session_error();
+            }
             (
                 eng.console.write_sender(),
                 eng.config.dev_host_ip(),
@@ -306,11 +312,11 @@ impl McpHandler {
         // No open connection → the probe cannot even be delivered. Preserve
         // the old read-error semantics without waiting out the whole window.
         if !was_open {
-            self.engine
-                .lock()
-                .await
-                .state
-                .transition(TargetState::Disconnected);
+            let mut eng = self.engine.lock().await;
+            if eng.in_manual_takeover() {
+                return crate::serial_engine::SerialEngine::dutabo_session_error();
+            }
+            eng.state.transition(TargetState::Disconnected);
             return json!({
                 "state_after": "disconnected",
                 "hint": format!("Command timed out and the serial connection is closed on {host}:{port}. Check ser2net or cabling."),
@@ -335,6 +341,9 @@ impl McpHandler {
         }
 
         let mut eng = self.engine.lock().await;
+        if eng.in_manual_takeover() {
+            return crate::serial_engine::SerialEngine::dutabo_session_error();
+        }
         if responded {
             // The read loop already fed the response bytes to the detector;
             // only a trailing partial line (prompt without newline) can still
@@ -479,6 +488,10 @@ mod tests {
             }
         };
         wait_for_stage("Waiting for kernel start").await;
+        assert!(
+            !handler.engine.lock().await.manual_takeover_available(),
+            "the detached reset task must reserve control while waiting"
+        );
         if after_kernel {
             handler
                 .engine

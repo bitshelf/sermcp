@@ -95,8 +95,8 @@ impl DownloadContext {
     pub fn serial_command(&self, cmd: &str) -> bool {
         crate::tui_init::mcp_probe_mark(
             &self.mcp_ports,
-            "serial_send_command",
-            serde_json::json!({"command": cmd, "timeout": 5}),
+            "serial_exec",
+            serde_json::json!({"command": cmd, "mode": "shell", "timeout": 5}),
         ) == crate::tui_init::ProbeMark::Ok
     }
 
@@ -104,8 +104,8 @@ impl DownloadContext {
     pub fn uboot_command(&self, cmd: &str) -> bool {
         crate::tui_init::mcp_probe_mark(
             &self.mcp_ports,
-            "serial_uboot_command",
-            serde_json::json!({"command": cmd, "timeout": 5}),
+            "serial_exec",
+            serde_json::json!({"command": cmd, "mode": "uboot", "timeout": 5}),
         ) == crate::tui_init::ProbeMark::Ok
     }
 

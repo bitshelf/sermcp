@@ -56,80 +56,32 @@ mod multi_dut_tests;
 mod query_tools;
 mod task_runtime;
 
-#[derive(Debug)]
 pub(crate) struct AgentAccessRegistry {
-    /// The stdio singleton reserves the owner slot for its own spawning
-    /// client. The reservation is keyed by that agent's session identity
-    /// (this process's env): a bridged session of the SAME agent re-enters
-    /// as owner, a foreign agent (or an unidentified client) stays
-    /// read-only. `owner_reserved` with no identity degrades to the old
-    /// blanket reservation — isolation never weakens.
-    owner_reserved: bool,
-    reserved_identity: Option<String>,
-    owner: Mutex<OwnerSlot>,
-}
-
-#[derive(Debug, Default)]
-struct OwnerSlot {
-    /// Session identity of the current owner, when it presented one. Later
-    /// sessions presenting the SAME identity re-enter as owners (the same
-    /// agent reconnected or opened a parallel connection).
-    identity: Option<String>,
-    sessions: Vec<Weak<Mutex<AgentAccessRole>>>,
+    pub(crate) control_token: Option<String>,
+    stdio_owner: bool,
+    owner: Mutex<Weak<Mutex<AgentAccessRole>>>,
 }
 
 impl AgentAccessRegistry {
-    pub(crate) fn new(owner_reserved: bool, reserved_identity: Option<String>) -> Self {
+    pub(crate) fn new(stdio_owner: bool) -> Self {
         Self {
-            owner_reserved,
-            reserved_identity,
-            owner: Mutex::new(OwnerSlot::default()),
+            control_token: None,
+            stdio_owner,
+            owner: Mutex::new(Weak::new()),
         }
     }
 
-    fn assign(
-        &self,
-        client_name: Option<&str>,
-        identity: Option<&str>,
-        session: &Arc<Mutex<AgentAccessRole>>,
-    ) -> AgentAccessRole {
-        if client_name == Some("dutabo") {
-            return AgentAccessRole::Human;
-        }
-        if self.owner_reserved {
-            // The stdio client owns this server. The same agent host spawns
-            // every bridge process with the same env, so an identity match
-            // is the same agent — never a foreign session.
-            if identity.is_some() && identity == self.reserved_identity.as_deref() {
-                return AgentAccessRole::Owner;
-            }
+    fn assign(&self, session: &Arc<Mutex<AgentAccessRole>>) -> AgentAccessRole {
+        let mut owner = self.owner.lock().unwrap_or_else(|p| p.into_inner());
+        if self.stdio_owner || owner.strong_count() > 0 {
             return AgentAccessRole::ReadOnly;
         }
-        let mut owner = self.owner.lock().unwrap_or_else(|p| p.into_inner());
-        // Keep the reservation until every connection of the owning agent
-        // has closed. A reconnect must not outlive the registry's anchor.
-        owner.sessions.retain(|session| session.strong_count() > 0);
-        if !owner.sessions.is_empty() {
-            if identity.is_none() || identity != owner.identity.as_deref() {
-                return AgentAccessRole::ReadOnly;
-            }
-        } else {
-            owner.identity = identity.map(str::to_string);
-        }
-        owner.sessions.push(Arc::downgrade(session));
+        *owner = Arc::downgrade(session);
         AgentAccessRole::Owner
     }
 }
 
-/// Agent-host session identity for MCP access control. Isolation is per
-/// AGENT, not per connection: the host sets the same env on every sermcp
-/// child of one agent session (the direct stdio spawn AND every bridge
-/// process a reconnect spawns), so identity equality distinguishes "the
-/// same agent opened MCP again" from "a foreign agent connected".
-///
-/// Precedence: explicit override first, then the agent hosts' native ids.
-/// `None` when the host sets none — identity matching then degrades to
-/// first-connection-wins (the pre-identity behavior).
+/// Agent host identity recorded in project status.
 pub fn agent_session_identity() -> Option<String> {
     static IDENTITY: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     IDENTITY
@@ -150,12 +102,6 @@ pub fn agent_session_identity() -> Option<String> {
         })
         .clone()
 }
-
-/// Custom `initialize` `_meta` key the stdio bridge stamps with its own
-/// [`agent_session_identity`] — the only channel that carries client
-/// identity from the bridging process into this (server) process, whose
-/// env is the SERVER's, not the client's.
-pub(crate) const META_AGENT_SESSION: &str = "sermcp_agent_session";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AgentAccessRole {
@@ -191,9 +137,8 @@ pub(crate) enum ToolProfile {
 /// same server) and their handlers keep working — `Agent` sessions simply
 /// do not discover them:
 ///
-/// * `serial_send_command`/`serial_uboot_command`/`serial_send_raw` —
-///   superseded for agents by `serial_exec(mode=...)`; raw bytes are an
-///   escape hatch, not a model-facing default.
+/// * `serial_send_raw` — raw bytes are an escape hatch, not a
+///   model-facing default (`serial_exec(mode=...)` covers commands).
 /// * `serial_get_config`/`serial_get_metrics`/`serial_list_logs` —
 ///   server-introspection queries; logs are discoverable via
 ///   `resources/list` and readable via `serial_get_logs`.
@@ -201,8 +146,6 @@ pub(crate) enum ToolProfile {
 ///   `serial_load_reference`/`serial_append_reference` — bring-up/init
 ///   surface (`tui_init` TEST, `dutabo init`), noise for daily debugging.
 const AGENT_HIDDEN_TOOLS: &[&str] = &[
-    "serial_send_command",
-    "serial_uboot_command",
     "serial_send_raw",
     "serial_get_config",
     "serial_get_metrics",
@@ -271,10 +214,6 @@ pub struct McpHandler {
     pub(super) connecting_state: Value,
     agent_access_registry: Option<Arc<AgentAccessRegistry>>,
     agent_access_role: Arc<Mutex<AgentAccessRole>>,
-    /// Agent-session identity THIS session presented in its `initialize`
-    /// (`_meta.sermcp_agent_session`, stamped by the stdio bridge). Set during
-    /// the handshake, read by every later `ensure_agent_access`.
-    agent_identity: Arc<Mutex<Option<String>>>,
     dut_caps: DutCapabilities,
     pub(crate) registry: Option<crate::engine_registry::EngineRegistry>,
 }
@@ -331,7 +270,6 @@ impl McpHandler {
             connecting_state,
             agent_access_registry,
             agent_access_role: Arc::new(Mutex::new(initial_role)),
-            agent_identity: Arc::new(Mutex::new(None)),
             dut_caps,
             registry: None,
         }
@@ -449,17 +387,6 @@ impl McpHandler {
             .collect()
     }
 
-    /// This session's agent identity: the `_meta` value captured during
-    /// `initialize` (bridge-stamped). Direct clients that present no
-    /// `_meta` have no identity — the process env is the SERVER's, not
-    /// the client's, and must never be lent to a foreign session.
-    fn session_identity(&self) -> Option<String> {
-        self.agent_identity
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone()
-    }
-
     fn ensure_agent_access(&self, client_name: Option<&str>) -> AgentAccessRole {
         let mut role = self
             .agent_access_role
@@ -470,16 +397,14 @@ impl McpHandler {
             AgentAccessRole::Unassigned | AgentAccessRole::ReadOnly
         ) {
             let previous = *role;
-            let identity = self.session_identity();
             *role = self
                 .agent_access_registry
                 .as_ref()
                 .expect("shared HTTP handler must have an access registry")
-                .assign(client_name, identity.as_deref(), &self.agent_access_role);
+                .assign(&self.agent_access_role);
             if *role != previous {
                 tracing::info!(
                     client = client_name.unwrap_or("unknown"),
-                    agent_session = identity.as_deref().unwrap_or("<none>"),
                     access = ?*role,
                     "assigned MCP session access"
                 );
@@ -555,7 +480,10 @@ impl McpHandler {
     }
 
     /// Lock-free `call_tool` guard — returns the rejection result while an
-    /// interactive dutabo session owns the port, while the startup probe
+    /// interactive dutabo session owns the port (read-only tools stay
+    /// available for log analysis, control tools are rejected so the agent
+    /// can never execute commands or drive the relay under a human's
+    /// session), while the startup probe
     /// is genuinely still in progress, or while this engine does NOT own the
     /// serial endpoint (non-owner: read-only tools stay available, control
     /// tools are rejected so one agent can never reset/flash another's DUT);
@@ -577,11 +505,18 @@ impl McpHandler {
                 json!({"success": false, "code": "dut_removed", "error": "DUT removed from this project"}),
             ));
         }
-        if flags.dutabo_taken.load(Ordering::Relaxed) != 0 && tool_name != "serial_get_state" {
+        // Interactive takeover: control tools are rejected so the agent can
+        // never execute commands (reboot included) or touch the relay while
+        // a human drives the port; read-only tools stay available so log
+        // analysis (`serial_get_logs`, `serial_poll_logs`, ...) continues.
+        if flags.dutabo_taken.load(Ordering::Relaxed) != 0 && !self.tool_is_read_only(tool_name) {
             return Some(text_error(json!({
                 "success": false,
+                "code": "dutabo_session",
                 "error": "Serial is taken over by dutabo interactive session",
                 "state": "dutabo",
+                "hint": "Serial control returns when the interactive session ends; \
+                         logs stay readable via serial_get_logs / serial_poll_logs",
             })));
         }
         if flags.startup_in_progress.load(Ordering::Relaxed) && tool_name != "serial_get_state" {
@@ -714,29 +649,21 @@ impl ServerHandler for McpHandler {
         request: InitializeRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<InitializeResult, ErrorData> {
-        // Capture the bridge-stamped agent identity before any access
-        // decision (`on_initialized` fires right after this response).
-        // rmcp 3.5 lifts `params._meta` out of the typed params during
-        // wire deserialization into the request's extensions, so the
-        // context — not `request.meta` — carries what the client sent;
-        // the typed field stays as the fallback for in-process callers.
-        let identity = context
-            .meta
-            .get(META_AGENT_SESSION)
-            .or_else(|| {
-                request
-                    .meta
-                    .as_ref()
-                    .and_then(|meta| meta.get(META_AGENT_SESSION))
-            })
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_string)
-            .filter(|identity| !identity.is_empty());
-        if let Some(identity) = identity {
-            *self
-                .agent_identity
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(identity);
+        if let Some(parts) = context.extensions.get::<axum::http::request::Parts>()
+            && parts.headers.contains_key(crate::lifecycle::CONTROL_HEADER)
+        {
+            let authorized = self
+                .agent_access_registry
+                .as_ref()
+                .and_then(|registry| registry.control_token.as_deref())
+                .is_some_and(|token| crate::mcp_http::local_control_authorized(parts, token));
+            if !authorized {
+                return Err(ErrorData::invalid_request(
+                    "Invalid local control credential",
+                    None,
+                ));
+            }
+            *self.agent_access_role.lock().unwrap() = AgentAccessRole::Human;
         }
         context.peer.set_peer_info(request.clone());
         self.negotiate_initialize(&request)
@@ -775,15 +702,8 @@ impl ServerHandler for McpHandler {
             return Err(ErrorData::invalid_params("tool not found", None));
         }
 
-        // Dutabo takeover guard — block ALL serial tools while an interactive
-        // `dutabo serial` session owns the port. (The earlier implementation
-        // exempted `serial_send_command`; community best practice is to gate
-        // every tool, since the agent must not race the live terminal.) The
-        // guard
-        // reads the engine's lock-free flags mirror instead of `try_lock()`:
-        // the read loop parks on `wait_readable(100ms)` while holding the
-        // mutex, so try_lock misreports a busy-but-healthy engine as "still
-        // connecting" ~91% of every idle cycle.
+        // Reject quickly during takeover; mutating requests also reserve
+        // control under the engine mutex before dispatch.
         if let Some(rejection) = selected.takeover_rejection(name) {
             return Ok(CallToolResponse::Complete(rejection));
         }
@@ -812,6 +732,15 @@ impl ServerHandler for McpHandler {
                 .handle_reset_with_task(request, supports_tasks)
                 .await;
         }
+
+        let _control = if selected.tool_is_read_only(name) {
+            None
+        } else {
+            match selected.engine.lock().await.begin_control_request() {
+                Ok(token) => Some(token),
+                Err(error) => return Ok(CallToolResponse::Complete(text_error(error))),
+            }
+        };
 
         // Every other tool flows through the macro router.
         let tcc = rmcp::handler::server::tool::ToolCallContext::new(&selected, request, context);
@@ -1145,7 +1074,7 @@ mod tests {
 
     #[test]
     fn shared_http_assigns_first_code_agent_owner_and_later_agents_read_only() {
-        let registry = Arc::new(AgentAccessRegistry::new(false, None));
+        let registry = Arc::new(AgentAccessRegistry::new(false));
         let (first, _first_tmp) = make_shared_handler(registry.clone());
         let (second, _second_tmp) = make_shared_handler(registry);
 
@@ -1161,7 +1090,7 @@ mod tests {
 
     #[test]
     fn shared_http_releases_owner_only_after_last_handler_clone_drops() {
-        let registry = Arc::new(AgentAccessRegistry::new(false, None));
+        let registry = Arc::new(AgentAccessRegistry::new(false));
         let (owner, _tmp) = make_shared_handler(registry.clone());
         let (guest, _guest_tmp) = make_shared_handler(registry);
         assert_eq!(
@@ -1183,7 +1112,7 @@ mod tests {
 
     #[tokio::test]
     async fn guest_state_query_displays_busy_then_dutabo_even_with_engine_locked() {
-        let registry = Arc::new(AgentAccessRegistry::new(true, None));
+        let registry = Arc::new(AgentAccessRegistry::new(true));
         let (guest, _tmp) = make_shared_handler(registry);
         guest.ensure_agent_access(Some("codex"));
         let state = guest.with_session_display(json!({"state":"active", "dut_name":"board"}));
@@ -1210,24 +1139,8 @@ mod tests {
     }
 
     #[test]
-    fn dutabo_does_not_consume_code_agent_owner_slot() {
-        let registry = Arc::new(AgentAccessRegistry::new(false, None));
-        let (dutabo, _dutabo_tmp) = make_shared_handler(registry.clone());
-        let (agent, _agent_tmp) = make_shared_handler(registry);
-
-        assert_eq!(
-            dutabo.ensure_agent_access(Some("dutabo")),
-            AgentAccessRole::Human
-        );
-        assert_eq!(
-            agent.ensure_agent_access(Some("codex")),
-            AgentAccessRole::Owner
-        );
-    }
-
-    #[test]
     fn stdio_owner_reservation_makes_all_http_code_agents_read_only() {
-        let registry = Arc::new(AgentAccessRegistry::new(true, None));
+        let registry = Arc::new(AgentAccessRegistry::new(true));
         let (http_agent, _tmp) = make_shared_handler(registry);
 
         assert_eq!(
@@ -1236,175 +1149,9 @@ mod tests {
         );
     }
 
-    /// Helper: stamp a session handler with the `_meta` identity the
-    /// initialize override would have captured from a bridge-stamped
-    /// handshake.
-    fn with_identity(handler: McpHandler, identity: &str) -> McpHandler {
-        *handler
-            .agent_identity
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(identity.to_string());
-        handler
-    }
-
-    #[test]
-    fn shared_http_same_agent_identity_reenters_as_owner() {
-        // The same agent host opens MCP again (reconnect or parallel
-        // connection): its bridge stamps the same session identity, and
-        // it must NOT be demoted below its own earlier session.
-        let registry = Arc::new(AgentAccessRegistry::new(false, None));
-        let (first, _t1) = make_shared_handler(registry.clone());
-        let first = with_identity(first, "sess-1");
-        let (second, _t2) = make_shared_handler(registry.clone());
-        let second = with_identity(second, "sess-1");
-        let (foreign, _t3) = make_shared_handler(registry);
-        let foreign = with_identity(foreign, "sess-2");
-
-        assert_eq!(
-            first.ensure_agent_access(Some("claude-code")),
-            AgentAccessRole::Owner
-        );
-        assert_eq!(
-            second.ensure_agent_access(Some("claude-code")),
-            AgentAccessRole::Owner
-        );
-        // A genuinely different agent stays a read-only guest.
-        assert_eq!(
-            foreign.ensure_agent_access(Some("codex")),
-            AgentAccessRole::ReadOnly
-        );
-    }
-
-    #[tokio::test]
-    async fn wire_initialize_captures_identity_from_request_metadata() {
-        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
-        let registry = Arc::new(AgentAccessRegistry::new(true, Some("agent-a".into())));
-        let (handler, _tmp) = make_shared_handler(registry);
-        let observer = handler.clone();
-        let (mut client_io, server_io) = tokio::io::duplex(8192);
-        let server = tokio::spawn(async move { serve_server(handler, server_io).await.unwrap() });
-        let line = json!({"jsonrpc":"2.0", "id":1, "method":"initialize", "params":{
-            "protocolVersion":"2025-06-18", "capabilities":{},
-            "clientInfo":{"name":"agent", "version":"1"},
-            "_meta":{META_AGENT_SESSION:"agent-a"}
-        }});
-        client_io
-            .write_all(format!("{line}\n").as_bytes())
-            .await
-            .unwrap();
-        let mut reader = tokio::io::BufReader::new(client_io);
-        let mut response = String::new();
-        tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut response))
-            .await
-            .unwrap()
-            .unwrap();
-        let response: Value = serde_json::from_str(&response).unwrap();
-        assert!(response.get("result").is_some(), "{response}");
-        assert_eq!(observer.session_identity().as_deref(), Some("agent-a"));
-        assert_eq!(
-            observer.ensure_agent_access(Some("agent")),
-            AgentAccessRole::Owner
-        );
-        reader
-            .get_mut()
-            .write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n")
-            .await
-            .unwrap();
-        let service = tokio::time::timeout(Duration::from_secs(5), server)
-            .await
-            .unwrap()
-            .unwrap();
-        drop(reader);
-        drop(service);
-    }
-
-    #[test]
-    fn shared_http_keeps_owner_until_all_same_agent_connections_close() {
-        let registry = Arc::new(AgentAccessRegistry::new(false, None));
-        let (first, _t1) = make_shared_handler(registry.clone());
-        let first = with_identity(first, "agent-a");
-        let (second, _t2) = make_shared_handler(registry.clone());
-        let second = with_identity(second, "agent-a");
-        let second_clone = second.clone();
-        let (foreign, _t3) = make_shared_handler(registry);
-        let foreign = with_identity(foreign, "agent-b");
-        assert_eq!(
-            first.ensure_agent_access(Some("agent")),
-            AgentAccessRole::Owner
-        );
-        assert_eq!(
-            second.ensure_agent_access(Some("agent")),
-            AgentAccessRole::Owner
-        );
-        drop(first);
-        assert_eq!(
-            foreign.ensure_agent_access(Some("agent")),
-            AgentAccessRole::ReadOnly
-        );
-        drop(second);
-        assert_eq!(
-            foreign.ensure_agent_access(Some("agent")),
-            AgentAccessRole::ReadOnly
-        );
-        drop(second_clone);
-        assert_eq!(
-            foreign.ensure_agent_access(Some("agent")),
-            AgentAccessRole::Owner
-        );
-    }
-
-    #[test]
-    fn stdio_reservation_admits_only_the_owning_agents_identity() {
-        // The stdio singleton's control port: the reservation is keyed on
-        // the spawning agent's identity. The same agent's bridged session
-        // re-enters as owner; a foreign agent stays read-only.
-        let registry = Arc::new(AgentAccessRegistry::new(true, Some("sess-1".to_string())));
-        let (same_agent, _t1) = make_shared_handler(registry.clone());
-        let same_agent = with_identity(same_agent, "sess-1");
-        let (foreign, _t2) = make_shared_handler(registry);
-        let foreign = with_identity(foreign, "sess-2");
-
-        assert_eq!(
-            same_agent.ensure_agent_access(Some("claude-code")),
-            AgentAccessRole::Owner
-        );
-        assert_eq!(
-            foreign.ensure_agent_access(Some("codex")),
-            AgentAccessRole::ReadOnly
-        );
-    }
-
-    #[test]
-    fn owner_death_moves_the_identity_anchor_to_the_new_owner() {
-        // When the owner session dies, the next claimer records ITS
-        // identity; a later connection of the dead owner's agent is then a
-        // guest, not an owner.
-        let registry = Arc::new(AgentAccessRegistry::new(false, None));
-        let (owner, _t1) = make_shared_handler(registry.clone());
-        let owner = with_identity(owner, "sess-1");
-        assert_eq!(
-            owner.ensure_agent_access(Some("claude-code")),
-            AgentAccessRole::Owner
-        );
-        drop(owner);
-
-        let (successor, _t2) = make_shared_handler(registry.clone());
-        let successor = with_identity(successor, "sess-2");
-        assert_eq!(
-            successor.ensure_agent_access(Some("codex")),
-            AgentAccessRole::Owner
-        );
-        let (late, _t3) = make_shared_handler(registry);
-        let late = with_identity(late, "sess-1");
-        assert_eq!(
-            late.ensure_agent_access(Some("claude-code")),
-            AgentAccessRole::ReadOnly
-        );
-    }
-
     #[test]
     fn read_only_agent_can_query_but_cannot_operate_or_mutate_tasks() {
-        let registry = Arc::new(AgentAccessRegistry::new(true, None));
+        let registry = Arc::new(AgentAccessRegistry::new(true));
         let (handler, _tmp) = make_shared_handler(registry);
 
         assert!(
@@ -1423,7 +1170,7 @@ mod tests {
                 .is_none()
         );
 
-        for tool in ["serial_send_command", "serial_reset", "serial_claim"] {
+        for tool in ["serial_exec", "serial_reset", "serial_claim"] {
             let rejection = handler
                 .agent_access_rejection(tool, Some("codex"))
                 .expect("mutating tool must be rejected for a read-only agent");
@@ -1500,21 +1247,6 @@ mod tests {
     }
 
     #[test]
-    fn shared_http_human_sessions_get_full_agents_get_agent() {
-        let registry = Arc::new(AgentAccessRegistry::new(false, None));
-        let (dutabo_handler, _dutabo_tmp) = make_shared_handler(registry.clone());
-        let (agent_handler, _agent_tmp) = make_shared_handler(registry);
-        assert_eq!(
-            dutabo_handler.session_tool_profile(Some("dutabo")),
-            ToolProfile::Full
-        );
-        assert_eq!(
-            agent_handler.session_tool_profile(Some("codex")),
-            ToolProfile::Agent
-        );
-    }
-
-    #[test]
     fn agent_profile_keeps_debugging_core_withholds_implementation_tools() {
         let (handler, _tmp) = make_handler_with_relay_buttons();
         let names = names_of(&handler, ToolProfile::Agent);
@@ -1562,10 +1294,14 @@ mod tests {
             .map(|tool| tool.name.to_string())
             .collect();
         assert_eq!(full, router);
-        // The unified exec entry coexists with the legacy pair the internal
-        // CLI clients (dutabo, tui_init) still drive over this same server.
-        for name in ["serial_exec", "serial_send_command", "serial_uboot_command"] {
-            assert!(full.iter().any(|n| n == name), "{name}: {full:?}");
+        // The unified exec entry is THE command tool; the legacy duplicated
+        // pair was removed.
+        assert!(full.iter().any(|n| n == "serial_exec"), "{full:?}");
+        for removed in ["serial_send_command", "serial_uboot_command"] {
+            assert!(
+                !full.iter().any(|n| n == removed),
+                "{removed} was removed: {full:?}"
+            );
         }
     }
 
@@ -2083,7 +1819,7 @@ mod tests {
         // reject control tools while leaving state queries available.
         handler.engine.lock().await.begin_manual_session();
         let rejection = handler
-            .takeover_rejection("serial_send_command")
+            .takeover_rejection("serial_exec")
             .expect("dutabo takeover must block tools");
         assert_eq!(rejection.is_error, Some(true));
         let wire = serde_json::to_value(rejection).unwrap();
@@ -2093,11 +1829,41 @@ mod tests {
                 .unwrap()
                 .contains("taken over by dutabo interactive session")
         );
+        assert!(
+            wire["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("dutabo_session"),
+            "the takeover rejection must carry the dutabo_session code"
+        );
         assert!(handler.takeover_rejection("serial_get_state").is_none());
+
+        // Command execution and every relay path stay blocked …
+        for tool in [
+            "serial_send_raw",
+            "serial_power_cycle",
+            "serial_reset",
+            "serial_button",
+            "serial_enter_uboot",
+            "serial_wait_pattern",
+            "serial_claim",
+        ] {
+            assert!(
+                handler.takeover_rejection(tool).is_some(),
+                "{tool} must stay blocked during a dutabo takeover"
+            );
+        }
+        // … while read-only log analysis keeps working.
+        for tool in ["serial_get_logs", "serial_list_logs", "serial_poll_logs"] {
+            assert!(
+                handler.takeover_rejection(tool).is_none(),
+                "{tool} must stay available during a dutabo takeover"
+            );
+        }
 
         // The session ends → guard opens again.
         handler.engine.lock().await.clear_ws_tx();
-        assert!(handler.takeover_rejection("serial_send_command").is_none());
+        assert!(handler.takeover_rejection("serial_exec").is_none());
     }
 
     /// serial_claim must stay reachable for a non-owner engine: it is the
@@ -2127,7 +1893,7 @@ mod tests {
         // The claim itself passes the non-owner gate…
         assert!(handler.takeover_rejection("serial_claim").is_none());
         // …while every other control tool stays gated for the same engine.
-        assert!(handler.takeover_rejection("serial_send_command").is_some());
+        assert!(handler.takeover_rejection("serial_exec").is_some());
         assert!(handler.takeover_rejection("serial_reset").is_some());
     }
 
@@ -2431,6 +2197,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn read_resource_rejects_oversized_log_and_preserves_invalid_byte_text() {
+        let (h, tmp) = make_handler();
+        std::fs::create_dir_all(logs_dir(&tmp)).unwrap();
+        let path = logs_dir(&tmp).join("full.full.log");
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(16 * 1024 * 1024 * 1024).unwrap();
+        let error = h
+            .read_resource_impl("log://serial/raw/full")
+            .await
+            .unwrap_err();
+        let data = error.data.unwrap();
+        assert_eq!(data["code"], "resource_too_large");
+        assert_eq!(data["path"], path.to_string_lossy().as_ref());
+        assert_eq!(data["max_bytes"], 8 * 1024 * 1024);
+
+        std::fs::write(&path, b"before\xffafter\n").unwrap();
+        let response = h.read_resource_impl("log://serial/raw/full").await.unwrap();
+        let ReadResourceResponse::Complete(response) = response else {
+            panic!("expected complete resource");
+        };
+        let ResourceContents::TextResourceContents { text, .. } = &response.contents[0] else {
+            panic!("expected text content");
+        };
+        assert_eq!(text, "before\u{fffd}after\n");
+        assert_eq!(std::fs::read(path).unwrap(), b"before\xffafter\n");
+    }
+
+    #[tokio::test]
     async fn read_resource_returns_unclassified_log_under_dut_dir() {
         // unclassified.log lives in `.dut-serial/<name>/` (NOT logs/), so
         // this verifies the resource layer resolves it via `dut_dir()`.
@@ -2711,27 +2505,24 @@ mod tests {
 
     #[tokio::test]
     async fn wire_tools_list_filters_by_session_role() {
-        let registry = Arc::new(AgentAccessRegistry::new(false, None));
+        let registry = Arc::new(AgentAccessRegistry::new(false));
         let (agent_handler, _agent_tmp) = make_shared_handler(registry.clone());
         let (dutabo_handler, _dutabo_tmp) = make_shared_handler(registry);
 
         let agent_tools = tools_seen_by("codex-agent", agent_handler).await;
+        *dutabo_handler.agent_access_role.lock().unwrap() = AgentAccessRole::Human;
         let dutabo_tools = tools_seen_by("dutabo", dutabo_handler).await;
 
         // Agent catalog: unified entry in, implementation tools out.
         assert!(agent_tools.iter().any(|name| name == "serial_exec"));
-        for hidden in [
-            "serial_send_command",
-            "serial_test_baud",
-            "serial_get_metrics",
-        ] {
+        for hidden in ["serial_send_raw", "serial_test_baud", "serial_get_metrics"] {
             assert!(
                 !agent_tools.iter().any(|name| name == hidden),
                 "{hidden} must not be listed for an agent session: {agent_tools:?}"
             );
         }
         // Human-role CLI session keeps the complete catalog.
-        for present in ["serial_exec", "serial_send_command", "serial_test_baud"] {
+        for present in ["serial_exec", "serial_send_raw", "serial_test_baud"] {
             assert!(
                 dutabo_tools.iter().any(|name| name == present),
                 "{present} must be listed for the dutabo session: {dutabo_tools:?}"

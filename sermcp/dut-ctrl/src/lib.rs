@@ -228,7 +228,7 @@ impl ButtonChannels {
 // ```
 //
 // The built-in ch340 backend registers itself the same way (feature-gated);
-// `none`/`disabled` are the semantic "no power control" builtin, not plugins.
+// `none` is the semantic "no power control" builtin, not a plugin.
 
 use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex};
@@ -238,8 +238,6 @@ pub type BackendFactory = fn(&PowerControlConfig) -> Box<dyn PowerControl>;
 
 static REGISTRY: LazyLock<Mutex<HashMap<String, BackendFactory>>> = LazyLock::new(|| {
     Mutex::new(HashMap::from([
-        #[cfg(feature = "ch340")]
-        ("ch340".to_string(), ch340_factory as BackendFactory),
         #[cfg(feature = "ch340")]
         ("ch340-relay".to_string(), ch340_factory as BackendFactory),
     ]))
@@ -251,7 +249,7 @@ static REGISTRY: LazyLock<Mutex<HashMap<String, BackendFactory>>> = LazyLock::ne
 pub fn register_backend(name: &str, factory: BackendFactory) {
     REGISTRY
         .lock()
-        .unwrap_or_else(|e| e.into_inner())
+        .expect("resource registry mutex poisoned")
         .insert(name.to_string(), factory);
 }
 
@@ -264,27 +262,32 @@ fn ch340_factory(config: &PowerControlConfig) -> Box<dyn PowerControl> {
     )
 }
 
-/// Build the backend selected by `config.backend` ("" / absent → the ch340
-/// plugin, mirroring the legacy default). Unknown names and unregistered
-/// plugins fall back to the disabled backend with an explanatory reason —
-/// never a panic, so a stale `.target.jsonc` cannot crash the server.
+/// Build the backend selected by `config.backend` ("" / absent → the
+/// ch340-relay plugin, the default power control). Unknown names and
+/// unregistered plugins fall back to the disabled backend with an
+/// explanatory reason — never a panic, so a stale `.target.jsonc` cannot
+/// crash the server.
 pub fn build_backend(config: &PowerControlConfig) -> Box<dyn PowerControl> {
     let backend = config.backend.trim().to_ascii_lowercase();
     match backend.as_str() {
-        "none" | "disabled" => Box::new(DisabledControl::new(
+        "none" => Box::new(DisabledControl::new(
             "power control disabled by configuration",
         )),
         "" => match REGISTRY
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get("ch340")
+            .expect("resource registry mutex poisoned")
+            .get("ch340-relay")
         {
             Some(factory) => factory(config),
             None => Box::new(DisabledControl::new(
                 "CH340 backend was not compiled (enable dut-ctrl feature `ch340`)",
             )),
         },
-        name => match REGISTRY.lock().unwrap_or_else(|e| e.into_inner()).get(name) {
+        name => match REGISTRY
+            .lock()
+            .expect("resource registry mutex poisoned")
+            .get(name)
+        {
             Some(factory) => factory(config),
             None => Box::new(DisabledControl::new(format!(
                 "unknown backend '{name}' — no plugin registered under this name"
@@ -293,14 +296,14 @@ pub fn build_backend(config: &PowerControlConfig) -> Box<dyn PowerControl> {
     }
 }
 
-/// Is a backend name available (a registered plugin, or the built-in
-/// `none`/`disabled` semantics)?
+/// Is a backend name available (a registered plugin, or the built-in `none`
+/// semantics)?
 pub fn supports(name: &str) -> bool {
     match name.trim().to_ascii_lowercase().as_str() {
-        "" | "none" | "disabled" => true,
+        "" | "none" => true,
         n => REGISTRY
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .expect("resource registry mutex poisoned")
             .contains_key(n),
     }
 }
@@ -402,7 +405,7 @@ mod tests {
     #[cfg(feature = "ch340")]
     #[test]
     fn target_type_selects_ch340_extension() {
-        let backend = build_backend(&backend_config("ch340"));
+        let backend = build_backend(&backend_config("ch340-relay"));
         assert_eq!(backend.name(), "ch340-relay");
         assert!(backend.has_button(Button::Reset));
         // The `usb-relay` alias was removed — it now resolves
@@ -414,15 +417,15 @@ mod tests {
 
     #[test]
     fn target_type_can_disable_power_control() {
-        let backend = build_backend(&backend_config("disabled"));
+        let backend = build_backend(&backend_config("none"));
         assert_eq!(backend.name(), "disabled");
         assert!(!backend.has_button(Button::Reset));
         assert!(!supports("unknown-backend"));
         // The external dev-ctl program backend was removed.
         assert!(!supports("external-dev-ctl"));
         assert!(!supports("dev-ctl"));
-        // An empty backend name resolves to the ch340 plugin (legacy
-        // default), or the disabled backend when ch340 is not compiled.
+        // An empty backend name resolves to the ch340-relay plugin
+        // (the default), or the disabled backend when ch340 is not compiled.
         let empty = build_backend(&backend_config(""));
         assert!(!empty.has_button(Button::Download));
         #[cfg(feature = "ch340")]

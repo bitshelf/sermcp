@@ -510,8 +510,7 @@ impl FormState {
                 .dev_hosts
                 .get(*hi)
                 .and_then(|h| h.duts.get(*di))
-                .and_then(|d| d.relay.as_ref().and_then(|r| r.relay_type.clone()))
-                .map(|relay_type| normalize_relay_type(&relay_type)),
+                .and_then(|d| d.relay.as_ref().and_then(|r| r.relay_type.clone())),
             FieldKey::DutRelayPort(hi, di) => existing
                 .dev_hosts
                 .get(*hi)
@@ -809,7 +808,7 @@ impl FormState {
         if self.schema.advanced_gate == AdvancedGate::Skip {
             return;
         }
-        self.other_expanded = !self.other_expanded;
+        self.other_expanded.toggle();
         if !self.gate_forced() {
             self.gate = self.other_expanded;
         }
@@ -1556,7 +1555,7 @@ fn handle_form_mode_key(state: &mut FormState, key: KeyEvent) -> FormAction {
     }
     // '?' toggles the footer key hints (hidden by default).
     if key.code == KeyCode::Char('?') && !field_owns_q(state) {
-        state.footer_hints_visible = !state.footer_hints_visible;
+        state.footer_hints_visible.toggle();
         return FormAction::Continue;
     }
     // F2 saves DIRECTLY — no Review screen.
@@ -2627,8 +2626,8 @@ fn dut_boxes(state: &FormState, hi: usize, di: usize) -> Vec<DutBox> {
         adv("control.dev_ctrl"),
     ];
     let mut right = vec![
-        adv("flash.loader_cmd"),
-        adv("flash.list_devices_cmd"),
+        adv("download.loader_cmd"),
+        adv("download.list_devices_cmd"),
         adv("loader"),
         adv("uboot.interrupt_char"),
     ];
@@ -2793,7 +2792,7 @@ fn dut_content_layout(state: &FormState, content: Rect, shared_line: bool) -> Du
     let boxes = dut_boxes(state, hi, di);
     // Fixed box→column pinning: whole boxes per column, canonical order
     // top-to-bottom inside each (— no balancing, no splitting).
-    let mut cols: Vec<Vec<&DutBox>> = vec![Vec::new(); n];
+    let mut cols: Vec<Vec<&DutBox>> = Vec::from_fn(n, |_| Vec::new());
     for b in &boxes {
         cols[dut_box_column(b.name, n)].push(b);
     }
@@ -3320,41 +3319,29 @@ fn form_mode_layout(area: Rect, state: &FormState) -> LayoutMap {
     map
 }
 
-/// The `.target.jsonc` download overlay for one DUT, from the RENDERED
-/// test config (existing text + form edits): DUT-level `download.*`
-/// over global `download.*`, with the legacy `flash.loader_cmd` /
-/// `flash.list_devices_cmd` spellings as migration fallbacks. The
-/// provider defaults apply where this returns None — there is
-/// deliberately no CLI layer.
+/// Resolve the DUT download overlay, then global values, then provider defaults.
 fn download_overlay_for(test_text: &str, hi: usize, di: usize) -> (Option<String>, Option<String>) {
     let Ok(config) = sermcp::config::parse_jsonc_text(test_text) else {
         return (None, None);
     };
-    let dut = config.dev_hosts.get(hi).and_then(|h| h.duts.get(di));
-    fn overlay(
-        sections: &sermcp::config::JsoncSections,
-        key: fn(&sermcp::config::JsoncDownload) -> &Option<String>,
-        legacy: fn(&sermcp::config::JsoncFlash) -> &Option<String>,
-    ) -> Option<String> {
-        sections
-            .download
-            .as_ref()
-            .and_then(|d| key(d).clone())
-            .or_else(|| sections.flash.as_ref().and_then(|f| legacy(f).clone()))
-    }
-    let dut_sections = dut.map(sermcp::config::JsoncSections::from);
-    let global_sections = sermcp::config::JsoncSections::from(&config);
-    let resolve = |field: fn(&sermcp::config::JsoncDownload) -> &Option<String>,
-                   legacy: fn(&sermcp::config::JsoncFlash) -> &Option<String>| {
-        // DUT section wins over the global fallback.
-        dut_sections
-            .as_ref()
-            .and_then(|d| overlay(d, field, legacy))
-            .or_else(|| overlay(&global_sections, field, legacy))
+    let dut = config
+        .dev_hosts
+        .get(hi)
+        .and_then(|h| h.duts.get(di))
+        .and_then(|dut| dut.download.as_ref());
+    let resolve = |field: fn(&sermcp::config::JsoncDownload) -> &Option<String>| {
+        dut.and_then(|download| field(download).clone())
+            .or_else(|| {
+                config
+                    .download
+                    .as_ref()
+                    .and_then(|download| field(download).clone())
+            })
     };
-    let loader = resolve(|d| &d.loader_cmd, |f| &f.loader_cmd);
-    let list = resolve(|d| &d.list_devices_cmd, |f| &f.list_devices_cmd);
-    (loader, list)
+    (
+        resolve(|download| &download.loader_cmd),
+        resolve(|download| &download.list_devices_cmd),
+    )
 }
 
 /// [Test] [Save] [Save & Exit] [Exit] at the footer's right edge — shared by
@@ -3403,34 +3390,6 @@ fn footer_button_rects(footer: Rect) -> Vec<(ButtonId, Rect)> {
     ]
 }
 
-/// Direct fallback parameters for the U-Boot interrupt probe — DEBUG-ONLY
-/// (compiled with `direct-dut-probe`; production never direct-connects to
-/// the DUT from `init`).
-#[cfg(feature = "direct-dut-probe")]
-#[derive(Clone)]
-struct DirectUbootProbe {
-    relay_host: String,
-    relay_port: u16,
-    channel: u8,
-    serial_host: String,
-    serial_port: u16,
-    interrupt_char: u8,
-    reset_hold_ms: u64,
-}
-
-/// Direct fallback parameters for the relay reset-cycle probe — DEBUG-ONLY.
-#[cfg(feature = "direct-dut-probe")]
-#[derive(Clone)]
-struct DirectResetCycleProbe {
-    relay_host: String,
-    relay_port: u16,
-    channel: u8,
-    serial_host: String,
-    serial_port: u16,
-    save_path: std::path::PathBuf,
-    reset_hold_ms: u64,
-}
-
 /// One connectivity probe (TEST button, real-hardware
 /// extensions). Quick probes stay bounded (connect 700 ms,
 /// per-probe ≤1 s); the relay cycle and SSH login are the two SLOW
@@ -3460,22 +3419,16 @@ enum ProbeTarget {
         pass: String,
         linked_user: FieldKey,
     },
-    /// RFC 2217 baudrate negotiation on the serial endpoint: connect,
-    /// offer COM-PORT, set the baudrate — a ser2net rfc2217 port answers
-    /// with telnet IAC traffic. DEBUG-ONLY direct probe (it would evict the
-    /// MCP server's serial connection in production).
-    #[cfg(feature = "direct-dut-probe")]
-    SerialBaud { host: String, port: u16, baud: u32 },
+
     /// A MANDATORY probe whose prerequisite is missing (dev_ctrl chose a
     /// real relay backend but the relay port is not filled): the row must
     /// fail loudly (✗), not silently skip (user rule: with
     /// ch340-relay chosen, the port and reset MUST be tested).
     AlwaysFail,
     /// Fresh raw-byte baud test through the MCP-owned SerialEngine. The init
-    /// process never opens ser2net directly in production. `use_reset=false`
+    /// process never opens the serial endpoint directly. `use_reset=false`
     /// when the form's dev_ctrl is none: the server must not press the
     /// reset relay the user disabled.
-    #[cfg(not(feature = "direct-dut-probe"))]
     McpBaudTest {
         ports: DutPorts,
         baud: u32,
@@ -3496,30 +3449,24 @@ enum ProbeTarget {
         mode_buttons: Vec<String>,
         linked_keys: Vec<FieldKey>,
     },
-    /// U-Boot autoboot-interrupt test. Primary: the MCP server's dev-ctrl
+    /// U-Boot autoboot-interrupt test through the MCP server's dev-ctrl
     /// backend (`serial_enter_uboot`) — when dev_ctrl is enabled this proves
-    /// the configured interrupt char stops autoboot at `=>`. The direct
-    /// relay reset + interrupt flood fallback is compiled only with
-    /// `direct-dut-probe`. The mark lands on uboot.interrupt_char.
+    /// the configured interrupt char stops autoboot at `=>`.
+    /// The mark lands on uboot.interrupt_char.
     UbootInterrupt {
         ports: DutPorts,
         interrupt_char: String,
         soft_reboot: bool,
         normalization_key: Option<FieldKey>,
-        #[cfg(feature = "direct-dut-probe")]
-        direct: DirectUbootProbe,
     },
-    /// Full relay reset cycle. Primary: the MCP server's connection
+    /// Full relay reset cycle through the MCP server's connection
     /// learning (`serial_learn_connection`) — reset cycles whose pairwise
     /// similarity reaches ≥93% (≥2 cycles); on success the server writes
-    /// the reference log. The direct press/release fallback is compiled
-    /// only with `direct-dut-probe`. The mark lands on monitor.reference_log.
+    /// the reference log. The mark lands on monitor.reference_log.
     RelayResetCycle {
         ports: DutPorts,
         reference_log_path: String,
         use_power: bool,
-        #[cfg(feature = "direct-dut-probe")]
-        direct: DirectResetCycleProbe,
     },
     /// Deliberate non-test: reference-log learning needs a HARDWARE reset to
     /// align the boot boundary (press → rotate the log in the silence →
@@ -3528,18 +3475,9 @@ enum ProbeTarget {
     /// plain algorithm can tell "first line of the new boot" from that tail.
     /// Rendered as · skip with the reason, never ✗.
     Skip { reason: String },
-    /// Per-channel relay liveness: send the ch340 STATUS packet for one
-    /// FILLED channel and expect a reply — a non-disruptive check of
-    /// every configured channel (reset/download/recovery/power). DEBUG-ONLY
-    /// direct probe: compiled only with `direct-dut-probe`.
-    #[cfg(feature = "direct-dut-probe")]
-    RelayChannelStatus {
-        host: String,
-        port: u16,
-        channel: u8,
-    },
+
     /// Flash device-list probe: verify the DUT entered
-    /// flashing mode. Runs `flash.list_devices_cmd` on the dev host BEFORE
+    /// flashing mode. Runs `download.list_devices_cmd` on the dev host BEFORE
     /// (baseline), triggers flashing mode, then polls it AGAIN for ~15 s —
     /// the newly-appeared device lines (the XOR of the two outputs) are the
     /// probe detail. The trigger is CONTEXT-AWARE (flash.rs): at the
@@ -3581,70 +3519,6 @@ enum ProbeTarget {
         pass: String,
         list_cmd: String,
     },
-}
-
-/// How many boot-log lines the relay test saves as the similarity
-/// reference (matches the connection learner's compare window — the
-/// default `compare_lines` is 50; keeping them identical means the saved
-/// file feeds `serial_load_reference` unchanged).
-#[cfg(feature = "direct-dut-probe")]
-const REFERENCE_LINES: usize = 50;
-
-/// First N meaningful lines of captured serial output: split on newline,
-/// strip CR and trailing blanks; empty lines skipped. PURE (unit-tested).
-#[cfg(feature = "direct-dut-probe")]
-fn first_reference_lines(data: &[u8], n: usize) -> Vec<String> {
-    let text = String::from_utf8_lossy(data);
-    text.split('\n')
-        .map(|l| l.trim_end_matches('\r').trim())
-        .filter(|l| !l.is_empty())
-        .take(n)
-        .map(str::to_string)
-        .collect()
-}
-
-/// Board-output check for the press window: bytes that survive telnet
-/// IAC stripping and banner-line removal count as "the board talked while
-/// held in reset" (a wiring/channel error). PURE (unit-tested).
-#[cfg(feature = "direct-dut-probe")]
-fn meaningful_serial_noise(data: &[u8]) -> bool {
-    // Drop telnet IAC sequences (0xff + cmd [+ option] / SB...SE) — the
-    // same shapes TerminalSanitizer handles; a tiny local copy keeps the
-    // probe worker self-contained.
-    let mut stripped = Vec::with_capacity(data.len());
-    let mut i = 0;
-    while i < data.len() {
-        if data[i] == 0xff && i + 1 < data.len() {
-            let cmd = data[i + 1];
-            if cmd == 0xff {
-                stripped.push(0xff); // escaped literal
-                i += 2;
-                continue;
-            }
-            if (0xfb..=0xfe).contains(&cmd) {
-                i += 3; // WILL/WONT/DO/DONT + option
-                continue;
-            }
-            if cmd == 0xfa {
-                // subnegotiation: skip to IAC SE
-                i += 2;
-                while i + 1 < data.len() && !(data[i] == 0xff && data[i + 1] == 0xf0) {
-                    i += 1;
-                }
-                i += 2;
-                continue;
-            }
-            i += 2; // two-byte command
-            continue;
-        }
-        stripped.push(data[i]);
-        i += 1;
-    }
-    let text = String::from_utf8_lossy(&stripped);
-    text.lines().any(|l| {
-        let t = l.trim_end_matches('\r').trim();
-        !t.is_empty() && !t.contains("ser2net port")
-    })
 }
 
 /// Try public-key authentication and retain the narrow stale-host-key recovery
@@ -3815,475 +3689,12 @@ fn ssh_askpass_login(dest: &str, pass: &str, base: &[&str]) -> bool {
     ok
 }
 
-/// RFC 2217 baudrate probe: connect, negotiate COM-PORT, set the rate —
-/// an rfc2217 ser2net endpoint answers with IAC traffic.
-#[cfg(feature = "direct-dut-probe")]
-fn probe_serial_baud(host: &str, port: u16, baud: u32) -> ProbeMark {
-    use std::io::{Read, Write};
-    use std::net::TcpStream;
-    use std::net::ToSocketAddrs;
-    let Some(addr) = (host, port)
-        .to_socket_addrs()
-        .ok()
-        .and_then(|mut a| a.next())
-    else {
-        return ProbeMark::Err;
-    };
-    let Ok(mut stream) = TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(700))
-    else {
-        return ProbeMark::Err;
-    };
-    let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(700)));
-    // Good-citizen prelude: accept the server's DO (IAC WILL), offer our
-    // own DO, then the rate. (Live-verified against ser2net:
-    // the endpoint may still send IAC WONT for the option itself — a
-    // quirk — while applying AND acknowledging the requested rate.)
-    let mut msg = vec![0xff, 0xfb, 44, 0xff, 0xfd, 44];
-    msg.extend(sermcp::telnet_filter::rfc2217_set_baudrate(baud));
-    if stream.write_all(&msg).is_err() {
-        return ProbeMark::Err;
-    }
-    let _ = stream.flush();
-    // Collect the answer until the SERVER-SET-BAUDRATE acknowledgement
-    // (cmd 101) arrives — the authoritative "rate applied" reply.
-    let mut buf = [0u8; 512];
-    let mut resp = Vec::new();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(1500);
-    while std::time::Instant::now() < deadline {
-        match stream.read(&mut buf) {
-            Ok(n) if n > 0 => resp.extend_from_slice(&buf[..n]),
-            _ => {}
-        }
-        if rfc2217_baud_ack(&resp).is_some() {
-            break;
-        }
-    }
-    let Some(actual) = rfc2217_baud_ack(&resp) else {
-        // No acknowledgement: the endpoint does not speak rfc2217 (or
-        // never applied the rate) — not a pass.
-        return ProbeMark::Err;
-    };
-    if actual != baud {
-        // Acknowledged at a DIFFERENT rate: the endpoint clamped it.
-        return ProbeMark::Err;
-    }
-    // The ack alone cannot catch a WRONG-but-applied rate (ser2net acks
-    // anything, field-observed: "9600 passed"). Data-quality
-    // check: poke the console and classify the output — a mismatched
-    // UART renders garbage; a matched one answers clean text.
-    if stream.write_all(b"\r").is_err() {
-        return ProbeMark::Warn;
-    }
-    let _ = stream.flush();
-    let mut data = Vec::new();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(1500);
-    while std::time::Instant::now() < deadline {
-        match stream.read(&mut buf) {
-            Ok(n) if n > 0 => data.extend_from_slice(&buf[..n]),
-            _ => {}
-        }
-    }
-    // Strip telnet IAC traffic before judging text quality.
-    let text = strip_iac(&data);
-    if text.is_empty() {
-        // Quiet console: the rate was applied but nothing answers —
-        // cannot confirm nor deny.
-        return ProbeMark::Warn;
-    }
-    let garbage = text
-        .iter()
-        .filter(|&&b| b >= 0x80 || (b < 0x20 && b != b'\r' && b != b'\n' && b != b'\t'))
-        .count();
-    let ratio = garbage as f64 / text.len() as f64;
-    if ratio > 0.25 {
-        ProbeMark::Err // mojibake: the configured baud is wrong
-    } else {
-        ProbeMark::Ok
-    }
-}
-
-/// Drop telnet IAC sequences (negotiation/subnegotiation); keep escaped
-/// literal 0xFF data bytes. PURE.
-#[cfg(feature = "direct-dut-probe")]
-fn strip_iac(data: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(data.len());
-    let mut i = 0;
-    while i < data.len() {
-        if data[i] == 0xff && i + 1 < data.len() {
-            let cmd = data[i + 1];
-            if cmd == 0xff {
-                out.push(0xff);
-                i += 2;
-                continue;
-            }
-            if (0xfb..=0xfe).contains(&cmd) {
-                i += 3;
-                continue;
-            }
-            if cmd == 0xfa {
-                i += 2;
-                while i + 1 < data.len() && !(data[i] == 0xff && data[i + 1] == 0xf0) {
-                    i += 1;
-                }
-                i += 2;
-                continue;
-            }
-            i += 2;
-            continue;
-        }
-        out.push(data[i]);
-        i += 1;
-    }
-    out
-}
-
-/// Parse the RFC 2217 SERVER-SET-BAUDRATE acknowledgement
-/// (`IAC SB COM-PORT SERVER-SET-BAUDRATE(101) <4-byte rate> IAC SE`) —
-/// the authoritative "rate applied" reply. PURE.
-#[cfg(feature = "direct-dut-probe")]
-fn rfc2217_baud_ack(resp: &[u8]) -> Option<u32> {
-    let needle = [0xff, 0xfa, 44, 101];
-    let pos = resp.windows(4).position(|w| w == needle)?;
-    let rate = resp.get(pos + 4..pos + 8)?;
-    if resp.get(pos + 8) != Some(&0xff) {
-        return None;
-    }
-    Some(u32::from_be_bytes([rate[0], rate[1], rate[2], rate[3]]))
-}
-
-/// One relay channel liveness check: connect to the relay endpoint and
-/// send the ch340 STATUS packet — a responding relay is wired and the
-/// channel number is in range (non-disruptive: STATUS never switches).
-#[cfg(feature = "direct-dut-probe")]
-fn probe_relay_channel_status(host: &str, port: u16, channel: u8) -> ProbeMark {
-    use std::io::{Read, Write};
-    use std::net::TcpStream;
-    use std::net::ToSocketAddrs;
-    let Some(addr) = (host, port)
-        .to_socket_addrs()
-        .ok()
-        .and_then(|mut a| a.next())
-    else {
-        return ProbeMark::Err;
-    };
-    let Ok(mut stream) = TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(700))
-    else {
-        return ProbeMark::Err;
-    };
-    let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(500)));
-    let pkt = sermcp::power_control::relay_packet(channel, sermcp::power_control::RELAY_OP_STATUS);
-    if stream.write_all(&pkt).is_err() {
-        return ProbeMark::Err;
-    }
-    let mut buf = [0u8; 16];
-    matches!(stream.read(&mut buf), Ok(n) if n > 0)
-        .then_some(())
-        .map_or(ProbeMark::Err, |_| ProbeMark::Ok)
-}
-
-/// U-Boot interrupt char from the already validated form value. PURE.
-#[cfg(feature = "direct-dut-probe")]
-fn parse_interrupt_char(v: &str) -> u8 {
-    sermcp::config::parse_interrupt_char(v)
-}
-
-/// Reset via the relay and flood the interrupt char through the boot
-/// window: Ok when the U-Boot prompt (`=>`) appears — the board stopped
-/// at the bootloader command line (requested).
-#[cfg(feature = "direct-dut-probe")]
-fn probe_uboot_interrupt(
-    relay_host: &str,
-    relay_port: u16,
-    channel: u8,
-    serial_host: &str,
-    serial_port: u16,
-    interrupt_char: u8,
-    reset_hold_ms: u64,
-) -> ProbeMark {
-    use std::io::{Read, Write};
-    use std::net::{TcpStream, ToSocketAddrs};
-    let connect = |host: &str, port: u16| -> Option<TcpStream> {
-        let addr = (host, port)
-            .to_socket_addrs()
-            .ok()
-            .and_then(|mut a| a.next())?;
-        TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(700)).ok()
-    };
-    let Some(mut serial) = connect(serial_host, serial_port) else {
-        return ProbeMark::Err;
-    };
-    let _ = serial.set_read_timeout(Some(std::time::Duration::from_millis(100)));
-    let Some(mut relay) = connect(relay_host, relay_port) else {
-        return ProbeMark::Err;
-    };
-    let pkt = |op: u8| sermcp::power_control::relay_packet(channel, op);
-
-    // Press: hold the board in reset (drain the connect chatter).
-    if relay
-        .write_all(&pkt(sermcp::power_control::RELAY_OP_ON))
-        .is_err()
-    {
-        return ProbeMark::Err;
-    }
-    let _ = relay.flush();
-    let mut scratch = [0u8; 4096];
-    if reset_hold_ms == 0 {
-        return ProbeMark::Err;
-    }
-    let press_end = std::time::Instant::now() + std::time::Duration::from_millis(reset_hold_ms);
-    while std::time::Instant::now() < press_end {
-        let _ = serial.read(&mut scratch);
-    }
-    // Release + FLOOD the interrupt char through the boot window —
-    // whenever the autoboot countdown appears, a char is already in
-    // flight (the engine's "flood" strategy).
-    if relay
-        .write_all(&pkt(sermcp::power_control::RELAY_OP_OFF))
-        .is_err()
-    {
-        return ProbeMark::Err;
-    }
-    let _ = relay.flush();
-    let mut seen = Vec::new();
-    let mut next_send = std::time::Instant::now();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-    while std::time::Instant::now() < deadline {
-        if std::time::Instant::now() >= next_send {
-            let _ = serial.write_all(&[interrupt_char]);
-            next_send += std::time::Duration::from_millis(150);
-        }
-        if let Ok(n) = serial.read(&mut scratch)
-            && n > 0
-        {
-            seen.extend_from_slice(&scratch[..n]);
-            if ends_at_uboot_prompt(&seen) {
-                // INTERACTIVE PROOF (user demand: actually
-                // REACH the U-Boot command line, no fake pass): run a
-                // command and require a genuine U-Boot reply — boot-log
-                // debris containing "=>" can never satisfy this.
-                let _ = serial.write_all(b"version\r");
-                let mut reply = Vec::new();
-                let proof_end = std::time::Instant::now() + std::time::Duration::from_secs(3);
-                while std::time::Instant::now() < proof_end {
-                    if let Ok(n) = serial.read(&mut scratch)
-                        && n > 0
-                    {
-                        reply.extend_from_slice(&scratch[..n]);
-                    }
-                }
-                let text = String::from_utf8_lossy(&reply).to_lowercase();
-                return if text.contains("u-boot") {
-                    ProbeMark::Ok
-                } else {
-                    ProbeMark::Err
-                };
-            }
-        }
-    }
-    ProbeMark::Err
-}
-
-/// Strict U-Boot prompt check: the LAST non-empty clean line consists of
-/// "=>" alone — boot-log debris that merely CONTAINS "=>" never matches
-/// (that loose check was a false pass, field-observed). PURE.
-#[cfg(feature = "direct-dut-probe")]
-fn ends_at_uboot_prompt(data: &[u8]) -> bool {
-    let text = String::from_utf8_lossy(data);
-    text.lines()
-        .map(|l| l.trim_end_matches('\r').trim())
-        .rfind(|l| !l.is_empty())
-        .is_some_and(|last| last == "=>")
-}
-
-/// The full relay reset cycle (real hardware): press → serial must go
-/// silent → release → serial must produce boot output → save the first
-/// REFERENCE_LINES lines as the similarity reference. PURE line-splitting
-/// is factored into `first_reference_lines` (unit-tested); the capture
-/// windows are generous because real boards boot slowly.
-#[cfg(feature = "direct-dut-probe")]
-fn probe_relay_reset_cycle(
-    relay_host: &str,
-    relay_port: u16,
-    channel: u8,
-    serial_host: &str,
-    serial_port: u16,
-    save_path: &std::path::Path,
-    reset_hold_ms: u64,
-) -> ProbeMark {
-    use std::io::{Read, Write};
-    use std::net::{TcpStream, ToSocketAddrs};
-
-    let connect = |host: &str, port: u16| -> Option<TcpStream> {
-        let addr = (host, port)
-            .to_socket_addrs()
-            .ok()
-            .and_then(|mut a| a.next())?;
-        TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(700)).ok()
-    };
-
-    // Serial first: the reader must be attached BEFORE the press so the
-    // silence window is meaningful.
-    let Some(mut serial) = connect(serial_host, serial_port) else {
-        return ProbeMark::Err;
-    };
-    let _ = serial.set_read_timeout(Some(std::time::Duration::from_millis(200)));
-    let Some(mut relay) = connect(relay_host, relay_port) else {
-        return ProbeMark::Err;
-    };
-    let pkt = |op: u8| sermcp::power_control::relay_packet(channel, op);
-
-    // PRESS the reset channel, then verify the serial goes quiet (the
-    // board is held in reset — no output while pressed). The connect
-    // banner + telnet IAC handshake (always sent by ser2net right after
-    // connect) is NOT board output — strip it before judging silence.
-    if relay
-        .write_all(&pkt(sermcp::power_control::RELAY_OP_ON))
-        .is_err()
-    {
-        return ProbeMark::Err;
-    }
-    let _ = relay.flush();
-    let mut scratch = [0u8; 4096];
-    let mut pressed_bytes = Vec::new();
-    if reset_hold_ms == 0 {
-        return ProbeMark::Err;
-    }
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(reset_hold_ms);
-    while std::time::Instant::now() < deadline {
-        if let Ok(n) = serial.read(&mut scratch)
-            && n > 0
-        {
-            pressed_bytes.extend_from_slice(&scratch[..n]);
-        }
-    }
-    let noisy_while_pressed = meaningful_serial_noise(&pressed_bytes);
-
-    // THREE capture cycles (deliberate): release → capture
-    // the boot window, repeat. The reference is written ONLY when the
-    // three normalized windows are pairwise >= 0.93 similar — a stable
-    // boot signature worth segmenting on (same threshold as the
-    // connection learner's similarity_threshold).
-    let pkt_on = pkt(sermcp::power_control::RELAY_OP_ON);
-    let pkt_off = pkt(sermcp::power_control::RELAY_OP_OFF);
-    let mut windows: Vec<String> = Vec::new();
-    for cycle in 0..3 {
-        if cycle > 0 {
-            // Re-press for the next capture.
-            if relay.write_all(&pkt_on).is_err() {
-                return ProbeMark::Err;
-            }
-            let _ = relay.flush();
-            let press_end = std::time::Instant::now() + std::time::Duration::from_millis(1500);
-            let mut pressed_bytes = Vec::new();
-            while std::time::Instant::now() < press_end {
-                if let Ok(n) = serial.read(&mut scratch)
-                    && n > 0
-                {
-                    pressed_bytes.extend_from_slice(&scratch[..n]);
-                }
-            }
-            if meaningful_serial_noise(&pressed_bytes) {
-                return ProbeMark::Warn; // board talked while held
-            }
-        }
-        if relay.write_all(&pkt_off).is_err() {
-            return ProbeMark::Err;
-        }
-        let _ = relay.flush();
-        let mut captured = Vec::new();
-        // ALIGNMENT: drop bytes before the first newline — the release
-        // burst can begin mid-line (a leftover tail), and a misaligned
-        // first line poisons every pairwise comparison after it.
-        let mut aligned = false;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
-        while std::time::Instant::now() < deadline {
-            if let Ok(n) = serial.read(&mut scratch)
-                && n > 0
-            {
-                if !aligned {
-                    if let Some(nl) = scratch[..n].iter().position(|&b| b == b'\n') {
-                        captured.extend_from_slice(&scratch[nl + 1..n]);
-                        aligned = true;
-                    }
-                } else {
-                    captured.extend_from_slice(&scratch[..n]);
-                }
-                if first_reference_lines(&captured, usize::MAX).len() >= REFERENCE_LINES {
-                    break;
-                }
-            }
-        }
-        let lines = first_reference_lines(&captured, REFERENCE_LINES);
-        if lines.is_empty() {
-            return ProbeMark::Err; // released but silent
-        }
-        windows.push(lines.join("\n"));
-    }
-    if !reference_is_stable(&windows) {
-        // The relay and serial work, but the boot output is not
-        // deterministic enough to seed similarity segmentation — nothing
-        // is written (rerun TEST on a quieter boot).
-        return ProbeMark::Warn;
-    }
-    // Persist the FIRST capture's window as the similarity reference
-    // (best effort — a read-only tree must not fail the whole cycle).
-    if let Some(parent) = save_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let _ = std::fs::write(save_path, format!("{}\n", windows[0]));
-    if noisy_while_pressed {
-        ProbeMark::Warn
-    } else {
-        ProbeMark::Ok
-    }
-}
-
-/// Mask boot-to-boot volatile tokens (hex addresses/checksums, multi-digit
-/// counters, training values) before comparing — the deterministic
-/// STRUCTURE of the boot is what the reference segments on. PURE.
-#[cfg(feature = "direct-dut-probe")]
-fn stabilize_for_similarity(text: &str) -> String {
-    use std::sync::LazyLock;
-    static RE_HEX: LazyLock<regex::Regex> =
-        LazyLock::new(|| regex::Regex::new(r"[0-9a-fA-F]{4,}").unwrap());
-    // ANY 2+ digit run — also inside words (ttot10, 09:48, ch16) — a
-    // deterministic boot's structure lives in its words, not its counters
-    // (live-measured: 2-digit residuals alone dropped the
-    // blend to 0.83).
-    static RE_NUM: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"\d{2,}").unwrap());
-    let masked = RE_HEX.replace_all(text, "#H");
-    RE_NUM.replace_all(&masked, "#N").to_string()
-}
-
-/// The 3-window stability gate for the reference write: every pair of
-/// normalized windows must score >= 0.93 (the connection learner's
-/// blended metric: jaro-winkler 0.6 + 3-gram jaccard 0.4). Volatile
-/// tokens are masked first — DDR training values and checksums differ
-/// every boot while the log structure stays identical (real boots never
-/// reached 0.93 unmasked). PURE.
-#[cfg(feature = "direct-dut-probe")]
-fn reference_is_stable(windows: &[String]) -> bool {
-    if windows.len() < 2 {
-        return false;
-    }
-    let normalized: Vec<String> = windows
-        .iter()
-        .map(|w| {
-            sermcp::connection_learner::ConnectionLearner::normalize(&stabilize_for_similarity(w))
-        })
-        .collect();
-    (0..normalized.len()).all(|i| {
-        (i + 1..normalized.len()).all(|j| {
-            sermcp::connection_learner::compute_similarity(&normalized[i], &normalized[j]) >= 0.93
-        })
-    })
-}
-
 /// A target identity travels with candidate transport ports through TEST.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DutPorts {
     ports: Vec<u16>,
     dut: Option<String>,
+    project: Option<std::path::PathBuf>,
 }
 
 impl std::ops::Deref for DutPorts {
@@ -4303,7 +3714,11 @@ impl<'a> IntoIterator for &'a DutPorts {
 
 impl From<Vec<u16>> for DutPorts {
     fn from(ports: Vec<u16>) -> Self {
-        Self { ports, dut: None }
+        Self {
+            ports,
+            dut: None,
+            project: None,
+        }
     }
 }
 
@@ -4314,7 +3729,7 @@ impl DutPorts {
         {
             args["arguments"]["dut"] = serde_json::json!(dut);
         }
-        super::mcp_call(method, args, &self.ports).await
+        super::mcp_call(method, args, &self.ports, self.project.as_deref()).await
     }
 }
 
@@ -4338,24 +3753,32 @@ fn mcp_ports_for_dut(cwd: &std::path::Path, name: &str) -> DutPorts {
     DutPorts {
         ports,
         dut: Some(name.to_string()),
+        project: Some(cwd.to_path_buf()),
     }
 }
 
-/// Shared probe runtime, built once per process. Probing used to build a
-/// fresh tokio runtime per call (driver + timer setup on every mark); the
-/// probes fire dozens of times per TEST run, so one lazily-initialized
-/// runtime removes that churn. `block_on` on the shared handle is
-/// thread-safe; concurrent probe lanes may briefly queue on the single
-/// driver — their calls are short and the lanes poll at ≥1s cadence, so
-/// results are unchanged.
-pub(super) fn probe_runtime() -> &'static tokio::runtime::Runtime {
+/// Run synchronous TUI probes outside any caller's Tokio runtime.
+fn run_probe<F: std::future::Future + Send>(future: F) -> F::Output
+where
+    F::Output: Send,
+{
     static RT: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
-    RT.get_or_init(|| {
+    let runtime = RT.get_or_init(|| {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .expect("probe tokio runtime")
-    })
+    });
+    if tokio::runtime::Handle::try_current().is_ok() {
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| runtime.block_on(future))
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+        })
+    } else {
+        runtime.block_on(future)
+    }
 }
 
 /// Call one MCP tool synchronously from the probe worker thread and map it
@@ -4365,7 +3788,7 @@ pub(super) fn probe_runtime() -> &'static tokio::runtime::Runtime {
 /// DUT is wired but the test genuinely failed; an unreachable server is a
 /// skip (·).
 fn mcp_probe_mark(ports: &DutPorts, tool: &str, arguments: serde_json::Value) -> ProbeMark {
-    let outcome = probe_runtime().block_on(ports.call(
+    let outcome = run_probe(ports.call(
         "tools/call",
         serde_json::json!({"name": tool, "arguments": arguments}),
     ));
@@ -4433,35 +3856,6 @@ fn normalize_dut_state(ports: &DutPorts, use_power: bool, mode_buttons: &[String
     cycle(ports, true)
 }
 
-/// Try the MCP server tool first; when it does not PASS (unreachable or the
-/// tool answered failure), fall back to the original direct-hardware probe
-/// (MCP is primary, the direct code is the fallback).
-///
-/// The fallback closure only runs with `direct-dut-probe` — in production a
-/// failed MCP call surfaces as an error instead of the init process poking
-/// the DUT directly.
-fn mcp_first_or_direct(
-    ports: &DutPorts,
-    tool: &str,
-    arguments: serde_json::Value,
-    direct: impl FnOnce() -> ProbeMark,
-) -> ProbeMark {
-    match mcp_probe_mark(ports, tool, arguments) {
-        ProbeMark::Ok => ProbeMark::Ok,
-        _ => {
-            #[cfg(feature = "direct-dut-probe")]
-            {
-                direct()
-            }
-            #[cfg(not(feature = "direct-dut-probe"))]
-            {
-                let _ = direct;
-                ProbeMark::Err
-            }
-        }
-    }
-}
-
 /// Run the probes — ASYNC, one thread per probe (field-observed:
 /// a slow/blocked probe must never stall the others; every mark streams
 /// to the UI independently). SSH logins are memoized per credential tuple.
@@ -4477,7 +3871,7 @@ fn run_probes(
     type ProbeResults = Arc<(Mutex<HashMap<FieldKey, ProbeMark>>, Condvar)>;
     let results: ProbeResults = Arc::new((Mutex::new(HashMap::new()), Condvar::new()));
     let mut available: HashSet<FieldKey> = probes.iter().map(|(key, _)| key.clone()).collect();
-    #[cfg(not(feature = "direct-dut-probe"))]
+
     for (_, target) in &probes {
         if let ProbeTarget::McpBaudTest { linked_key, .. } = target {
             available.insert(linked_key.clone());
@@ -4499,7 +3893,7 @@ fn run_probes(
         .partition(|(_, t)| touches_serial_endpoint(t));
     serial_bound.sort_by_key(|(_, target)| match target {
         ProbeTarget::McpNormalizeState { .. } => 0,
-        #[cfg(not(feature = "direct-dut-probe"))]
+
         ProbeTarget::McpBaudTest { .. } => 1,
         ProbeTarget::RelayResetCycle { .. } => 2,
         ProbeTarget::UbootInterrupt { .. } => 3,
@@ -4589,7 +3983,6 @@ fn run_probes(
 
 fn linked_probe_keys(target: &ProbeTarget) -> Vec<FieldKey> {
     match target {
-        #[cfg(not(feature = "direct-dut-probe"))]
         ProbeTarget::McpBaudTest { linked_key, .. } => vec![linked_key.clone()],
         ProbeTarget::McpNormalizeState { linked_keys, .. } => linked_keys.clone(),
         ProbeTarget::SshPasswordLogin { linked_user, .. } => vec![linked_user.clone()],
@@ -4630,10 +4023,7 @@ fn probe_dependencies(
             if let Some((hi, di)) = field_host_dut(key) {
                 dependencies.push(FieldKey::HostIp(hi));
                 match target {
-                    // The MCP-routed variant only exists without the
-                    // direct-probe feature; the direct variant needs no
-                    // extra dependency here.
-                    #[cfg(not(feature = "direct-dut-probe"))]
+                    // Capture baud evidence only after state normalization.
                     ProbeTarget::McpBaudTest {
                         normalization_key: Some(key),
                         ..
@@ -4718,20 +4108,6 @@ fn publish_probe_result(
 /// TcpConnect to the serial port killed the baud probe's read, user
 /// report. SSH and local-device checks stay parallel.)
 fn touches_serial_endpoint(t: &ProbeTarget) -> bool {
-    #[cfg(feature = "direct-dut-probe")]
-    {
-        matches!(
-            t,
-            ProbeTarget::SerialBaud { .. }
-                | ProbeTarget::RelayChannelStatus { .. }
-                | ProbeTarget::TcpConnect { .. }
-                | ProbeTarget::McpNormalizeState { .. }
-                | ProbeTarget::UbootInterrupt { .. }
-                | ProbeTarget::RelayResetCycle { .. }
-                | ProbeTarget::ListDevices { .. }
-        )
-    }
-    #[cfg(not(feature = "direct-dut-probe"))]
     {
         matches!(
             t,
@@ -4750,7 +4126,7 @@ fn probe_mcp_ports(target: &ProbeTarget) -> Option<&DutPorts> {
         ProbeTarget::McpNormalizeState { ports, .. }
         | ProbeTarget::UbootInterrupt { ports, .. }
         | ProbeTarget::RelayResetCycle { ports, .. } => Some(ports),
-        #[cfg(not(feature = "direct-dut-probe"))]
+
         ProbeTarget::McpBaudTest { ports, .. } => Some(ports),
         ProbeTarget::ListDevices { mcp_ports, .. } => Some(mcp_ports),
         _ => None,
@@ -4810,7 +4186,6 @@ fn uboot_probe_arguments(interrupt_char: &str, soft_reboot: bool) -> serde_json:
 /// Run one probe and retain an optional UI detail plus a distinct linked-field
 /// mark when one physical check proves two fields differently.
 fn run_probe_with_detail(target: ProbeTarget, ssh_memo: &SshMemoInner) -> ProbeExecution {
-    #[cfg(not(feature = "direct-dut-probe"))]
     if let ProbeTarget::McpBaudTest {
         ports,
         baud,
@@ -4818,7 +4193,7 @@ fn run_probe_with_detail(target: ProbeTarget, ssh_memo: &SshMemoInner) -> ProbeE
         ..
     } = &target
     {
-        let outcome = probe_runtime().block_on(ports.call(
+        let outcome = run_probe(ports.call(
             "tools/call",
             serde_json::json!({"name": "serial_test_baud", "arguments": {
                 "baud": baud, "capture_secs": 3.0, "use_reset": use_reset
@@ -4857,7 +4232,7 @@ fn run_probe_with_detail(target: ProbeTarget, ssh_memo: &SshMemoInner) -> ProbeE
     // self-evident (relay channel unset, a `dutabo serial` takeover, a
     // reset that produced no boot output) — surface the server's own
     // error text on its row instead of a bare ✗.
-    #[cfg(not(feature = "direct-dut-probe"))]
+
     if let ProbeTarget::RelayResetCycle {
         ports,
         reference_log_path,
@@ -4865,7 +4240,7 @@ fn run_probe_with_detail(target: ProbeTarget, ssh_memo: &SshMemoInner) -> ProbeE
         ..
     } = &target
     {
-        let outcome = probe_runtime().block_on(ports.call(
+        let outcome = run_probe(ports.call(
             "tools/call",
             serde_json::json!({"name": "serial_learn_connection", "arguments": {
                 "method": "hardware",
@@ -5036,10 +4411,9 @@ fn run_one_probe(target: ProbeTarget, ssh_memo: &SshMemoInner) -> ProbeMark {
             pass,
             linked_user: _,
         } => probe_ssh_password_login(&host, &user, &pass),
-        #[cfg(feature = "direct-dut-probe")]
-        ProbeTarget::SerialBaud { host, port, baud } => probe_serial_baud(&host, port, baud),
+
         ProbeTarget::AlwaysFail => ProbeMark::Err,
-        #[cfg(not(feature = "direct-dut-probe"))]
+
         ProbeTarget::McpBaudTest {
             ports,
             baud,
@@ -5064,41 +4438,16 @@ fn run_one_probe(target: ProbeTarget, ssh_memo: &SshMemoInner) -> ProbeMark {
             mode_buttons,
             linked_keys: _,
         } => normalize_dut_state(&ports, use_power, &mode_buttons),
-        #[cfg(feature = "direct-dut-probe")]
-        ProbeTarget::RelayChannelStatus {
-            host,
-            port,
-            channel,
-        } => probe_relay_channel_status(&host, port, channel),
+
         ProbeTarget::UbootInterrupt {
             ports,
             interrupt_char,
             soft_reboot,
             normalization_key: _,
-            #[cfg(feature = "direct-dut-probe")]
-            direct,
-        } => mcp_first_or_direct(
+        } => mcp_probe_mark(
             &ports,
             "serial_enter_uboot",
             uboot_probe_arguments(&interrupt_char, soft_reboot),
-            || {
-                #[cfg(feature = "direct-dut-probe")]
-                {
-                    probe_uboot_interrupt(
-                        &direct.relay_host,
-                        direct.relay_port,
-                        direct.channel,
-                        &direct.serial_host,
-                        direct.serial_port,
-                        direct.interrupt_char,
-                        direct.reset_hold_ms,
-                    )
-                }
-                #[cfg(not(feature = "direct-dut-probe"))]
-                {
-                    ProbeMark::Err
-                }
-            },
         ),
         ProbeTarget::Skip { reason } => {
             // run_one_probe has no detail lane; the reason was preset into
@@ -5110,9 +4459,7 @@ fn run_one_probe(target: ProbeTarget, ssh_memo: &SshMemoInner) -> ProbeMark {
             ports,
             reference_log_path,
             use_power,
-            #[cfg(feature = "direct-dut-probe")]
-            direct,
-        } => mcp_first_or_direct(
+        } => mcp_probe_mark(
             &ports,
             "serial_learn_connection",
             serde_json::json!({
@@ -5127,24 +4474,6 @@ fn run_one_probe(target: ProbeTarget, ssh_memo: &SshMemoInner) -> ProbeMark {
                 // reference. Explicit MCP learning remains exhaustive.
                 "quick": true,
             }),
-            || {
-                #[cfg(feature = "direct-dut-probe")]
-                {
-                    probe_relay_reset_cycle(
-                        &direct.relay_host,
-                        direct.relay_port,
-                        direct.channel,
-                        &direct.serial_host,
-                        direct.serial_port,
-                        &direct.save_path,
-                        direct.reset_hold_ms,
-                    )
-                }
-                #[cfg(not(feature = "direct-dut-probe"))]
-                {
-                    ProbeMark::Err
-                }
-            },
         ),
         // The flash device-list probe runs through
         // `run_probe_with_detail` — unreachable here.
@@ -6427,21 +5756,6 @@ impl Drop for TerminalGuard {
     }
 }
 
-/// Map retired relay backend names onto their surviving equivalents when
-/// seeding the wizard from an existing config. The wizard exists to repair
-/// configs — round-tripping a value that config validation rejects at
-/// server start (`usb-relay` is no longer a backend) would make `dutabo
-/// init` unable to fix the very projects it runs on. `usb-relay` spoke the
-/// exact same CH340 wire protocol; unknown names pass through untouched and
-/// keep failing loudly in validation.
-fn normalize_relay_type(relay_type: &str) -> String {
-    if relay_type.trim().eq_ignore_ascii_case("usb-relay") {
-        "ch340-relay".to_string()
-    } else {
-        relay_type.to_string()
-    }
-}
-
 /// Panic-only cleanup for unread input. Normal exits must not flush stdin:
 /// after raw mode is disabled the shell owns new bytes, and flushing at
 /// that boundary can consume only the ESC byte of a following arrow-key
@@ -6543,6 +5857,25 @@ impl McpHandle {
             .map(|spawned| spawned.child.id())
             .chain(self.borrowed_pids.iter().copied())
             .collect()
+    }
+
+    fn ensure_terminal(
+        &mut self,
+        project: &Path,
+        dut: &str,
+        ports: &DutPorts,
+        config: &Path,
+    ) -> Result<(), String> {
+        let external = mcp_alive_for_project(project)
+            && !self
+                .children
+                .iter()
+                .any(|child| child.project_dir == project);
+        if external && !terminal_server_matches(project, dut, ports, config) {
+            return Err("Project sermcp is already running with a different or unavailable serial configuration. Stop the project service before previewing these settings.".into());
+        }
+        self.ensure(project, dut, ports[0], config);
+        Ok(())
     }
 
     /// Write the per-run TEST config. It sits in the PROJECT directory
@@ -6683,10 +6016,6 @@ impl McpHandle {
                 let _ = std::fs::remove_file(pid_file);
             }
         }
-        sermcp::lock_manager::cleanup_dead_process_locks(
-            pid,
-            &sermcp::lock_manager::default_lock_dir(),
-        );
         spawned
     }
 
@@ -6715,10 +6044,6 @@ impl McpHandle {
                     let _ = std::fs::remove_file(pid_file);
                 }
             }
-            sermcp::lock_manager::cleanup_dead_process_locks(
-                pid,
-                &sermcp::lock_manager::default_lock_dir(),
-            );
         }
 
         for snapshot in self.inventory_snapshots.drain(..) {
@@ -6755,6 +6080,53 @@ impl McpHandle {
         self.blocked_ports.clear();
         self.borrowed_pids.clear();
     }
+}
+
+fn terminal_server_matches(project: &Path, dut: &str, ports: &DutPorts, config: &Path) -> bool {
+    let desired = sermcp::config::Config {
+        values: sermcp::config::defaults(),
+        config_path: Some(config.to_path_buf()),
+        project_dir: Some(project.to_path_buf()),
+        format: sermcp::config::ConfigFormat::Jsonc,
+    };
+    let Some(desired) = desired.managed_dut_configs().ok().and_then(|configs| {
+        configs
+            .into_iter()
+            .find(|config| config.get("DUT_NAME") == dut)
+    }) else {
+        return false;
+    };
+    run_probe(async {
+        let Ok(client) = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(std::time::Duration::from_millis(500))
+            .build()
+        else {
+            return false;
+        };
+        for &port in ports {
+            if reusable_project_mcp(project, dut, port, config).is_none() {
+                continue;
+            }
+            let selector = sermcp::engine_registry::dut_query(dut);
+            if let Ok(response) = client
+                .get(format!("http://127.0.0.1:{port}/health?{selector}"))
+                .send()
+                .await
+                && response.status().is_success()
+                && let Ok(health) = response.json::<serde_json::Value>().await
+                && health["serial"]["host"].as_str() == Some(desired.dev_host_ip().as_str())
+                && health["serial"]["port"].as_str() == Some(desired.serial_target().as_str())
+                && health["serial"]["owned"].as_bool() == Some(true)
+                && health
+                    .get("serial_error")
+                    .is_none_or(serde_json::Value::is_null)
+            {
+                return true;
+            }
+        }
+        false
+    })
 }
 
 impl Drop for McpHandle {
@@ -7557,62 +6929,9 @@ impl<B: Backend, E: EventSource> FormTui<B, E> {
                         ProbeTarget::CharDevice { path: port },
                     ));
                 } else {
-                    #[cfg_attr(not(feature = "direct-dut-probe"), allow(unused_variables))]
-                    if let Ok(p) = port.parse::<u16>() {
-                        // Direct serial-endpoint probes are DEBUG-ONLY
-                        //: a direct TCP / RFC 2217 connection to
-                        // the ser2net port EVICTS the MCP server's own
-                        // connection (kickolduser) and breaks every
-                        // MCP-based test that follows. Production validates
-                        // the serial link through the MCP server instead.
-                        #[cfg(feature = "direct-dut-probe")]
-                        {
-                            probes.push((
-                                FieldKey::DutPort(hi, di),
-                                ProbeTarget::TcpConnect {
-                                    host: host.clone(),
-                                    port: p,
-                                },
-                            ));
-                            // Baudrate verification (rfc2217 endpoints only).
-                            let baud = state
-                                .values
-                                .get(&FieldKey::DutAdvanced(hi, di, "serial.baudrate"))
-                                .cloned()
-                                .unwrap_or_default();
-                            let baud = if baud.trim().is_empty() {
-                                state
-                                    .fields
-                                    .iter()
-                                    .find(|f| {
-                                        f.key == FieldKey::DutAdvanced(hi, di, "serial.baudrate")
-                                    })
-                                    .and_then(|f| f.default.clone())
-                                    .unwrap_or_else(|| "1500000".into())
-                            } else {
-                                baud
-                            };
-                            if let Ok(b) = baud.trim().parse::<u32>() {
-                                let baud_key = if state.fields.iter().any(|f| {
-                                    f.key == FieldKey::DutAdvanced(hi, di, "serial.baudrate")
-                                }) {
-                                    FieldKey::DutAdvanced(hi, di, "serial.baudrate")
-                                } else {
-                                    FieldKey::DutPort(hi, di)
-                                };
-                                probes.push((
-                                    baud_key,
-                                    ProbeTarget::SerialBaud {
-                                        host: host.clone(),
-                                        port: p,
-                                        baud: b,
-                                    },
-                                ));
-                            }
-                        }
-                        // Shared per-DUT context: needed by BOTH the
-                        // MCP-routed probes (default build) and the direct
-                        // probes (direct-dut-probe build).
+                    if port.parse::<u16>().is_ok() {
+                        // Keep the MCP server as the sole serial owner while
+                        // validating the link and baudrate.
                         let name = state
                             .values
                             .get(&FieldKey::DutName(hi, di))
@@ -7645,7 +6964,6 @@ impl<B: Backend, E: EventSource> FormTui<B, E> {
                             None
                         };
 
-                        #[cfg(not(feature = "direct-dut-probe"))]
                         {
                             // Production: the MCP-owned SerialEngine performs a
                             // fresh reset/capture and classifies the RAW bytes.
@@ -7701,10 +7019,6 @@ impl<B: Backend, E: EventSource> FormTui<B, E> {
                         if let Some(key) = normalization_key.clone() {
                             let mut mode_buttons = Vec::new();
                             let mut linked_keys = Vec::new();
-                            // ONE download-family key: the download row
-                            // (download on the wire). `recovery_ch` is a
-                            // legacy config key — the download layer maps it
-                            // onto this same channel (see `download_ch`).
                             if configured_channel(FieldKey::DutRelayDownload(hi, di)) {
                                 mode_buttons.push("download".to_string());
                                 linked_keys.push(FieldKey::DutRelayDownload(hi, di));
@@ -7745,11 +7059,6 @@ impl<B: Backend, E: EventSource> FormTui<B, E> {
                             .get(&FieldKey::DutRelayPort(hi, di))
                             .cloned()
                             .unwrap_or_default();
-                        let reset_ch = state
-                            .values
-                            .get(&FieldKey::DutRelayReset(hi, di))
-                            .cloned()
-                            .unwrap_or_default();
                         let rp_ok = relay_port.trim().parse::<u16>().is_ok_and(|p| p > 0);
                         if relay_enabled && backend_chosen && !rp_ok {
                             probes.push((FieldKey::DutRelayPort(hi, di), ProbeTarget::AlwaysFail));
@@ -7788,60 +7097,8 @@ impl<B: Backend, E: EventSource> FormTui<B, E> {
                                     port: rp,
                                 },
                             ));
-                            // Every other FILLED channel gets a non-disruptive
-                            // direct liveness check (ch340 STATUS) on its own row
-                            // — DEBUG-ONLY (production must not direct-connect
-                            // to the DUT from init).
-                            #[cfg(feature = "direct-dut-probe")]
-                            {
-                                let channels = [
-                                    (
-                                        FieldKey::DutRelayDownload(hi, di),
-                                        state
-                                            .values
-                                            .get(&FieldKey::DutRelayDownload(hi, di))
-                                            .cloned()
-                                            .unwrap_or_default(),
-                                    ),
-                                    (
-                                        FieldKey::DutRelayRecovery(hi, di),
-                                        state
-                                            .values
-                                            .get(&FieldKey::DutRelayRecovery(hi, di))
-                                            .cloned()
-                                            .unwrap_or_default(),
-                                    ),
-                                    (
-                                        FieldKey::DutRelayPower(hi, di),
-                                        state
-                                            .values
-                                            .get(&FieldKey::DutRelayPower(hi, di))
-                                            .cloned()
-                                            .unwrap_or_default(),
-                                    ),
-                                ];
-                                // Channel 0 IS a valid channel (this bench's
-                                // ch340 wires reset to channel 0); only an EMPTY
-                                // field means unset.
-                                for (ch_key, ch_val) in channels {
-                                    if !ch_val.trim().is_empty()
-                                        && let Ok(ch) = ch_val.trim().parse::<u8>()
-                                    {
-                                        probes.push((
-                                            ch_key,
-                                            ProbeTarget::RelayChannelStatus {
-                                                host: host.clone(),
-                                                port: rp,
-                                                channel: ch,
-                                            },
-                                        ));
-                                    }
-                                }
-                            }
-                            // DUT tests (reference capture + U-Boot entry) go
-                            // through the MCP server FIRST; with
-                            // direct-dut-probe the original direct relay probes
-                            // are the fallback.
+                            // Reference capture and U-Boot entry use the
+                            // MCP server's hardware ownership and recovery.
                             slow = true;
                             let ref_val = state
                                 .values
@@ -7881,23 +7138,7 @@ impl<B: Backend, E: EventSource> FormTui<B, E> {
                                 .unwrap_or("uboot")
                                 .trim()
                                 == "uboot";
-                            #[cfg(feature = "direct-dut-probe")]
-                            let (reset_cycle_ch, interrupt_char, reset_hold_ms) = {
-                                let reset_ok_for_cycle = if !reset_ch.trim().is_empty() {
-                                    reset_ch.trim().parse::<u8>().ok()
-                                } else {
-                                    None
-                                };
-                                // The configured reset channel when filled, else
-                                // channel 1 (the original direct-probe default).
-                                let reset_cycle_ch = reset_ok_for_cycle.unwrap_or(1);
-                                let reset_hold_ms = state
-                                    .values
-                                    .get(&FieldKey::DutRelayResetTimeMs(hi, di))
-                                    .and_then(|value| value.trim().parse::<u64>().ok())
-                                    .unwrap_or(0);
-                                (reset_cycle_ch, parse_interrupt_char(&ic_val), reset_hold_ms)
-                            };
+
                             // User rule: without the dev_ctrl relay the
                             // reference-log probe cannot align the boot
                             // boundary (soft `reboot` trails shutdown
@@ -7922,16 +7163,6 @@ impl<B: Backend, E: EventSource> FormTui<B, E> {
                                             .values
                                             .get(&FieldKey::DutRelayPower(hi, di))
                                             .is_some_and(|value| !value.trim().is_empty()),
-                                        #[cfg(feature = "direct-dut-probe")]
-                                        direct: DirectResetCycleProbe {
-                                            relay_host: host.clone(),
-                                            relay_port: rp,
-                                            channel: reset_cycle_ch,
-                                            serial_host: host.clone(),
-                                            serial_port: p,
-                                            save_path: save_path.clone(),
-                                            reset_hold_ms,
-                                        },
                                     },
                                 ));
                             }
@@ -7950,16 +7181,6 @@ impl<B: Backend, E: EventSource> FormTui<B, E> {
                                             Some(FieldKey::DutRelayPower(hi, di))
                                         } else {
                                             Some(FieldKey::DutRelayReset(hi, di))
-                                        },
-                                        #[cfg(feature = "direct-dut-probe")]
-                                        direct: DirectUbootProbe {
-                                            relay_host: host.clone(),
-                                            relay_port: rp,
-                                            channel: reset_cycle_ch,
-                                            serial_host: host.clone(),
-                                            serial_port: p,
-                                            interrupt_char,
-                                            reset_hold_ms,
                                         },
                                     },
                                 ));
@@ -8000,16 +7221,6 @@ impl<B: Backend, E: EventSource> FormTui<B, E> {
                                         interrupt_char,
                                         soft_reboot: true,
                                         normalization_key: None,
-                                        #[cfg(feature = "direct-dut-probe")]
-                                        direct: DirectUbootProbe {
-                                            relay_host: host.clone(),
-                                            relay_port: 0,
-                                            channel: 0,
-                                            serial_host: host.clone(),
-                                            serial_port: p,
-                                            interrupt_char: 3,
-                                            reset_hold_ms: 0,
-                                        },
                                     },
                                 ));
                             }
@@ -8207,7 +7418,7 @@ impl<B: Backend, E: EventSource> FormTui<B, E> {
                 self.state.probe_details.insert(key.clone(), reason.clone());
             }
         }
-        #[cfg(not(feature = "direct-dut-probe"))]
+
         for (_, target) in &probes {
             if let ProbeTarget::McpBaudTest { linked_key, .. } = target {
                 self.state

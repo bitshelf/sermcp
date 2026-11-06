@@ -7,6 +7,7 @@
 //! Channel is **bounded** (depth 64). When full, oldest messages are dropped
 //! to prevent unbounded memory growth during extended disconnects.
 
+use std::collections::VecDeque;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -29,6 +30,8 @@ const COMMAND_WRITE_GAP: Duration = Duration::from_millis(2);
 const NEGOTIATE_TIMEOUT: Duration = Duration::from_millis(500);
 /// Window for the NOTIFY-BAUDRATE ack after sending SET-BAUDRATE.
 const SET_BAUD_ACK_TIMEOUT: Duration = Duration::from_millis(1000);
+/// Bound data retained while a control operation owns the socket reader.
+const CONTROL_RX_LIMIT: usize = 1024 * 1024;
 
 /// Console transport mode. Raw = byte passthrough (default, today's behavior).
 /// Rfc2217 = telnet COM-PORT-OPTION negotiation + IAC filtering + dynamic baud.
@@ -54,7 +57,7 @@ struct WriteRequest {
 /// Cloneable producer for the console's single ordered write queue.
 ///
 /// Raw input, control bytes and reset/boot helpers remain immediate.  Only
-/// marker-wrapped `serial_send_command` payloads opt into command pacing.
+/// marker-wrapped `serial_exec` payloads opt into command pacing.
 ///
 /// Every successful enqueue pokes the write [`tokio::sync::Notify`] so the
 /// read loop can flush the queue to the wire immediately instead of at its
@@ -75,6 +78,7 @@ impl ConsoleWriteSender {
     }
 
     pub async fn send(&self, data: Vec<u8>) -> Result<(), ConsoleWriteError> {
+        crate::relay_trace!(bytes = data.len(), "write_enqueued");
         self.tx
             .send(WriteRequest {
                 data,
@@ -126,6 +130,11 @@ pub struct SerialConsoleDriver {
     /// Pending NOTIFY-BAUDRATE ack — resolved when the server confirms a
     /// `set_baud` request. None when no request is in flight.
     baud_ack_tx: Option<tokio::sync::oneshot::Sender<u32>>,
+    /// UART bytes consumed by control exchanges await the normal log reader.
+    pending_rx: VecDeque<u8>,
+    /// Retain the original negotiation bytes until framing is established.
+    /// This also survives cancellation of the negotiation future.
+    negotiation_rx: Vec<u8>,
 }
 
 impl SerialConsoleDriver {
@@ -163,6 +172,8 @@ impl SerialConsoleDriver {
             telnet: TelnetDecoder::new(),
             negotiated: false,
             baud_ack_tx: None,
+            pending_rx: VecDeque::new(),
+            negotiation_rx: Vec::new(),
         }
     }
 
@@ -219,6 +230,7 @@ impl SerialConsoleDriver {
     }
 
     async fn connect_inner(&mut self, timeout_secs: u64, audited: bool) -> std::io::Result<()> {
+        self.finish_negotiation_as_raw();
         self.stream.take();
         self.connected = false;
 
@@ -307,38 +319,47 @@ impl SerialConsoleDriver {
         let deadline = tokio::time::Instant::now() + NEGOTIATE_TIMEOUT;
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            if remaining.is_zero() {
-                tracing::warn!("RFC 2217 negotiation failed — falling back to raw passthrough");
+            if remaining.is_zero() || self.negotiation_rx.len() >= CONTROL_RX_LIMIT {
+                tracing::warn!(
+                    "RFC 2217 negotiation failed — retaining received bytes as raw passthrough"
+                );
+                self.finish_negotiation_as_raw();
                 return;
             }
             let chunk = match self
-                .read_available(remaining.min(Duration::from_millis(100)), 256)
+                .read_socket(remaining.min(Duration::from_millis(100)), 256)
                 .await
             {
                 Ok(c) => c,
                 Err(e) => {
                     tracing::warn!("RFC 2217 negotiation I/O error: {e}");
+                    self.finish_negotiation_as_raw();
                     return;
                 }
             };
             if chunk.is_empty() {
                 continue;
             }
-            // `negotiated` is still false here, so read_available returned raw
-            // bytes. Payload events (ser2net banner / early boot output) are
-            // discarded — the engine's probe_initial_state re-reads post-connect.
-            for ev in self.telnet.decode(&chunk) {
-                if matches!(ev, TelnetEvent::PortOptionActive) {
-                    self.negotiated = true;
-                    tracing::info!("RFC 2217 negotiated (COM-PORT-OPTION)");
-                    return;
-                }
+            self.negotiation_rx.extend_from_slice(&chunk);
+            self.telnet.decode(&chunk);
+            if self.telnet.port_option_active {
+                self.negotiated = true;
+                // Replay the retained wire once through a fresh decoder so
+                // payload before and after the handshake is preserved, as is
+                // decoder state for a frame split across this read boundary.
+                self.telnet.reset();
+                let raw = std::mem::take(&mut self.negotiation_rx);
+                let payload = self.decode_events(&raw);
+                self.pending_rx.extend(payload);
+                tracing::info!("RFC 2217 negotiated (COM-PORT-OPTION)");
+                return;
             }
         }
     }
 
     /// Close the connection
     pub fn close(&mut self) {
+        self.finish_negotiation_as_raw();
         self.stream.take();
         self.connected = false;
         self.telnet.reset();
@@ -397,13 +418,21 @@ impl SerialConsoleDriver {
                 self.baud_ack_tx = None;
                 return Err(SerialError::NegotiationTimeout);
             }
+            if self.pending_rx.len() >= CONTROL_RX_LIMIT {
+                self.baud_ack_tx = None;
+                return Err(SerialError::Io(std::io::Error::other(
+                    "baud exchange paused: received serial payload must be logged first",
+                )));
+            }
             match self
-                .read_available(remaining.min(Duration::from_millis(100)), 256)
+                .read_socket(remaining.min(Duration::from_millis(100)), 256)
                 .await
             {
-                Ok(_) => {
-                    // read_available already ran the decoder: a NOTIFY-BAUDRATE
-                    // subneg resolves `baud_ack_tx` via the oneshot.
+                Ok(raw) => {
+                    let payload = self.decode_events(&raw);
+                    self.pending_rx.extend(payload);
+                    // The decoder resolves NOTIFY-BAUDRATE through
+                    // the pending `baud_ack_tx` oneshot.
                     if let Ok(actual) = rx.try_recv() {
                         if actual != baud {
                             return Err(SerialError::BaudMismatch {
@@ -431,6 +460,11 @@ impl SerialConsoleDriver {
     pub fn sendline(&self, line: &str) -> bool {
         let data = format!("{line}\n");
         self.write_tx.try_send(data.into_bytes()).is_ok()
+    }
+
+    /// Avoid injecting maintenance commands behind user or control writes.
+    pub fn has_pending_writes(&self) -> bool {
+        !self.write_rx.is_empty()
     }
 
     /// Asynchronously send a control character (Ctrl-C = 0x03, etc.)
@@ -507,6 +541,9 @@ impl SerialConsoleDriver {
 
     /// Event-driven wait for readability (tokio readable / epoll, no polling)
     pub async fn wait_readable(&self, timeout: Duration) -> bool {
+        if !self.pending_rx.is_empty() || !self.negotiation_rx.is_empty() {
+            return true;
+        }
         match &self.stream {
             Some(s) => matches!(
                 tokio::time::timeout(timeout, s.readable()).await,
@@ -554,6 +591,41 @@ impl SerialConsoleDriver {
         timeout: Duration,
         max_size: usize,
     ) -> Result<Vec<u8>, std::io::Error> {
+        self.finish_negotiation_as_raw();
+        if max_size == 0 {
+            return Ok(Vec::new());
+        }
+        if !self.pending_rx.is_empty() {
+            let count = max_size.min(self.pending_rx.len());
+            return Ok(self.pending_rx.drain(..count).collect());
+        }
+        let raw = self.read_socket(timeout, max_size).await?;
+        if self.mode == ConsoleMode::Rfc2217 && self.negotiated {
+            Ok(self.decode_events(&raw))
+        } else {
+            Ok(raw)
+        }
+    }
+
+    /// Transfer already received control-exchange payload before shutdown or
+    /// reconnect. Closing a socket must not discard bytes consumed from it.
+    pub(crate) fn take_pending_received(&mut self) -> Vec<u8> {
+        self.finish_negotiation_as_raw();
+        self.pending_rx.drain(..).collect()
+    }
+
+    fn finish_negotiation_as_raw(&mut self) {
+        if !self.negotiation_rx.is_empty() {
+            self.pending_rx.extend(self.negotiation_rx.drain(..));
+            self.telnet.reset();
+        }
+    }
+
+    async fn read_socket(
+        &mut self,
+        timeout: Duration,
+        max_size: usize,
+    ) -> std::io::Result<Vec<u8>> {
         let stream = self.stream.as_mut().ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::NotConnected, "not connected")
         })?;
@@ -569,12 +641,9 @@ impl SerialConsoleDriver {
                 ))
             }
             Ok(Ok(n)) => {
+                acknowledge_read(stream);
                 buf.truncate(n);
-                if self.mode == ConsoleMode::Rfc2217 && self.negotiated {
-                    Ok(self.decode_events(&buf))
-                } else {
-                    Ok(buf)
-                }
+                Ok(buf)
             }
             Ok(Err(e)) => {
                 self.connected = false;
@@ -625,6 +694,18 @@ impl SerialConsoleDriver {
         }
         out
     }
+}
+
+/// Promptly acknowledge serial fragments so a bridge using Nagle does not
+/// hold the rest of an echo until the delayed-ACK timer expires. Linux resets
+/// QUICKACK during normal TCP processing, so request it after every read.
+pub fn acknowledge_read(stream: &TcpStream) {
+    #[cfg(target_os = "linux")]
+    if let Err(error) = socket2::SockRef::from(stream).set_tcp_quickack(true) {
+        tracing::debug!(%error, "Cannot request immediate serial TCP ACK");
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = stream;
 }
 
 /// Write one already-encoded wire request.  RFC 2217 stuffing is deliberately
@@ -1319,6 +1400,104 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn negotiation_preserves_uart_payload_across_wire_chunk_boundaries() {
+        let wire = b"early\x00\xff\xff\xff\xfd\x2c\xff\xfb\x2clate\r\n";
+        for chunk_size in [1, 2, 7, wire.len()] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut probe = [0; 6];
+                socket.read_exact(&mut probe).await.unwrap();
+                for chunk in wire.chunks(chunk_size) {
+                    socket.write_all(chunk).await.unwrap();
+                    tokio::task::yield_now().await;
+                }
+            });
+            let mut console = SerialConsoleDriver::new_with_mode(
+                "127.0.0.1".into(),
+                port.to_string(),
+                ConsoleMode::Rfc2217,
+            );
+            console.connect_with_timeout(2).await.unwrap();
+            assert!(console.negotiated);
+            let mut received = Vec::new();
+            while let Ok(data) = console.read_available(Duration::from_secs(1), 3).await {
+                received.extend(data);
+            }
+            assert_eq!(
+                received, b"early\x00\xfflate\r\n",
+                "chunk size {chunk_size}"
+            );
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_negotiation_preserves_bytes_even_after_close() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut probe = [0; 6];
+            socket.read_exact(&mut probe).await.unwrap();
+            socket.write_all(b"raw\x00\xff").await.unwrap();
+            let _ = finish_rx.await;
+        });
+        let mut console = SerialConsoleDriver::new_with_mode(
+            "127.0.0.1".into(),
+            port.to_string(),
+            ConsoleMode::Rfc2217,
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), console.connect())
+                .await
+                .is_err()
+        );
+        console.close();
+        assert_eq!(console.take_pending_received(), b"raw\x00\xff");
+        finish_tx.send(()).unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn baud_exchange_preserves_uart_payload_on_success_mismatch_and_eof() {
+        for actual in [Some(115200u32), Some(9600), None] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                server_handshake(&mut socket).await;
+                let mut request = [0; 10];
+                socket.read_exact(&mut request).await.unwrap();
+                let mut wire = b"before\x00\xff\xff".to_vec();
+                if let Some(baud) = actual {
+                    wire.extend([0xff, 0xfa, 0x2c, 0x65]);
+                    wire.extend(baud.to_be_bytes());
+                    wire.extend([0xff, 0xf0]);
+                }
+                wire.extend(b"after\r\n");
+                socket.write_all(&wire).await.unwrap();
+            });
+            let mut console = SerialConsoleDriver::new_with_mode(
+                "127.0.0.1".into(),
+                port.to_string(),
+                ConsoleMode::Rfc2217,
+            );
+            console.connect().await.unwrap();
+            let result = console.set_baud(115200).await;
+            assert_eq!(result.is_ok(), actual == Some(115200));
+            let mut received = Vec::new();
+            while let Ok(data) = console.read_available(Duration::from_secs(1), 3).await {
+                received.extend(data);
+            }
+            assert_eq!(received, b"before\x00\xffafter\r\n");
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
     async fn test_rfc2217_negotiate_success() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -1432,7 +1611,9 @@ mod tests {
 
         let mut collected = Vec::new();
         let deadline = std::time::Instant::now() + Duration::from_secs(3);
-        while std::time::Instant::now() < deadline && collected.len() < b"post-junk".len() {
+        while std::time::Instant::now() < deadline
+            && collected.len() < b"some plain banner text\r\npost-junk".len()
+        {
             match console
                 .read_available(Duration::from_millis(100), 256)
                 .await
@@ -1442,7 +1623,7 @@ mod tests {
                 Err(e) => panic!("read error: {e}"),
             }
         }
-        assert_eq!(collected, b"post-junk");
+        assert_eq!(collected, b"some plain banner text\r\npost-junk");
 
         console.close();
         server_handle.await.unwrap();

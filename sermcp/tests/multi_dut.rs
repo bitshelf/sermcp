@@ -8,6 +8,7 @@ use std::time::Duration;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
 
 struct Server(Child);
 impl Drop for Server {
@@ -80,12 +81,12 @@ fn frame(body: &str) -> Value {
 }
 
 impl Client {
-    async fn connect(base: String) -> Self {
+    async fn connect(base: String, token: Option<&str>) -> Self {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
             .build()
             .unwrap();
-        let response = http
+        let mut initialize = http
             .post(format!("{base}/mcp"))
             .header("Accept", "application/json, text/event-stream")
             .json(
@@ -93,10 +94,11 @@ impl Client {
                     "protocolVersion":"2025-06-18", "capabilities":{},
                     "clientInfo":{"name":"dutabo", "version":"test"}
                 }}),
-            )
-            .send()
-            .await
-            .unwrap();
+            );
+        if let Some(token) = token {
+            initialize = initialize.header(sermcp::lifecycle::CONTROL_HEADER, token);
+        }
+        let response = initialize.send().await.unwrap();
         assert!(response.status().is_success());
         let session = response.headers()["mcp-session-id"]
             .to_str()
@@ -186,7 +188,7 @@ async fn one_process_routes_two_boards_and_keeps_logging_when_one_disconnects() 
         command
             .current_dir(project.path())
             .env("TARGET_CONF", &config)
-            // A legacy selection must not prevent the other board starting.
+            // Selecting a client default does not prevent the other board starting.
             .env("TARGET_DUT_NAME", "board-a")
             .env("SERMCP_STARTUP_PROBE_TIMEOUT_MS", "500")
             .env_remove("SERMCP_SESSION_PID")
@@ -244,7 +246,14 @@ async fn one_process_routes_two_boards_and_keeps_logging_when_one_disconnects() 
             }
             tokio::time::sleep(Duration::from_millis(30)).await;
         };
-        let client = Client::connect(base.clone()).await;
+        let port = base.rsplit_once(':').unwrap().1.parse().unwrap();
+        let token = sermcp::lifecycle::read_control_token(project.path(), port).unwrap();
+        let guest = Client::connect(base.clone(), None).await;
+        let spoofed = guest
+            .tool("serial_send_raw", json!({"dut":"board-a","data":"spoofed"}))
+            .await;
+        assert_eq!(spoofed["error"]["message"], "tool not found");
+        let client = Client::connect(base.clone(), Some(&token)).await;
         if !http_mode {
             let stdin = server.0.stdin.as_mut().unwrap();
             writeln!(stdin, "{}", json!({"jsonrpc":"2.0", "id":31, "method":"initialize", "params":{
@@ -314,10 +323,17 @@ async fn one_process_routes_two_boards_and_keeps_logging_when_one_disconnects() 
                 .await
                 .is_err()
         );
-        let (mut manual_a, _) =
-            tokio_tungstenite::connect_async(format!("{ws_base}/serial/ws?dut=board-a"))
+        let manual_url = format!("{ws_base}/serial/ws?dut=board-a");
+        assert!(
+            tokio_tungstenite::connect_async(manual_url.as_str())
                 .await
-                .unwrap();
+                .is_err()
+        );
+        let mut request = manual_url.into_client_request().unwrap();
+        request
+            .headers_mut()
+            .insert(sermcp::lifecycle::CONTROL_HEADER, token.parse().unwrap());
+        let (mut manual_a, _) = tokio_tungstenite::connect_async(request).await.unwrap();
         // Wait for the upgrade worker to claim the selected engine.
         for _ in 0..50 {
             if payload(

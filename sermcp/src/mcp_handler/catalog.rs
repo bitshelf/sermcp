@@ -13,6 +13,43 @@ use serde_json::json;
 
 use super::McpHandler;
 
+/// Resource reads return complete files; larger logs must use bounded query
+/// tools or the supplied on-disk path rather than exhausting capture memory.
+const MAX_LOG_RESOURCE_BYTES: u64 = 8 * 1024 * 1024;
+
+fn read_log_resource(path: &std::path::Path, uri: &str) -> Result<String, ErrorData> {
+    use std::io::Read;
+
+    let unreadable = |error: std::io::Error| {
+        ErrorData::resource_not_found(
+            format!("Resource {uri} is unreadable: {error}"),
+            Some(json!({"uri": uri, "path": path})),
+        )
+    };
+    let oversized = || {
+        ErrorData::invalid_request(
+            "Serial log exceeds the 8 MiB resource limit; use serial_get_logs with a line limit, serial_poll_logs, or read the file directly",
+            Some(json!({
+                "code": "resource_too_large", "uri": uri, "path": path,
+                "max_bytes": MAX_LOG_RESOURCE_BYTES,
+            })),
+        )
+    };
+    let file = std::fs::File::open(path).map_err(unreadable)?;
+    if file.metadata().map_err(unreadable)?.len() > MAX_LOG_RESOURCE_BYTES {
+        return Err(oversized());
+    }
+    let mut bytes = Vec::new();
+    // Bound the actual read too: the writer can append after metadata().
+    file.take(MAX_LOG_RESOURCE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(unreadable)?;
+    if bytes.len() as u64 > MAX_LOG_RESOURCE_BYTES {
+        return Err(oversized());
+    }
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
 /// File metadata → optional byte size + `lastModified` annotation for a
 /// file-backed resource. Priority is a fixed per-kind hint (spec: 0.0 =
 /// entirely optional, 1.0 = most important).
@@ -103,6 +140,19 @@ impl McpHandler {
             0.3,
             &eng.logs.log_dir().join("full.serial.log"),
         ));
+
+        for (uri, filename) in [
+            ("log://serial/raw/current", "current.full.log"),
+            ("log://serial/raw/full", "full.full.log"),
+        ] {
+            resources.push(file_resource(
+                uri,
+                "Serial — including heartbeat",
+                filename.into(),
+                0.2,
+                &eng.logs.log_dir().join(filename),
+            ));
+        }
 
         // StageLearner unclassified lines (helps agents learning a new SoC)
         let unclassified_path = eng.logs.dut_dir().join("unclassified.log");
@@ -213,20 +263,25 @@ impl McpHandler {
         let known: &[(&str, &str)] = &[
             ("log://serial/current", "current.serial.log"),
             ("log://serial/full", "full.serial.log"),
+            ("log://serial/raw/current", "current.full.log"),
+            ("log://serial/raw/full", "full.full.log"),
         ];
         if let Some((_, rel)) = known.iter().find(|(u, _)| *u == uri) {
-            let eng = self.engine.lock().await;
-            let path = eng.logs.log_dir().join(rel);
-            // Gap #10: a listed resource that cannot be read is a structured
-            // failure (RESOURCE_NOT_FOUND), not a 200-OK text placeholder —
-            // agents can branch on the error code instead of scraping text.
-            let body = std::fs::read_to_string(&path).map_err(|e| {
-                tracing::warn!("read_resource {uri}: read {} failed: {e}", path.display());
-                ErrorData::resource_not_found(
-                    format!("Resource {uri} is unreadable: {e}"),
-                    Some(json!({"uri": uri, "path": path.to_string_lossy()})),
-                )
-            })?;
+            let path = {
+                let eng = self.engine.lock().await;
+                eng.logs.log_dir().join(rel)
+            };
+            let owned_uri = uri.to_string();
+            // File reads must not hold the capture mutex or block its async
+            // executor, especially when storage is already overloaded.
+            let body = tokio::task::spawn_blocking(move || read_log_resource(&path, &owned_uri))
+                .await
+                .map_err(|error| {
+                    ErrorData::internal_error(
+                        format!("Serial resource reader failed: {error}"),
+                        Some(json!({"uri": uri})),
+                    )
+                })??;
             return Ok(ReadResourceResponse::Complete(ReadResourceResult::new(
                 vec![ResourceContents::text(body, uri)],
             )));
@@ -332,7 +387,7 @@ impl McpHandler {
         prompt_result(
             "send_and_check",
             format!(
-                "Send the command '{}' to the target via serial_send_command and verify the output. Report the command result.",
+                "Send the command '{}' to the target via serial_exec and verify the output. Report the command result.",
                 args.command
             ),
         )
@@ -362,7 +417,7 @@ impl McpHandler {
     async fn uboot_recovery(&self) -> Result<GetPromptResult, ErrorData> {
         prompt_result(
             "uboot_recovery",
-            "Run serial_enter_uboot to get to the U-Boot prompt. From there, use serial_uboot_command('setenv bootdelay 3') and serial_uboot_command('saveenv') to make U-Boot interactive. Then use serial_uboot_command('boot') to continue booting.".into(),
+            "Run serial_enter_uboot to get to the U-Boot prompt. From there, use serial_exec(mode=uboot) to run 'setenv bootdelay 3' and 'saveenv' to make U-Boot interactive. Then run 'boot' to continue booting.".into(),
         )
     }
 }

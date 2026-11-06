@@ -125,7 +125,7 @@ fn test_dutabo_serial_is_single_call_deny() {
     let tmp = tempfile::TempDir::new().unwrap();
     make_project(tmp.path());
     let output = run_hook(tmp.path(), "dutabo serial -d rk3576");
-    assert_deny(&output, "serial_send_command");
+    assert_deny(&output, "serial_exec");
 }
 
 /// Raw serial access is denied per tool call. The Agent continues working but
@@ -135,7 +135,7 @@ fn test_raw_serial_access_is_single_call_deny() {
     let tmp = tempfile::TempDir::new().unwrap();
     make_project(tmp.path());
     let output = run_hook(tmp.path(), "tio /dev/ttyUSB0");
-    assert_deny(&output, "serial_send_command");
+    assert_deny(&output, "serial_exec");
 }
 
 /// Direct relay TCP access is also denied; physical reset/power control is

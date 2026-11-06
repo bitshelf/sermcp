@@ -60,10 +60,8 @@ impl McpHandler {
         &self,
         Parameters(a): Parameters<PowerCycleArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let power_result = {
-            let mut eng = self.engine.lock().await;
-            eng.power_cycle_target(false).await
-        };
+        let power_result =
+            crate::serial_engine::pulse_shared(&self.engine, dut_ctrl::Button::Power).await;
         if !power_result["success"].as_bool().unwrap_or(false) {
             // Gap #7: relay/backend failure is a cause-visible failure.
             return Ok(tool_result(power_result));
@@ -140,6 +138,16 @@ impl McpHandler {
 
         let (strategy, pattern, restart) = {
             let engine = self.engine.lock().await;
+            // Software restart types `reboot` on the console and hardware
+            // restart pulses the relay — neither may run under a human's
+            // interactive session.
+            if engine.in_manual_takeover() {
+                return Ok(text_error(json!({
+                    "success": false,
+                    "code": "dutabo_session",
+                    "error": "Serial console owned by interactive dutabo session; end it first",
+                })));
+            }
             let strategy = match engine.resolve_interrupt_strategy(a.interrupt_strategy.as_deref())
             {
                 Ok(strategy) => strategy,
@@ -184,6 +192,12 @@ impl McpHandler {
             if restart == UbootRestart::Software {
                 let (mut spl_rx, delivered) = {
                     let mut engine = self.engine.lock().await;
+                    if engine.in_manual_takeover() {
+                        engine.interrupt_char = original_interrupt_char;
+                        return Ok(text_error(
+                            crate::serial_engine::SerialEngine::dutabo_session_error(),
+                        ));
+                    }
                     engine.state.transition(TargetState::Booting);
                     let delivered = engine.console.sendline("reboot");
                     engine.console.drain_writes().await;
@@ -300,12 +314,7 @@ impl McpHandler {
     ) -> Result<CallToolResult, ErrorData> {
         // `action="send_interrupt"` sends the configured UBOOT_INTERRUPT_CHAR
         // (default 0x03 / Ctrl-C) once the pattern matches. The alias
-        // `send_ctrl_c` is kept for backward compatibility with existing agent
-        // prompts; new prompts should prefer the SoC-agnostic name.
-        let send_interrupt = a
-            .action
-            .as_deref()
-            .is_some_and(|s| s == "send_interrupt" || s == "send_ctrl_c");
+        let send_interrupt = a.action.as_deref().is_some_and(|s| s == "send_interrupt");
         let probe_on_timeout = a.pattern.contains("login")
             || a.pattern.contains("prompt")
             || a.pattern.contains("=>")
@@ -314,6 +323,17 @@ impl McpHandler {
 
         let console_tx = {
             let engine = self.engine.lock().await;
+            // Watching is passive, but the timeout probe and the
+            // send_interrupt action both transmit bytes; the detector feed
+            // is skipped during a takeover anyway, so reject up front
+            // instead of letting the caller wait out a guaranteed timeout.
+            if engine.in_manual_takeover() {
+                return Ok(text_error(json!({
+                    "success": false,
+                    "code": "dutabo_session",
+                    "error": "Serial console owned by interactive dutabo session; end it first",
+                })));
+            }
             engine.console.write_sender()
         };
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
@@ -334,6 +354,11 @@ impl McpHandler {
         }
         let result = if send_interrupt && result["matched"].as_bool().unwrap_or(false) {
             let mut engine = self.engine.lock().await;
+            if engine.in_manual_takeover() {
+                return Ok(text_error(
+                    crate::serial_engine::SerialEngine::dutabo_session_error(),
+                ));
+            }
             // Send the configured interrupt byte (UBOOT_INTERRUPT_CHAR), not a
             // hard-coded Ctrl-C — some boards use a different byte to abort.
             let byte = engine.interrupt_char;
@@ -401,6 +426,9 @@ impl McpHandler {
                             .is_some_and(|watch| watch.receiver.try_recv().is_ok())
                     {
                         let mut engine = self.engine.lock().await;
+                        if engine.in_manual_takeover() {
+                            break;
+                        }
                         let ch = engine.interrupt_char;
                         engine.console.write_raw(&[ch]).await;
                         interrupted = true;
@@ -447,6 +475,9 @@ impl McpHandler {
             .remove_watcher_by_pattern(crate::loader::default().prompt_watch_pattern());
         if let Some(watch) = pattern_interrupt {
             engine.detector.remove_watcher_by_pattern(watch.pattern);
+        }
+        if engine.in_manual_takeover() {
+            return crate::serial_engine::SerialEngine::dutabo_session_error();
         }
         if matched {
             engine.state.transition(TargetState::UBoot);

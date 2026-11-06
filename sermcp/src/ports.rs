@@ -22,12 +22,6 @@ pub fn project_mcp_port(project_dir: &Path) -> u16 {
     port_from_digest(&md5_hex(&hasher.finalize()))
 }
 
-/// Compatibility helper for inventory consumers that store a port on each
-/// DUT entry. Every entry resolves to the one project MCP port.
-pub fn project_dut_mcp_port(project_dir: &Path, _name: &str) -> u16 {
-    project_mcp_port(project_dir)
-}
-
 /// Actual control port recorded by this project's singleton. Consumers
 /// still verify the endpoint before using it because inventory can be stale.
 pub fn recorded_mcp_port(project_dir: &Path) -> Option<u16> {

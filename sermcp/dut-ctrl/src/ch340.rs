@@ -1,6 +1,7 @@
 //! CH340 four-byte relay backend.
 
 use std::collections::HashMap;
+use std::mem::DropGuard;
 use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -27,9 +28,7 @@ fn shared_relay_stream(host: &str, port: u16) -> SharedRelayStream {
     static STREAMS: OnceLock<StdMutex<HashMap<(String, u16), WeakRelayStream>>> = OnceLock::new();
     let streams = STREAMS.get_or_init(|| StdMutex::new(HashMap::new()));
     let key = (host.to_string(), port);
-    let mut streams = streams
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut streams = streams.lock().expect("resource registry mutex poisoned");
     if let Some(stream) = streams.get(&key).and_then(Weak::upgrade) {
         return stream;
     }
@@ -534,43 +533,6 @@ async fn best_effort_release(
     let _ = ctrl.release_with_retries(button, initial_state).await;
 }
 
-/// Cancellation safety for `pulse`: when dropped while armed, spawns a
-/// detached task that releases the button over the shared endpoint connection.
-/// An async release cannot run from `Drop`, so the task owns cloned connection
-/// parameters instead of borrowing the relay.
-struct PulseReleaseGuard {
-    armed: bool,
-    host: String,
-    port: u16,
-    channels: ButtonChannels,
-    button: Button,
-    initial_state: Option<u8>,
-}
-
-impl PulseReleaseGuard {
-    fn disarm(&mut self) {
-        self.armed = false;
-    }
-}
-
-impl Drop for PulseReleaseGuard {
-    fn drop(&mut self) {
-        if !self.armed {
-            return;
-        }
-        // Best effort only — no runtime context means nothing can be done.
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            handle.spawn(best_effort_release(
-                self.host.clone(),
-                self.port,
-                self.channels.clone(),
-                self.button,
-                self.initial_state,
-            ));
-        }
-    }
-}
-
 #[async_trait::async_trait]
 impl PowerControl for Ch340RelayControl {
     async fn press(&mut self, button: Button) -> Result<(), PowerError> {
@@ -600,7 +562,7 @@ impl PowerControl for Ch340RelayControl {
     /// Failure safety: the release is retried and, if it still fails, the
     /// channel is best-effort restored to its pre-pulse state. Cancellation
     /// safety: if this future is dropped while the relay is asserted (client
-    /// disconnect, MCP call cancelled), `PulseReleaseGuard` releases the
+    /// disconnect, MCP call cancelled), a `DropGuard` releases the
     /// button from a detached task.
     async fn pulse(&mut self, button: Button, delay_ms: u64) -> Result<(), PowerError> {
         let actual_delay = match button {
@@ -619,18 +581,27 @@ impl PowerControl for Ch340RelayControl {
 
         self.press(button).await?;
 
-        let mut guard = PulseReleaseGuard {
-            armed: true,
-            host: self.host.clone(),
-            port: self.port,
-            channels: self.channels.clone(),
-            button,
-            initial_state,
-        };
+        // Own the recovery future so cancellation can move it into a task
+        // without cloning connection parameters again during destruction.
+        let guard = DropGuard::new(
+            best_effort_release(
+                self.host.clone(),
+                self.port,
+                self.channels.clone(),
+                button,
+                initial_state,
+            ),
+            |release| {
+                // Best effort only — no runtime context means nothing can be done.
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    handle.spawn(release);
+                }
+            },
+        );
 
         tokio::time::sleep(Duration::from_millis(actual_delay)).await;
         let result = self.release_with_retries(button, initial_state).await;
-        guard.disarm();
+        drop(DropGuard::dismiss(guard));
         result
     }
 
@@ -801,7 +772,12 @@ mod tests {
 
             // Respond with status ON
             tokio::time::sleep(Duration::from_millis(10)).await;
-            let status_resp = [0xA0, buf[1], 0x01, (0xA0 + buf[1] + 0x01) as u8];
+            let status_resp = [
+                0xA0,
+                buf[1],
+                0x01,
+                0xA0u8.wrapping_add(buf[1]).wrapping_add(0x01),
+            ];
             socket.write_all(&status_resp).await.unwrap();
 
             // Read STATUS packet
@@ -809,7 +785,7 @@ mod tests {
             let _ = socket.read(&mut buf).await;
 
             // Respond with status ON
-            let status_resp = [0xA0, 1, 0x01, (0xA0 + 1 + 0x01) as u8];
+            let status_resp = [0xA0, 1, 0x01, 0xA0u8.wrapping_add(1).wrapping_add(0x01)];
             socket.write_all(&status_resp).await.unwrap();
 
             // Read OFF packet
@@ -819,7 +795,7 @@ mod tests {
 
             // Respond with status OFF
             tokio::time::sleep(Duration::from_millis(10)).await;
-            let status_resp = [0xA0, buf[1], 0x00, (0xA0 + buf[1] + 0x00) as u8];
+            let status_resp = [0xA0, buf[1], 0x00, 0xA0u8.wrapping_add(buf[1])];
             socket.write_all(&status_resp).await.unwrap();
 
             // Read STATUS packet
@@ -827,7 +803,7 @@ mod tests {
             let _ = socket.read(&mut buf).await;
 
             // Respond with status OFF
-            let status_resp = [0xA0, 1, 0x00, (0xA0 + 1 + 0x00) as u8];
+            let status_resp = [0xA0, 1, 0x00, 0xA0 + 1];
             socket.write_all(&status_resp).await.unwrap();
         });
 
@@ -1122,7 +1098,9 @@ mod tests {
                 0xA0,
                 buf[1],
                 Ch340RelayControl::OP_ON,
-                (0xA0 + buf[1] + Ch340RelayControl::OP_ON) as u8,
+                0xA0u8
+                    .wrapping_add(buf[1])
+                    .wrapping_add(Ch340RelayControl::OP_ON),
             ];
             socket.write_all(&echo).await.unwrap();
 
@@ -1181,7 +1159,7 @@ mod tests {
             let n = socket.read(&mut buf).await.unwrap();
             assert_eq!(n, 4);
             assert_eq!(buf[2], Ch340RelayControl::OP_STATUS);
-            let status_resp = [0xA0, buf[1], 0x00, (0xA0 + buf[1]) as u8];
+            let status_resp = [0xA0, buf[1], 0x00, 0xA0u8.wrapping_add(buf[1])];
             socket.write_all(&status_resp).await.unwrap();
 
             let n = socket.read(&mut buf).await.unwrap();
@@ -1191,7 +1169,9 @@ mod tests {
                 0xA0,
                 buf[1],
                 Ch340RelayControl::OP_ON,
-                (0xA0 + buf[1] + Ch340RelayControl::OP_ON) as u8,
+                0xA0u8
+                    .wrapping_add(buf[1])
+                    .wrapping_add(Ch340RelayControl::OP_ON),
             ];
             socket.write_all(&echo).await.unwrap();
 
@@ -1210,7 +1190,7 @@ mod tests {
                 0xA0,
                 buf[1],
                 Ch340RelayControl::OP_OFF,
-                (0xA0 + buf[1]) as u8,
+                0xA0u8.wrapping_add(buf[1]),
             ];
             socket2.write_all(&echo).await.unwrap();
         });

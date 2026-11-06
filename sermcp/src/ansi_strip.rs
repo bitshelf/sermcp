@@ -12,10 +12,35 @@
 
 use vte::{Parser, Perform};
 
+struct TextOutput<const KEEP_CONTROLS: bool>(Vec<u8>);
+
+impl<const KEEP_CONTROLS: bool> Perform for TextOutput<KEEP_CONTROLS> {
+    fn print(&mut self, character: char) {
+        let mut encoded = [0; 4];
+        for byte in character.encode_utf8(&mut encoded).bytes() {
+            self.0.push(byte);
+        }
+    }
+
+    fn execute(&mut self, byte: u8) {
+        if KEEP_CONTROLS || byte == b'\n' {
+            self.0.push(byte);
+        }
+    }
+}
+
 /// Strip ANSI escape sequences from `bytes`; only printable text and
 /// newlines survive.
 pub fn strip(bytes: &[u8]) -> Vec<u8> {
-    strip_with_offsets(bytes).0
+    let mut output = TextOutput::<false>(Vec::with_capacity(bytes.len()));
+    let mut parser = Parser::new();
+    // Chunk boundaries affect vte's decoding after malformed escapes or UTF-8.
+    // Keep byte-wise parsing consistent with the offset-producing path while
+    // avoiding its allocation and writes for the unused offset map.
+    for byte in bytes {
+        parser.advance(&mut output, std::slice::from_ref(byte));
+    }
+    output.0
 }
 
 /// [`strip`] keeping a byte-offset map of every surviving byte back to its
@@ -124,21 +149,7 @@ pub(crate) struct StreamingStripper {
 
 impl StreamingStripper {
     pub(crate) fn feed(&mut self, bytes: &[u8]) -> Vec<u8> {
-        struct Output(Vec<u8>);
-
-        impl Perform for Output {
-            fn print(&mut self, character: char) {
-                let mut encoded = [0; 4];
-                self.0
-                    .extend_from_slice(character.encode_utf8(&mut encoded).as_bytes());
-            }
-
-            fn execute(&mut self, byte: u8) {
-                self.0.push(byte);
-            }
-        }
-
-        let mut output = Output(Vec::with_capacity(bytes.len()));
+        let mut output = TextOutput::<true>(Vec::with_capacity(bytes.len()));
         self.parser.advance(&mut output, bytes);
         output.0
     }
@@ -147,6 +158,18 @@ impl StreamingStripper {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    proptest::proptest! {
+        #[test]
+        fn text_stripping_matches_offset_decoder(bytes in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..4096)) {
+            proptest::prop_assert_eq!(strip(&bytes), strip_with_offsets(&bytes).0);
+        }
+
+        #[test]
+        fn text_stripping_matches_offset_decoder_for_utf8(text in ".{0,4096}") {
+            proptest::prop_assert_eq!(strip(text.as_bytes()), strip_with_offsets(text.as_bytes()).0);
+        }
+    }
 
     fn assert_parsed(input: &[u8], expected: &[u8]) {
         assert_eq!(strip(input), expected);

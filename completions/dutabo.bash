@@ -1,36 +1,84 @@
-# dutabo bash completion
+# shellcheck shell=bash
+# Bash completion for dutabo.
 _dutabo() {
-    local cur prev opts
+    local cur="${COMP_WORDS[COMP_CWORD]}" cmd='' value='' word opts candidates
+    local -a positional=()
+    local i
     COMPREPLY=()
-    cur="${COMP_WORDS[COMP_CWORD]}"
-    prev="${COMP_WORDS[COMP_CWORD-1]}"
-    commands="start stop resume list names status serial reboot uboot button uf flash-kernel init agent"
 
-    case "${prev}" in
-        --dut)
-            # Read DUT names from .target.jsonc (canonical format).
-            local names=$(grep -oP '"dut_name"\s*:\s*"\K[^"]+' .target.jsonc 2>/dev/null)
-            COMPREPLY=( $(compgen -W "${names}" -- "${cur}") )
+    # Global options can appear before the command or between its arguments.
+    for ((i = 1; i < COMP_CWORD; i++)); do
+        word="${COMP_WORDS[i]}"
+        if [[ -n $value ]]; then
+            value=
+            continue
+        fi
+        case "$word" in
+            -d|--dut) value=dut ;;
+            -p|--mcp-port) value=port ;;
+            --agent) ;;
+            -h|--help|-V|--version) return 0 ;;
+            -*) ;;
+            *)
+                if [[ -z $cmd ]]; then
+                    cmd=$word
+                else
+                    positional+=("$word")
+                fi
+                ;;
+        esac
+    done
+
+    case "$value" in
+        dut)
+            # Use the CLI's config discovery and JSONC parser.
+            while IFS= read -r word; do
+                if [[ -n $word && $word == "$cur"* ]]; then
+                    COMPREPLY+=("$word")
+                fi
+            done < <(unset SERMCP_TRACE; "${COMP_WORDS[0]}" names 2>/dev/null)
             return 0
             ;;
-        uf|flash-kernel)
-            COMPREPLY=( $(compgen -f -- "${cur}") )
-            return 0
-            ;;
-        agent)
-            COMPREPLY=( $(compgen -W "deploy --select --project --agent --vendor --os --offline --force" -- "${cur}") )
-            return 0
-            ;;
-        dutabo)
-            COMPREPLY=( $(compgen -W "${commands} --dut --mcp-port" -- "${cur}") )
-            return 0
-            ;;
+        port) return 0 ;;
     esac
 
-    if [[ ${cur} == -* ]]; then
-        COMPREPLY=( $(compgen -W "--dut --mcp-port" -- "${cur}") )
+    opts='-h --help -V --version'
+    case "$cmd" in
+        '')
+            opts+=" -d --dut -p --mcp-port"
+            candidates='start stop resume list status serial reboot uboot button uf flash-kernel init filter-log help'
+            ;;
+        start|stop) opts+=" -p --mcp-port --agent" ;;
+        resume) opts+=" -p --mcp-port" ;;
+        list) opts+=" --json" ;;
+        init) opts+=" --non-interactive --quick --advanced --force --tui --plain" ;;
+        status) opts+=" -d --dut -p --mcp-port --watch" ;;
+        serial|reboot|uboot|button|uf|flash-kernel) opts+=" -d --dut -p --mcp-port" ;;
+        filter-log) opts='-V --version' ;;
+        help|names) ;;
+        *) return 0 ;;
+    esac
+
+    if [[ $cur == -* ]]; then
+        candidates=$opts
     else
-        COMPREPLY=( $(compgen -W "${commands}" -- "${cur}") )
+        case "$cmd:${#positional[@]}" in
+            uf:0|flash-kernel:0|filter-log:0)
+                mapfile -t COMPREPLY < <(compgen -f -- "$cur")
+                compopt -o filenames 2>/dev/null || :
+                return 0
+                ;;
+            filter-log:1)
+                # filter-log requires a new output file.
+                mapfile -t COMPREPLY < <(compgen -d -- "$cur")
+                compopt -o filenames 2>/dev/null || :
+                return 0
+                ;;
+            button:0) candidates='reset download power_key' ;;
+            button:1) candidates='press release pulse' ;;
+        esac
     fi
+
+    mapfile -t COMPREPLY < <(compgen -W "${candidates:-}" -- "$cur")
 }
 complete -F _dutabo dutabo

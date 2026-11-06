@@ -16,6 +16,26 @@ use tracing_subscriber::layer::SubscriberExt;
 
 type PerfettoLayer = NativeLayer<Arc<File>>;
 
+/// Interactive-relay hop instrumentation (keystroke/echo path latency).
+///
+/// Compiled to nothing unless the `relay-trace` feature is on — default
+/// (production) builds carry zero per-hop tracing code. With the feature on
+/// the events are plain `tracing::trace!`, so they still cost only a cached
+/// callsite check until a `SERMCP_TRACE` capture is actually attached.
+#[cfg(feature = "relay-trace")]
+#[macro_export]
+macro_rules! relay_trace {
+    ($($fields:tt)*) => {
+        tracing::trace!(target: "relay", $($fields)*)
+    };
+}
+
+#[cfg(not(feature = "relay-trace"))]
+#[macro_export]
+macro_rules! relay_trace {
+    ($($fields:tt)*) => {};
+}
+
 /// The registry subscriber and this slot share clones of one layer. Taking the
 /// global clone gives explicit exit paths a synchronization point before
 /// `process::exit`; packet writes themselves are synchronous and unbuffered.
@@ -47,6 +67,7 @@ pub fn finalize() {
 /// Finalize tracing, then terminate the process.
 pub fn exit_with_trace(code: i32) -> ! {
     finalize();
+    crate::diagnostic_log::finalize();
     std::process::exit(code)
 }
 
@@ -109,9 +130,6 @@ where
     };
     (subscriber.with(layer), guard)
 }
-
-/// Compatibility name for callers compiled against the previous helper API.
-pub use attach_perfetto as attach_chrome;
 
 /// Derive a sibling path for an MCP child without overwriting the client trace.
 pub fn child_trace_path(base: &std::ffi::OsStr) -> std::path::PathBuf {

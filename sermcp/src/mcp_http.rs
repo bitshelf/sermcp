@@ -36,6 +36,7 @@ use axum::http::StatusCode;
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
+use axum::serve::ListenerExt;
 use axum::{Json, Router};
 use tracing::warn;
 
@@ -63,6 +64,19 @@ struct AppState {
     /// graceful-shutdown drain open forever.
     shutdown: CancellationToken,
     idle_timeout_disabled: bool,
+    persistent: bool,
+    agent_access: Arc<AgentAccessRegistry>,
+}
+
+pub(crate) fn local_control_authorized(parts: &axum::http::request::Parts, token: &str) -> bool {
+    parts
+        .extensions
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .is_some_and(|peer| peer.ip().is_loopback())
+        && parts
+            .headers
+            .get(crate::lifecycle::CONTROL_HEADER)
+            .is_some_and(|value| value.as_bytes() == token.as_bytes())
 }
 
 impl AppState {
@@ -429,6 +443,7 @@ async fn serve_on_listener(
         idle_timeout,
         bind_host_hint,
         code_agent_owner_reserved,
+        false,
         shutdown,
     )
     .await
@@ -440,6 +455,7 @@ pub async fn run_registry_http(
     bind_host: &str,
     bind_port: u16,
     idle_timeout: Option<Duration>,
+    persistent: bool,
     shutdown: CancellationToken,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let listener = tokio::net::TcpListener::bind((bind_host, bind_port)).await?;
@@ -449,6 +465,7 @@ pub async fn run_registry_http(
         idle_timeout,
         Some(bind_host),
         false,
+        persistent,
         shutdown,
     )
     .await
@@ -460,7 +477,7 @@ pub async fn run_registry_on_listener(
     listener: tokio::net::TcpListener,
     shutdown: CancellationToken,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    serve_registry(registry, listener, None, None, true, shutdown).await
+    serve_registry(registry, listener, None, None, true, false, shutdown).await
 }
 
 async fn serve_registry(
@@ -469,11 +486,17 @@ async fn serve_registry(
     idle_timeout: Option<Duration>,
     bind_host_hint: Option<&str>,
     code_agent_owner_reserved: bool,
+    persistent: bool,
     shutdown: CancellationToken,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let engine = registry.first().engine.clone();
     let connecting_state = registry.first().connecting_state.clone();
     let local = listener.local_addr()?;
+    let listener = listener.tap_io(|stream| {
+        if let Err(error) = stream.set_nodelay(true) {
+            warn!(%error, "Cannot disable Nagle on HTTP/WebSocket connection");
+        }
+    });
     // Prefer the caller's original bind host (preserves hostnames for the
     // Host allowlist); fall back to the resolved address.
     let bind_host = bind_host_hint
@@ -486,14 +509,20 @@ async fn serve_registry(
     // rmcp's session manager; the engine itself is shared across sessions
     // because the physical serial port is a single shared resource.
     let tasks = registry.tasks.clone();
-    // The stdio singleton reserves the owner slot for its spawning agent:
-    // the reservation identity is this process's env session id, so the
-    // SAME agent's bridged sessions re-enter as owners while foreign agents
-    // stay read-only guests (see `AgentAccessRegistry`).
-    let agent_access_registry = Arc::new(AgentAccessRegistry::new(
-        code_agent_owner_reserved,
-        crate::mcp_handler::agent_session_identity(),
-    ));
+    // The stdio transport owns the Agent write slot whenever it is active.
+    let mut agent_access = AgentAccessRegistry::new(code_agent_owner_reserved);
+    let _control_file = if let Some(project) = registry
+        .inventory_config
+        .as_ref()
+        .and_then(|config| config.project_dir.as_deref())
+    {
+        let (token, file) = crate::lifecycle::publish_control_token(project, local.port())?;
+        agent_access.control_token = Some(token);
+        Some(file)
+    } else {
+        None
+    };
+    let agent_access_registry = Arc::new(agent_access);
     let handler_factory = {
         let engine = engine.clone();
         let tasks = tasks.clone();
@@ -537,6 +566,8 @@ async fn serve_registry(
         last_activity: last_activity.clone(),
         shutdown: shutdown.clone(),
         idle_timeout_disabled: idle_timeout.is_none(),
+        persistent,
+        agent_access: agent_access_registry,
     });
 
     // Apply the activity middleware across the entire router: every HTTP
@@ -651,17 +682,24 @@ struct ReconcileRequest {
     expected_pid: Option<u32>,
 }
 
-/// Stop only the explicitly identified local project service.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StopRequest {
+    config_path: std::path::PathBuf,
+    expected_pid: u32,
+}
+
+/// Stop the identified local service. Startup policy is managed by the CLI.
 async fn handle_project_stop(
     State(state): State<Arc<AppState>>,
     axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
     headers: axum::http::HeaderMap,
-    Json(request): Json<ReconcileRequest>,
+    Json(request): Json<StopRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     if !peer.ip().is_loopback() || headers.contains_key(axum::http::header::ORIGIN) {
         return Err((StatusCode::FORBIDDEN, "Local native clients only".into()));
     }
-    if request.expected_pid != Some(std::process::id()) {
+    if request.expected_pid != std::process::id() {
         return Err((StatusCode::CONFLICT, "Project MCP process changed".into()));
     }
     let expected = state
@@ -680,12 +718,6 @@ async fn handle_project_stop(
             "Different project configuration".into(),
         ));
     }
-    let marker = expected.parent().unwrap().join(".dut-serial/stopped");
-    std::fs::write(
-        marker,
-        "Stopped by dutabo; use dutabo resume to allow startup.\n",
-    )
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     state.shutdown.cancel();
     Ok(Json(
         serde_json::json!({"success": true, "pid": std::process::id()}),
@@ -751,7 +783,18 @@ async fn handle_health(
             }
         }))
         .await;
-    snapshot["duts"] = serde_json::Value::Array(rows.into_iter().collect::<Result<Vec<_>, _>>()?);
+    let rows = rows.into_iter().collect::<Result<Vec<_>, _>>()?;
+    snapshot["logging_status"] = serde_json::json!(if rows
+        .iter()
+        .any(|row| row["logging_status"] == "degraded")
+    {
+        "degraded"
+    } else if rows.iter().any(|row| row["logging_status"] != "ok") {
+        "unknown"
+    } else {
+        "ok"
+    });
+    snapshot["duts"] = serde_json::Value::Array(rows);
     snapshot["capabilities"]["multi_dut"] = serde_json::json!(true);
     Ok(Json(snapshot))
 }
@@ -764,12 +807,20 @@ async fn health_snapshot(
         Ok(e) => e,
         Err(_) => {
             return Ok(Json(
-                serde_json::json!({"status": "starting", "serial": null, "idle_timeout_disabled": state.idle_timeout_disabled}),
+                serde_json::json!({"status": "starting", "serial": null, "logging_status": "unknown", "logging": null, "idle_timeout_disabled": state.idle_timeout_disabled, "persistent": state.persistent}),
             ));
         }
     };
     let serial_state = engine.state.current();
     let config = &engine.config;
+    let persistence = engine.logs.persistence_status();
+    let logging_status = if persistence.last_error.is_some() || persistence.pending_bytes != 0 {
+        "degraded"
+    } else {
+        "ok"
+    };
+    let mut logging = serde_json::json!(persistence);
+    logging["status"] = serde_json::json!(logging_status);
     #[cfg(unix)]
     let executable_identity = {
         use std::os::unix::fs::MetadataExt;
@@ -785,7 +836,12 @@ async fn health_snapshot(
 
     Ok(Json(serde_json::json!({
         "status": "ok",
+        // Process discovery depends on the liveness status above. A storage
+        // fault must be visible without encouraging a competing server spawn.
+        "logging_status": logging_status,
+        "logging": logging,
         "idle_timeout_disabled": state.idle_timeout_disabled,
+        "persistent": state.persistent,
         "dut_name": config.get_str_or("DUT_NAME", "default"),
         "serial_error": engine.get_state_dict().get("error"),
         "server": {
@@ -813,6 +869,7 @@ async fn health_snapshot(
         // serial tool it is about to call).
         "capabilities": {
             "monitor": true,
+            "log_persistence": true,
         },
         "uptime_secs": engine.state.uptime_secs(),
         "commands": {
@@ -838,6 +895,7 @@ async fn handle_serial_ws(
     State(state): State<Arc<AppState>>,
     ws: WebSocketUpgrade,
     axum::extract::RawQuery(query): axum::extract::RawQuery,
+    parts: axum::http::request::Parts,
 ) -> Response {
     let name = match crate::engine_registry::query_dut(query.as_deref()) {
         Ok(name) => name,
@@ -860,16 +918,32 @@ async fn handle_serial_ws(
     {
         return ws.on_upgrade(move |socket| serial_ws_monitor(socket, state));
     }
-    let engine = state.engine.lock().await;
-    if !engine.owns_serial_lock() {
+    if !state
+        .agent_access
+        .control_token
+        .as_deref()
+        .is_some_and(|token| local_control_authorized(&parts, token))
+    {
         return (
-            StatusCode::CONFLICT,
-            "serial endpoint is not owned by this MCP process",
+            StatusCode::FORBIDDEN,
+            "Serial writes require local control credentials",
         )
             .into_response();
     }
-    if engine.state.current() == crate::state_manager::TargetState::Dutabo {
-        return (StatusCode::CONFLICT, "manual serial session already active").into_response();
+    let engine = state.engine.lock().await;
+    if !engine.owns_serial_lock() || !engine.console.is_open() {
+        return (
+            StatusCode::CONFLICT,
+            "Serial endpoint is unavailable or owned by another process",
+        )
+            .into_response();
+    }
+    if !engine.manual_takeover_available() {
+        return (
+            StatusCode::CONFLICT,
+            "Serial control is busy; retry after the active operation or session ends",
+        )
+            .into_response();
     }
     drop(engine);
     let history = query
@@ -922,23 +996,26 @@ async fn serial_ws_handler(mut socket: WebSocket, state: Arc<AppState>, history:
     let engine = state.engine.clone();
     let (ws_tx, _) = tokio::sync::broadcast::channel::<Vec<u8>>(256);
     let mut ws_rx = ws_tx.subscribe();
+    let session = ws_tx.downgrade();
 
     // Upgrade is asynchronous: recheck ownership, claim, snapshot and register
     // atomically so concurrent clients cannot claim or lose the first output.
     let attachment = {
         let mut eng = engine.lock().await;
-        if !eng.owns_serial_lock()
-            || eng.state.current() == crate::state_manager::TargetState::Dutabo
-        {
-            None
-        } else {
+        if eng.owns_serial_lock() && eng.console.is_open() && eng.set_ws_tx(ws_tx) {
             let backlog = history.then(|| eng.serial_history());
-            eng.set_ws_tx(ws_tx);
             Some((eng.get_write_sender(), backlog))
+        } else {
+            None
         }
     };
     let Some((write_tx, backlog)) = attachment else {
-        let _ = socket.send(Message::Close(None)).await;
+        let _ = socket
+            .send(Message::Close(Some(axum::extract::ws::CloseFrame {
+                code: 1013,
+                reason: "Serial control became busy; retry after the active operation ends".into(),
+            })))
+            .await;
         return;
     };
 
@@ -963,7 +1040,7 @@ async fn serial_ws_handler(mut socket: WebSocket, state: Arc<AppState>, history:
                 reason: "history replay timed out; reconnect to retry".into(),
             })));
             let _ = tokio::time::timeout(Duration::from_secs(1), close).await;
-            engine.lock().await.clear_ws_tx();
+            engine.lock().await.finish_manual_ws(&session).await;
             return;
         }
     }
@@ -986,6 +1063,7 @@ async fn serial_ws_handler(mut socket: WebSocket, state: Arc<AppState>, history:
                 match received {
                     Ok(data) => {
                         state.touch();
+                        crate::relay_trace!(bytes = data.len(), "ws_tx_echo");
                         if socket.send(Message::Binary(data.into())).await.is_err() {
                             break;
                         }
@@ -1005,10 +1083,12 @@ async fn serial_ws_handler(mut socket: WebSocket, state: Arc<AppState>, history:
                 match msg {
                     Some(Ok(Message::Text(t))) => {
                         state.touch();
+                        crate::relay_trace!(bytes = t.len(), "ws_rx_keystroke");
                         let _ = write_tx.send(t.as_bytes().to_vec()).await;
                     }
                     Some(Ok(Message::Binary(b))) => {
                         state.touch();
+                        crate::relay_trace!(bytes = b.len(), "ws_rx_keystroke");
                         let _ = write_tx.send(b.to_vec()).await;
                     }
                     Some(Ok(Message::Close(_))) | None => break,
@@ -1025,8 +1105,7 @@ async fn serial_ws_handler(mut socket: WebSocket, state: Arc<AppState>, history:
         }
     }
 
-    let mut eng = engine.lock().await;
-    eng.clear_ws_tx();
+    engine.lock().await.finish_manual_ws(&session).await;
 }
 
 #[cfg(test)]
@@ -1166,6 +1245,8 @@ mod tests {
             last_activity: Arc::new(AtomicU64::new(now_millis())),
             shutdown: CancellationToken::new(),
             idle_timeout_disabled: false,
+            persistent: false,
+            agent_access: Arc::new(AgentAccessRegistry::new(false)),
         })
     }
 
@@ -1250,6 +1331,49 @@ mod tests {
         assert_eq!(state.last_activity.load(Ordering::Relaxed), before);
         assert_eq!(json["idle_timeout_disabled"], false);
         assert!(json["serial_error"].is_null());
+        assert_eq!(json["logging_status"], "ok");
+        assert_eq!(json["logging"]["status"], "ok");
+        assert_eq!(json["logging"]["pending_bytes"], 0);
+        assert_eq!(json["capabilities"]["log_persistence"], true);
+    }
+
+    #[tokio::test]
+    async fn health_reports_storage_failure_and_recovery_without_hiding_process() {
+        let engine = create_test_engine();
+        let state = make_state(engine.clone());
+        let log_dir = engine.lock().await.logs.log_dir().to_path_buf();
+        std::fs::create_dir_all(log_dir.parent().unwrap()).unwrap();
+        std::fs::write(&log_dir, b"storage obstruction").unwrap();
+        let payload = b"captured before storage failure\n";
+        engine.lock().await.logs.write(payload);
+        // Storage failures surface at flush time (read paths batch them).
+        engine.lock().await.logs.flush_sync();
+
+        let failed = handle_health(State(state.clone()), axum::extract::RawQuery(None))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(failed["status"], "ok");
+        assert_eq!(failed["logging_status"], "degraded");
+        assert_eq!(failed["logging"]["status"], "degraded");
+        assert_eq!(failed["logging"]["pending_bytes"], payload.len());
+        assert!(failed["logging"]["last_error"].is_string());
+        assert_eq!(failed["duts"][0]["logging_status"], "degraded");
+
+        std::fs::remove_file(&log_dir).unwrap();
+        assert!(engine.lock().await.logs.retry_pending());
+        let recovered = handle_health(State(state), axum::extract::RawQuery(None))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(recovered["logging_status"], "ok");
+        assert_eq!(recovered["logging"]["durable_bytes"], payload.len());
+        assert_eq!(recovered["logging"]["pending_bytes"], 0);
+        assert!(recovered["logging"]["last_error"].is_null());
+        assert_eq!(
+            std::fs::read(log_dir.join("full.full.log")).unwrap(),
+            payload
+        );
     }
 
     #[tokio::test]

@@ -383,7 +383,7 @@ fn tool_payload_parses_success_and_flags_success_false() {
 
 #[test]
 fn tool_payload_missing_success_field_counts_as_success() {
-    // serial_get_state and serial_send_command carry no `success` field.
+    // serial_get_state and serial_exec(mode=shell) carry no `success` field.
     let result = serde_json::json!({
         "content": [{"type": "text", "text": "{\"state\":\"idle\",\"boot_number\":7}"}]
     });
@@ -427,29 +427,23 @@ fn project_port_is_stable_and_in_reserved_range() {
 fn dut_inventory_ports_match_the_project_port() {
     let project = std::path::Path::new("/path/to/sermcp");
     let project_port = sermcp::ports::project_mcp_port(project);
-    assert_eq!(
-        sermcp::ports::project_dut_mcp_port(project, "rk3576"),
-        project_port
-    );
-    assert_eq!(
-        sermcp::ports::project_dut_mcp_port(project, "rk3576-2"),
-        project_port
-    );
+    assert_eq!(sermcp::ports::project_mcp_port(project), project_port);
+    assert_eq!(sermcp::ports::project_mcp_port(project), project_port);
 }
 
 #[test]
 fn all_duts_share_one_stable_project_port() {
     let project = std::path::Path::new("/tmp/dutabo-per-dut-port-test");
-    let a = sermcp::ports::project_dut_mcp_port(project, "dut-a");
-    let b = sermcp::ports::project_dut_mcp_port(project, "dut-b");
+    let a = sermcp::ports::project_mcp_port(project);
+    let b = sermcp::ports::project_mcp_port(project);
     let range =
         sermcp::ports::MC_PORT_BASE..sermcp::ports::MC_PORT_BASE + sermcp::ports::MC_PORT_RANGE;
     assert!(range.contains(&a), "a={a} outside reserved range");
     assert!(range.contains(&b), "b={b} outside reserved range");
     assert_eq!(a, b, "DUT names must not create another MCP endpoint");
     // Deterministic across calls.
-    assert_eq!(a, sermcp::ports::project_dut_mcp_port(project, "dut-a"));
-    assert_eq!(b, sermcp::ports::project_dut_mcp_port(project, "dut-b"));
+    assert_eq!(a, sermcp::ports::project_mcp_port(project));
+    assert_eq!(b, sermcp::ports::project_mcp_port(project));
 }
 
 /// Minimal DUT config for probe/message tests.
@@ -761,6 +755,7 @@ async fn mcp_call_requests_accepts_both_mime_types() {
         "tools/call",
         serde_json::json!({"name":"serial_get_state","arguments":{}}),
         &[port],
+        None,
     )
     .await;
     server.abort();
@@ -957,6 +952,7 @@ async fn initialize_declares_tasks_extension() {
         "tools/call",
         serde_json::json!({"name":"serial_get_state","arguments":{}}),
         &[port],
+        None,
     )
     .await;
     server.abort();
@@ -989,6 +985,7 @@ async fn mcp_call_polls_task_and_returns_completed_result() {
         "tools/call",
         serde_json::json!({"name":"serial_reset","arguments":{"wait_boot":true}}),
         &[port],
+        None,
     )
     .await
     else {
@@ -1032,6 +1029,7 @@ async fn mcp_call_returns_error_when_task_failed() {
         "tools/call",
         serde_json::json!({"name":"serial_reset","arguments":{"wait_boot":true}}),
         &[port],
+        None,
     )
     .await
     else {
@@ -1059,6 +1057,7 @@ async fn initialized_notification_carries_session_header() {
         "tools/call",
         serde_json::json!({"name":"serial_get_state","arguments":{}}),
         &[port],
+        None,
     )
     .await;
     server.abort();
@@ -1115,6 +1114,7 @@ async fn initialize_error_frame_rejects_handshake() {
         "tools/call",
         serde_json::json!({"name":"serial_get_state","arguments":{}}),
         &[port],
+        None,
     )
     .await;
     server.abort();
@@ -1197,6 +1197,7 @@ async fn stale_session_cache_is_invalidated_and_retried() {
         "tools/call",
         serde_json::json!({"name":"serial_get_state","arguments":{}}),
         &[port],
+        None,
     )
     .await;
     server.abort();
@@ -1611,18 +1612,31 @@ async fn direct_serial_session_persists_payload_and_flushes_before_return() {
     .unwrap();
     sender.await.unwrap();
     let dir = tmp.path().join(".dut-serial/test/logs");
-    assert_eq!(std::fs::read(dir.join("full.serial.log")).unwrap(), payload);
+    let mut wire = b"ser2net port tcp,2000 device serialdev, /dev/ttyUSB0\r\n".to_vec();
+    wire.extend_from_slice(payload);
+    assert_eq!(std::fs::read(dir.join("full.full.log")).unwrap(), wire);
     assert!(
         std::fs::read(dir.join("current.serial.log"))
             .unwrap()
             .ends_with(b"quiet # ")
     );
-    assert_eq!(
-        std::fs::read_dir(dir)
-            .unwrap()
-            .filter_map(Result::ok)
-            .filter(|entry| entry.file_name().to_string_lossy().starts_with("boot-"))
-            .count(),
-        1
-    );
+    let mut archives: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("boot-")
+                && path.to_string_lossy().ends_with(".full.log")
+        })
+        .collect();
+    archives.sort();
+    let mut cycles = Vec::new();
+    for archive in archives {
+        cycles.extend(std::fs::read(archive).unwrap());
+    }
+    cycles.extend(std::fs::read(dir.join("current.full.log")).unwrap());
+    assert_eq!(cycles, wire);
 }

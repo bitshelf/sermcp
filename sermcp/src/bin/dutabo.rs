@@ -312,10 +312,10 @@ fn print_init_result(result: Result<sermcp::init::WizardOutcome, String>) {
             }
             if let Some(reason) = e.strip_prefix("aborted: ") {
                 eprintln!("[init] aborted: {reason}");
-                sermcp::trace_chrome::exit_with_trace(0);
+                sermcp::trace_perfetto::exit_with_trace(0);
             }
             eprintln!("Error: {e}");
-            sermcp::trace_chrome::exit_with_trace(1);
+            sermcp::trace_perfetto::exit_with_trace(1);
         }
     }
 }
@@ -336,9 +336,10 @@ async fn main() {
     if args.len() < 2 {
         // Usage error: scripts must be able to tell "no command" from success.
         print_usage();
-        sermcp::trace_chrome::exit_with_trace(1);
+        sermcp::trace_perfetto::exit_with_trace(1);
     }
 
+    let mut agent_flag = false;
     let mut dut_name: Option<String> = None;
     let mut mcp_port: u16 = std::env::var("MCP_PORT")
         .ok()
@@ -361,10 +362,13 @@ async fn main() {
                 Err(_) => {
                     eprintln!("Error: invalid --mcp-port value: {}", args[i + 1]);
                     print_usage();
-                    sermcp::trace_chrome::exit_with_trace(1);
+                    sermcp::trace_perfetto::exit_with_trace(1);
                 }
             }
             i += 2;
+        } else if args[i] == "--agent" {
+            agent_flag = true;
+            i += 1;
         } else if args[i] == "--version" || args[i] == "-V" {
             print_version();
             return;
@@ -387,9 +391,36 @@ async fn main() {
                 return;
             }
             print_usage();
-            sermcp::trace_chrome::exit_with_trace(1);
+            sermcp::trace_perfetto::exit_with_trace(1);
         }
     };
+
+    if agent_flag && !matches!(cmd.as_str(), "start" | "stop") {
+        eprintln!("Error: --agent is only supported by dutabo start and dutabo stop");
+        sermcp::trace_perfetto::exit_with_trace(1);
+    }
+
+    // Offline operation: no config, target connection or server is required.
+    // Exclusive output creation prevents accidental destruction of raw evidence.
+    if cmd == "filter-log" {
+        let result = (|| -> Result<(), Box<dyn std::error::Error>> {
+            if positional.len() != 2 {
+                return Err("usage: dutabo filter-log INPUT.full.log OUTPUT.serial.log".into());
+            }
+            let input = std::fs::File::open(&positional[0])?;
+            let output = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&positional[1])?;
+            sermcp::heartbeat::filter_log(input, output)?;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            eprintln!("filter-log: {error}");
+            sermcp::trace_perfetto::exit_with_trace(1);
+        }
+        return;
+    }
 
     if !matches!(
         cmd.as_str(),
@@ -410,7 +441,7 @@ async fn main() {
     ) {
         eprintln!("Unknown command: {cmd}");
         print_usage();
-        sermcp::trace_chrome::exit_with_trace(1);
+        sermcp::trace_perfetto::exit_with_trace(1);
     }
     if positional.iter().any(|arg| arg == "-h" || arg == "--help") {
         print_help();
@@ -445,7 +476,7 @@ async fn main() {
     if let Some(error) = arg_error {
         eprintln!("Error: {error}");
         print_usage();
-        sermcp::trace_chrome::exit_with_trace(1);
+        sermcp::trace_perfetto::exit_with_trace(1);
     }
 
     if cmd == "help" {
@@ -466,7 +497,7 @@ async fn main() {
             Ok(o) => o,
             Err(e) => {
                 eprintln!("Error: {e}");
-                sermcp::trace_chrome::exit_with_trace(1);
+                sermcp::trace_perfetto::exit_with_trace(1);
             }
         };
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -489,7 +520,7 @@ async fn main() {
             Ok(t) => t,
             Err(e) => {
                 eprintln!("Error: {e}");
-                sermcp::trace_chrome::exit_with_trace(1);
+                sermcp::trace_perfetto::exit_with_trace(1);
             }
         };
         let result = match transport {
@@ -505,7 +536,7 @@ async fn main() {
                         "Error: --tui requested but the TUI could not start \
                          (terminal unavailable or too small)"
                     );
-                    sermcp::trace_chrome::exit_with_trace(1);
+                    sermcp::trace_perfetto::exit_with_trace(1);
                 } else {
                     eprintln!("note: terminal unavailable for the TUI — using plain prompts");
                     sermcp::init::run_init(&mut tui_init::PlainPromptIO, &opts, &cwd)
@@ -530,31 +561,37 @@ async fn main() {
         Ok(Some(p)) => p,
         Ok(None) => {
             eprintln!("No .target.jsonc found.");
-            sermcp::trace_chrome::exit_with_trace(1);
+            sermcp::trace_perfetto::exit_with_trace(1);
         }
         Err(e) => {
             eprintln!("{e}");
-            sermcp::trace_chrome::exit_with_trace(1);
+            sermcp::trace_perfetto::exit_with_trace(1);
         }
     };
     if cmd == "start" || cmd == "stop" || cmd == "resume" {
         if dut_name.is_some() {
             eprintln!("Error: {cmd} applies to the entire project; --dut is not supported");
-            sermcp::trace_chrome::exit_with_trace(1);
+            sermcp::trace_perfetto::exit_with_trace(1);
         }
         let result = if cmd == "start" {
-            cmd_project_start(&config_path, mcp_port_explicit.then_some(mcp_port)).await
+            cmd_project_start(
+                &config_path,
+                mcp_port_explicit.then_some(mcp_port),
+                agent_flag,
+            )
+            .await
         } else {
             cmd_project_lifetime(
                 &config_path,
                 cmd == "resume",
                 mcp_port_explicit.then_some(mcp_port),
+                cmd == "stop" && agent_flag,
             )
             .await
         };
         if let Err(error) = result {
             eprintln!("Error: {error}");
-            sermcp::trace_chrome::exit_with_trace(1);
+            sermcp::trace_perfetto::exit_with_trace(1);
         }
         return;
     }
@@ -562,7 +599,7 @@ async fn main() {
         Ok(cfg) => (cfg.dev_hosts, cfg.duts),
         Err(e) => {
             eprintln!("{e}");
-            sermcp::trace_chrome::exit_with_trace(1);
+            sermcp::trace_perfetto::exit_with_trace(1);
         }
     };
 
@@ -581,7 +618,7 @@ async fn main() {
 
     let dut = match select_dut(&duts, dut_name.as_deref()) {
         Some(d) => d,
-        None => sermcp::trace_chrome::exit_with_trace(1),
+        None => sermcp::trace_perfetto::exit_with_trace(1),
     };
 
     // Compute the port only after DUT selection succeeds: an unknown name
@@ -620,7 +657,7 @@ async fn main() {
         }
         "serial" => cmd_serial(&dut, &mcp_port_candidates, &config_path).await,
         "reboot" => cmd_reboot(&dut, &mcp_port_candidates).await,
-        "uboot" => cmd_uboot(&dut, &mcp_port_candidates).await,
+        "uboot" => cmd_bootloader(&dut, &mcp_port_candidates).await,
         "button" => cmd_button(&dut, &positional, &mcp_port_candidates).await,
         "uf" => {
             if !positional.is_empty() {
@@ -628,7 +665,7 @@ async fn main() {
             } else {
                 // Unreachable: arg validation above enforces exactly one path.
                 eprintln!("Usage: dutabo uf <image>");
-                sermcp::trace_chrome::exit_with_trace(1);
+                sermcp::trace_perfetto::exit_with_trace(1);
             }
         }
         "flash-kernel" => {
@@ -637,14 +674,14 @@ async fn main() {
             } else {
                 // Unreachable: arg validation above enforces exactly one path.
                 eprintln!("Usage: dutabo flash-kernel <image>");
-                sermcp::trace_chrome::exit_with_trace(1);
+                sermcp::trace_perfetto::exit_with_trace(1);
             }
         }
         _ => {
             // Unreachable: unknown commands exit above.
             eprintln!("Unknown command: {cmd}");
             print_usage();
-            sermcp::trace_chrome::exit_with_trace(1);
+            sermcp::trace_perfetto::exit_with_trace(1);
         }
     }
 }
@@ -660,8 +697,10 @@ Commands:
     init [options]                  Create or update .target.jsonc
       --non-interactive, --quick, --advanced, --force, --tui, --plain
     list [--json]                   List configured devices
-    start                           Start or reuse a persistent project MCP
-    stop                            Stop this project MCP and release all DUTs
+    start [--agent]                 Start or reuse a persistent project MCP
+                                    Run without --agent to restart after a manual stop
+    stop [--agent]                 Stop this project MCP and release all DUTs
+                                    --agent stops without the inhibit marker
     resume                          Allow project MCP startup again; reconnect the Agent
 
   Device:
@@ -672,6 +711,7 @@ Commands:
     button <name> <action> [delay]  Control reset/download/power_key (sleep/wake)
     uf <image>                      Flash a full firmware image
     flash-kernel <image>            Flash a kernel or boot image
+    filter-log <input> <output>     Remove verified heartbeat records offline
 
     Common options:
       -d, --dut <name>    Select a device
@@ -683,12 +723,25 @@ Commands:
 
 ";
 
-async fn cmd_project_start(config: &Path, requested_port: Option<u16>) -> Result<(), String> {
+async fn cmd_project_start(
+    config: &Path,
+    requested_port: Option<u16>,
+    agent_start: bool,
+) -> Result<(), String> {
     let config = std::fs::canonicalize(config).map_err(|e| e.to_string())?;
     let project = config.parent().ok_or("Missing project directory")?;
-    sermcp::config::parse_config_file(&config)?;
+    let parsed = sermcp::config::parse_config_file(&config)?;
     let directory = project.join(".dut-serial");
     std::fs::create_dir_all(&directory).map_err(|e| e.to_string())?;
+    let _control = sermcp::lifecycle::lock_project_control(project)
+        .await
+        .map_err(|e| e.to_string())?;
+    let gate = sermcp::lifecycle::StartupGate::acquire(project)
+        .await
+        .map_err(|e| e.to_string())?;
+    if agent_start {
+        gate.require_enabled().map_err(|e| e.to_string())?;
+    }
     let client = reqwest::Client::builder()
         .no_proxy()
         .timeout(std::time::Duration::from_secs(1))
@@ -706,12 +759,13 @@ async fn cmd_project_start(config: &Path, requested_port: Option<u16>) -> Result
                 .send()
                 .await
             else {
-                return false;
+                return None;
             };
             let Ok(value) = response.json::<serde_json::Value>().await else {
-                return false;
+                return None;
             };
-            pid.is_some() && value["server"]["pid"].as_u64() == pid && value["status"] == "ok"
+            (pid.is_some() && value["server"]["pid"].as_u64() == pid && value["status"] == "ok")
+                .then_some(value)
         }
     };
     let port = requested_port
@@ -720,31 +774,13 @@ async fn cmd_project_start(config: &Path, requested_port: Option<u16>) -> Result
     if port == 0 {
         return Err("--mcp-port must be nonzero".into());
     }
-    if ready(port).await {
-        let health: serde_json::Value = client
-            .get(format!("http://127.0.0.1:{port}/health"))
-            .send()
-            .await
-            .map_err(|e| e.to_string())?
-            .json()
-            .await
-            .map_err(|e| e.to_string())?;
-        let pid = health["server"]["pid"]
-            .as_u64()
-            .ok_or("Missing server PID")?;
-        let environment =
-            std::fs::read(format!("/proc/{pid}/environ")).map_err(|e| e.to_string())?;
-        if environment
-            .split(|b| *b == 0)
-            .any(|entry| entry.starts_with(b"SERMCP_SESSION_PID="))
-            || !environment
-                .split(|b| *b == 0)
-                .any(|entry| entry == b"SERMCP_MANUAL_START=1")
-            || health["idle_timeout_disabled"] != true
-        {
-            return Err("Existing MCP is session-managed or idle-limited. Run dutabo stop, then dutabo start to create a persistent service".into());
+    if let Some(health) = ready(port).await {
+        if health["persistent"] != true {
+            return Err("Existing MCP is session-managed. Run dutabo stop --agent before starting a persistent service".into());
         }
-        cmd_project_lifetime(&config, true, None).await?;
+        if !agent_start {
+            gate.enable().map_err(|e| e.to_string())?;
+        }
         println!("Reusing project MCP on 127.0.0.1:{port}");
         return Ok(());
     }
@@ -754,7 +790,6 @@ async fn cmd_project_start(config: &Path, requested_port: Option<u16>) -> Result
     if !binary.is_file() {
         return Err("sermcp binary must be installed beside dutabo".into());
     }
-    let parsed = sermcp::config::parse_config_file(&config)?;
     let text = std::fs::read_to_string(&config).map_err(|e| e.to_string())?;
     let lock_dir = sermcp::config::parse_jsonc_text(&text)?
         .lock_dir
@@ -777,26 +812,9 @@ async fn cmd_project_start(config: &Path, requested_port: Option<u16>) -> Result
         }
     };
     conflicts(None)?;
-    // A launch lock covers marker removal, spawn and readiness across concurrent clients.
-    let launch_lock = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(directory.join("start.lock"))
-        .map_err(|e| e.to_string())?;
-    launch_lock
-        .try_lock()
-        .map_err(|_| "Another dutabo start is in progress; retry shortly")?;
-    if ready(port).await {
-        return Err(
-            "A project MCP appeared during startup; retry dutabo start to verify its lifetime mode"
-                .into(),
-        );
-    }
     let check = sermcp::lock_manager::acquire_project_lock(project)
         .map_err(|pid| format!("Project MCP {pid} already owns this project but is not ready on port {port}; no second service started"))?;
     drop(check);
-    cmd_project_lifetime(&config, true, None).await?;
     let log = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -804,23 +822,15 @@ async fn cmd_project_start(config: &Path, requested_port: Option<u16>) -> Result
         .map_err(|e| e.to_string())?;
     let mut command = std::process::Command::new(binary);
     command
-        .args([
-            "--http",
-            &format!("127.0.0.1:{port}"),
-            "--idle-timeout",
-            "0",
-        ])
+        .args(["--http", &format!("127.0.0.1:{port}"), "--persistent"])
         .current_dir(project)
         .env("TARGET_CONF", &config)
         .env_remove("TARGET_DUT_NAME")
-        .env_remove("TARGET_DUT_ALIAS")
+        .env_remove("SERMCP_SESSION_PID")
+        .env_remove("SERMCP_SESSION_START_TICKS")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(log);
-    command
-        .env("SERMCP_MANUAL_START", "1")
-        .env_remove("SERMCP_SESSION_PID")
-        .env_remove("SERMCP_SESSION_START_TICKS");
     use std::os::unix::process::CommandExt;
     // Detach from the launching terminal; only explicit stop or process failure ends this service.
     unsafe {
@@ -832,9 +842,20 @@ async fn cmd_project_start(config: &Path, requested_port: Option<u16>) -> Result
         });
     }
     let mut child = command.spawn().map_err(|e| e.to_string())?;
+    // The child waits on this gate before checking startup policy.
+    if !agent_start && let Err(error) = gate.enable() {
+        if child.kill().is_ok() {
+            let _ = child.wait();
+        }
+        return Err(error.to_string());
+    }
+    drop(gate);
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
     loop {
-        if ready(port).await {
+        if ready(port).await.is_some_and(|health| {
+            health["persistent"] == true
+                && health["server"]["pid"].as_u64() == Some(u64::from(child.id()))
+        }) {
             if let Err(error) = conflicts(Some(child.id())) {
                 // This is our own newly spawned child, never the competing holder.
                 unsafe {
@@ -861,40 +882,49 @@ async fn cmd_project_start(config: &Path, requested_port: Option<u16>) -> Result
     }
 }
 
+/// `dutabo stop` / `dutabo stop --agent` / `dutabo resume`.
+///
+/// Stop stops the project MCP and releases every DUT. The human form writes
+/// the startup inhibit first so automatic startup stays off until a human
+/// `start` or `resume`. The `--agent` form never writes or clears the inhibit:
+/// it stops the service while leaving the startup policy exactly as it was.
 async fn cmd_project_lifetime(
     config: &std::path::Path,
     resume: bool,
     port: Option<u16>,
+    agent_stop: bool,
 ) -> Result<(), String> {
     let config = std::fs::canonicalize(config).map_err(|e| e.to_string())?;
     let project = config.parent().ok_or("Missing project directory")?;
-    let directory = project.join(".dut-serial");
-    let marker = directory.join("stopped");
+    let _control = sermcp::lifecycle::lock_project_control(project)
+        .await
+        .map_err(|e| e.to_string())?;
+    let gate = sermcp::lifecycle::StartupGate::acquire(project)
+        .await
+        .map_err(|e| e.to_string())?;
     if resume {
-        match std::fs::remove_file(marker) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e.to_string()),
-        }
+        gate.enable().map_err(|e| e.to_string())?;
         println!("Project startup enabled. Reconnect the Agent MCP to start or reuse the service.");
         return Ok(());
     }
-    std::fs::create_dir_all(&directory).map_err(|e| e.to_string())?;
-    std::fs::write(
-        marker,
-        "Stopped by dutabo; use dutabo resume to allow startup.\n",
-    )
-    .map_err(|e| e.to_string())?;
-    if let Ok(lock) = sermcp::lock_manager::acquire_project_lock(project) {
-        drop(lock);
-        println!("Project MCP is stopped; automatic startup is disabled.");
-        return Ok(());
+    if !agent_stop {
+        gate.inhibit().map_err(|e| e.to_string())?;
     }
-    let pid: u32 = std::fs::read_to_string(directory.join("mcp.pid"))
-        .map_err(|e| e.to_string())?
-        .trim()
-        .parse()
-        .map_err(|_| "Invalid MCP PID")?;
+    let pid = match sermcp::lock_manager::acquire_project_lock(project) {
+        Ok(_) => {
+            if agent_stop {
+                println!("No project MCP is running.");
+            } else {
+                println!("Project MCP is stopped; automatic startup is disabled.");
+            }
+            return Ok(());
+        }
+        Err(0) => {
+            return Err("Cannot verify the project MCP PID; ownership is still locked".into());
+        }
+        Err(pid) => pid,
+    };
+    drop(gate);
     let ports = if let Some(port) = port {
         vec![port]
     } else {
@@ -912,27 +942,57 @@ async fn cmd_project_lifetime(
         .build()
         .map_err(|e| e.to_string())?;
     for port in ports {
-        let _ = client
-            .post(format!("http://127.0.0.1:{port}/project/stop"))
-            .json(&serde_json::json!({"config_path": config, "expected_pid": pid}))
-            .send()
-            .await;
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
-            if let Ok(lock) = sermcp::lock_manager::acquire_project_lock(project) {
-                drop(lock);
-                println!(
-                    "Project MCP stopped and project ownership released; automatic startup is disabled."
-                );
-                return Ok(());
+            match sermcp::lock_manager::acquire_project_lock(project) {
+                Ok(_) => {
+                    if agent_stop {
+                        println!("Project MCP stopped and project ownership released.");
+                    } else {
+                        println!(
+                            "Project MCP stopped and project ownership released; automatic startup is disabled."
+                        );
+                    }
+                    return Ok(());
+                }
+                Err(owner)
+                    if agent_stop
+                        && owner != 0
+                        && owner != pid
+                        && !sermcp::lock_manager::process_alive(pid) =>
+                {
+                    println!(
+                        "Former MCP released project ownership. PID {owner} now serves the project."
+                    );
+                    return Ok(());
+                }
+                Err(_) => {}
             }
             if tokio::time::Instant::now() >= deadline {
                 break;
             }
+            // A directly launched server can own the project before its
+            // control listener is ready. Retry the identified stop request;
+            // verify release before reporting success.
+            if let Err(error) = client
+                .post(format!("http://127.0.0.1:{port}/project/stop"))
+                .json(&serde_json::json!({
+                    "config_path": config,
+                    "expected_pid": pid,
+                }))
+                .send()
+                .await
+            {
+                tracing::debug!(%error, port, "Waiting for project stop control endpoint");
+            }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
     }
-    Err("Stop not confirmed; automatic startup is disabled, but the existing service may still own DUTs. Check the service version/control port; no process was forcibly killed.".into())
+    if agent_stop {
+        Err("Stop not confirmed; the existing service may still own DUTs. Check the service version/control port; no process was forcibly killed.".into())
+    } else {
+        Err("Stop not confirmed; automatic startup is disabled, but the existing service may still own DUTs. Check the service version/control port; no process was forcibly killed.".into())
+    }
 }
 
 fn print_usage() {
@@ -1055,7 +1115,7 @@ fn print_list_json(
         Ok(file_map) => values.extend(file_map),
         Err(e) => {
             eprintln!("{e}");
-            sermcp::trace_chrome::exit_with_trace(1);
+            sermcp::trace_perfetto::exit_with_trace(1);
         }
     }
     let cfg = sermcp::config::Config {
@@ -1090,7 +1150,7 @@ fn print_list_json(
         Ok(text) => println!("{text}"),
         Err(e) => {
             eprintln!("Cannot serialize inventory JSON: {e}");
-            sermcp::trace_chrome::exit_with_trace(1);
+            sermcp::trace_perfetto::exit_with_trace(1);
         }
     }
 }
@@ -1353,7 +1413,17 @@ async fn mcp_call_for_dut(
     if method == "tools/call" {
         args["arguments"]["dut"] = serde_json::json!(dut.dut_name);
     }
-    mcp_call(method, args, ports).await
+    let config = sermcp::config::find_config_path()
+        .ok()
+        .flatten()
+        .and_then(|path| path.canonicalize().ok());
+    mcp_call(
+        method,
+        args,
+        ports,
+        config.as_deref().and_then(Path::parent),
+    )
+    .await
 }
 
 /// Try the JSON-RPC `method` against each candidate port in order; the first
@@ -1363,9 +1433,14 @@ async fn mcp_call_for_dut(
 /// Gap list §1.3: a JSON-RPC error stops the probe immediately — the
 /// answering server is the authoritative one and its error is the real
 /// problem; trying fallback ports would mask it.
-async fn mcp_call(method: &str, args: serde_json::Value, ports: &[u16]) -> McpOutcome {
+async fn mcp_call(
+    method: &str,
+    args: serde_json::Value,
+    ports: &[u16],
+    project: Option<&Path>,
+) -> McpOutcome {
     for &port in ports {
-        match mcp_call_on_port(method, args.clone(), port).await {
+        match mcp_call_on_port(method, args.clone(), port, project).await {
             PortAttempt::Result(result) => return McpOutcome::Result(result),
             PortAttempt::RpcError { code, message } => {
                 return McpOutcome::RpcError { code, message };
@@ -1374,6 +1449,13 @@ async fn mcp_call(method: &str, args: serde_json::Value, ports: &[u16]) -> McpOu
         }
     }
     McpOutcome::Unreachable
+}
+
+fn control_header(project: Option<&Path>, port: u16) -> Option<reqwest::header::HeaderValue> {
+    let token = sermcp::lifecycle::read_control_token(project?, port)?;
+    let mut value = reqwest::header::HeaderValue::from_str(&token).ok()?;
+    value.set_sensitive(true);
+    Some(value)
 }
 
 /// Call `method` against one Streamable HTTP server on `port`.
@@ -1388,13 +1470,25 @@ async fn mcp_call(method: &str, args: serde_json::Value, ports: &[u16]) -> McpOu
 /// (MCP spec: terminated/unknown sessions MUST get 404 — the server
 /// restarted and recycled the port), the cache is dropped and the call is
 /// retried once with a fresh `initialize`.
-async fn mcp_call_on_port(method: &str, args: serde_json::Value, port: u16) -> PortAttempt {
+async fn mcp_call_on_port(
+    method: &str,
+    args: serde_json::Value,
+    port: u16,
+    project: Option<&Path>,
+) -> PortAttempt {
     let url = format!("http://127.0.0.1:{port}/mcp");
     // Only the connect phase is tightly bounded: a dead server fails fast
     // (connection refused), while a live server answering a long tool call
     // must not be abandoned mid-flight (see TOOL_CALL_TIMEOUT).
+    let mut headers = reqwest::header::HeaderMap::new();
+    if let Some(value) = control_header(project, port) {
+        headers.insert(sermcp::lifecycle::CONTROL_HEADER, value);
+    }
     let Ok(client) = reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(3))
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .default_headers(headers)
         .build()
     else {
         return PortAttempt::Failed;
@@ -1805,11 +1899,11 @@ fn report_mcp_failure(dut: &sermcp::config::DutConfig, ports: &[u16], outcome: M
     match outcome {
         McpOutcome::RpcError { code, message } => {
             eprintln!("MCP error {code}: {message}");
-            sermcp::trace_chrome::exit_with_trace(1);
+            sermcp::trace_perfetto::exit_with_trace(1);
         }
         McpOutcome::Unreachable => {
             eprintln!("{}", missing_server_message(dut, ports, None));
-            sermcp::trace_chrome::exit_with_trace(1);
+            sermcp::trace_perfetto::exit_with_trace(1);
         }
         McpOutcome::Result(_) => unreachable!("success is not a failure"),
     }
@@ -1820,7 +1914,7 @@ fn report_mcp_failure(dut: &sermcp::config::DutConfig, ports: &[u16], outcome: M
 /// `error` message when present) or when the text is not JSON at all — a
 /// server that answered with garbage is a failure, not a success. A missing
 /// `success` field counts as success (`serial_get_state` and
-/// `serial_send_command` carry none).
+/// `serial_exec` carry none).
 fn tool_payload(result: &serde_json::Value) -> Result<serde_json::Value, String> {
     let text = result["content"][0]["text"].as_str().unwrap_or("");
     let v = serde_json::from_str::<serde_json::Value>(text)
@@ -1843,7 +1937,7 @@ fn require_tool_success(result: &serde_json::Value, what: &str) -> serde_json::V
         Ok(v) => v,
         Err(error) => {
             eprintln!("{what} failed: {error}");
-            sermcp::trace_chrome::exit_with_trace(1);
+            sermcp::trace_perfetto::exit_with_trace(1);
         }
     }
 }
@@ -1985,7 +2079,7 @@ async fn cmd_status(
         Ok(watcher) => watcher,
         Err(error) => {
             eprintln!("Cannot watch DUT state: {error}");
-            sermcp::trace_chrome::exit_with_trace(1);
+            sermcp::trace_perfetto::exit_with_trace(1);
         }
     };
 
@@ -2025,7 +2119,7 @@ async fn cmd_reboot(dut: &sermcp::config::DutConfig, ports: &[u16]) {
         }
     } else {
         println!("Software reboot via serial...");
-        let args = serde_json::json!({"name":"serial_send_command","arguments":{"command":"reboot","timeout":5}});
+        let args = serde_json::json!({"name":"serial_exec","arguments":{"command":"reboot","mode":"shell","timeout":5}});
         match mcp_call_for_dut(dut, "tools/call", args, ports).await {
             McpOutcome::Result(r) => {
                 require_tool_success(&r, "reboot");
@@ -2036,21 +2130,11 @@ async fn cmd_reboot(dut: &sermcp::config::DutConfig, ports: &[u16]) {
     }
 }
 
-async fn cmd_uboot(dut: &sermcp::config::DutConfig, ports: &[u16]) {
-    // Delegate to the platform-agnostic `cmd_bootloader` — kept as a
-    // thin alias so existing `dutabo uboot` muscle memory keeps working.
-    cmd_bootloader(dut, ports).await;
-}
-
-/// `dutabo bootloader` — enter the target's bootloader interactive prompt
+/// `dutabo uboot` — enter the target's bootloader interactive prompt
 /// (U-Boot, UEFI Shell, barebox, GRUB, ...) by interrupting its autoboot
 /// countdown. `serial_enter_uboot` selects a hardware reset when available
-/// and otherwise falls back to a software reboot.
-///
-/// The underlying MCP tools keep their `*_uboot` names for historical wire
-/// stability — agents have prompts hardcoded around them — but this CLI
-/// subcommand is named `bootloader` because the same interrupt-flood
-/// mechanism works for any bootloader with an autoboot countdown. The
+/// and otherwise falls back to a software reboot. The same interrupt-flood
+/// mechanism works for any bootloader with an autoboot countdown; the
 /// interrupt byte itself is configured via `UBOOT_INTERRUPT_CHAR`.
 async fn cmd_bootloader(dut: &sermcp::config::DutConfig, ports: &[u16]) {
     let args = serde_json::json!({
@@ -2067,7 +2151,7 @@ async fn cmd_bootloader(dut: &sermcp::config::DutConfig, ports: &[u16]) {
         }
         Err(error) => {
             eprintln!("enter bootloader failed: {error}");
-            sermcp::trace_chrome::exit_with_trace(1);
+            sermcp::trace_perfetto::exit_with_trace(1);
         }
     }
 }
@@ -2095,7 +2179,7 @@ async fn cmd_button(dut: &sermcp::config::DutConfig, positional: &[String], port
                     positional[2]
                 );
                 print_usage();
-                sermcp::trace_chrome::exit_with_trace(1);
+                sermcp::trace_perfetto::exit_with_trace(1);
             }
         }
     }
@@ -2120,21 +2204,36 @@ async fn cmd_serial(dut: &sermcp::config::DutConfig, ports: &[u16], config_path:
     let settings = SerialSettings::from_lookup(|key| dut.section_values.get(key).cloned());
     let (winner, owner_mismatch) = probe_serial_server_detailed(dut, ports).await;
     if let Some(port) = winner {
-        serial_ws_relay(port, &dut.dut_name, settings).await;
+        let project = config_path.canonicalize().ok();
+        serial_ws_relay(
+            port,
+            &dut.dut_name,
+            settings,
+            project.as_deref().and_then(Path::parent),
+        )
+        .await;
         // Session ended — clean exit, no message needed.
         return;
     }
-    // No healthy MCP owns this DUT — rule: as long as .target.jsonc exists
-    // and the dev host + DUT are healthy, `dutabo serial` must always be
-    // able to interact. Connect directly to ser2net (host:port form), first
-    // asking the endpoint-owning MCP to yield via SIGUSR1 and, if it never
-    // does, taking the endpoint forcibly (explicit human preemption is
-    // absolute; the agent-side hook still blocks dutabo serial).
+    // Direct sessions still use the server's endpoint lock. A live owner
+    // must finish its control operations before handing the endpoint over.
     let Ok(serial_port_num) = dut.serial_port.parse::<u16>() else {
         eprintln!("{}", missing_server_message(dut, ports, owner_mismatch));
-        sermcp::trace_chrome::exit_with_trace(1);
+        sermcp::trace_perfetto::exit_with_trace(1);
     };
-    let lock_dir = sermcp::lock_manager::default_lock_dir();
+    let global = match sermcp::config::parse_jsonc_config(config_path) {
+        Ok(global) => global,
+        Err(error) => {
+            eprintln!("Cannot verify the serial endpoint lock configuration: {error}");
+            sermcp::trace_perfetto::exit_with_trace(1);
+        }
+    };
+    let values = dut.to_config_map(&global);
+    let lock_dir = values
+        .get("LOCK_DIR")
+        .filter(|path| !path.is_empty())
+        .cloned()
+        .unwrap_or_else(sermcp::lock_manager::default_lock_dir);
     let mut yielded_owner: Option<u32> = None;
     let stream = match connect_serial_direct(
         &dut.dev_host_ip,
@@ -2152,7 +2251,7 @@ async fn cmd_serial(dut: &sermcp::config::DutConfig, ports: &[u16], config_path:
                  survived forced takeover). Close that session first.",
                 dut.dev_host_ip, serial_port_num
             );
-            sermcp::trace_chrome::exit_with_trace(1);
+            sermcp::trace_perfetto::exit_with_trace(1);
         }
         DirectTakeover::Unreachable => {
             eprintln!(
@@ -2160,12 +2259,10 @@ async fn cmd_serial(dut: &sermcp::config::DutConfig, ports: &[u16], config_path:
                  (dev host or serial endpoint unreachable).",
                 dut.dut_name, dut.dev_host_ip, serial_port_num
             );
-            sermcp::trace_chrome::exit_with_trace(1);
+            sermcp::trace_perfetto::exit_with_trace(1);
         }
     };
-    let global = sermcp::config::parse_jsonc_config(config_path).unwrap_or_default();
-    let values = dut.to_config_map(&global);
-    let logs = sermcp::log_manager::LogManager::new(
+    let logs = sermcp::log_manager::LogManager::new_background(
         config_path.parent().unwrap_or_else(|| Path::new(".")),
         values
             .get("MAX_ARCHIVED_LOGS")
@@ -2203,25 +2300,19 @@ async fn cmd_serial(dut: &sermcp::config::DutConfig, ports: &[u16], config_path:
 enum DirectTakeover {
     Connected(tokio::net::TcpStream),
     /// The endpoint is held by a pid `dutabo serial` does not take over: any
-    /// non-MCP owner (another interactive session, an unrelated program —
-    /// first come wins among humans), or an MCP that survived every
-    /// polite window and forced-takeover round. Holds the last observed pid.
+    /// non-MCP owner (another interactive session or an unrelated program)
+    /// or an MCP that did not release ownership in time.
     ForeignOwner(u32),
     /// We held the lock but ser2net refused the TCP connection.
     Unreachable,
 }
 
-/// Polite yield window before forced takeover. Covers the engine's 30 s
-/// reconnect-backoff cap plus a moderate command hold; an owner still holding
-/// the endpoint after this is wedged (or runs a binary without the SIGUSR1
-/// handler) and the human takes over regardless.
+/// Allow time for the server to finish active control operations and yield.
 const POLITE_YIELD_SECS: u64 = 45;
 /// Re-send SIGUSR1 at this cadence while waiting: the first signal can race a
 /// server that has not spawned its handler task yet.
 const YIELD_NUDGE_SECS: u64 = 3;
-/// Polite-window-plus-forced-takeover rounds. The first round settles every
-/// realistic case (yield or steal); more is pathological lock churn we must
-/// not fight forever.
+/// Bound retries if the owner exits just as the yield window expires.
 const TAKEOVER_ROUNDS: usize = 3;
 
 /// Direct-connect to the serial endpoint after atomically taking its lock.
@@ -2231,13 +2322,8 @@ const TAKEOVER_ROUNDS: usize = 3;
 /// asked to yield with SIGUSR1; this dutabo process then claims the same lock,
 /// preventing every Agent from reconnecting for the whole human session.
 ///
-/// Preemption ladder for an MCP owner, per [`TAKEOVER_ROUNDS`]: a
-/// [`POLITE_YIELD_SECS`] polite window (SIGUSR1 re-nudged every
-/// [`YIELD_NUDGE_SECS`]), then forced takeover via
-/// [`steal_lock`](sermcp::lock_manager::steal_lock) — human
-/// preemption is absolute. `steal_lock` re-verifies the recorded pid right
-/// before unlinking, so an owner that yielded or a brand-new owner is never
-/// evicted. Non-MCP owners are never preempted.
+/// Retry acquisition after a verified owner exit. A live holder must
+/// release the kernel lock before the direct session connects.
 async fn connect_serial_direct(
     host: &str,
     port: u16,
@@ -2294,15 +2380,13 @@ async fn connect_serial_direct(
             }
             tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         }
-        // Polite window over with the lock still held: displace the owner.
-        // Losing the steal race (a new owner slipped in) just means the next
-        // round politely asks THAT owner.
+        // Retry acquisition only if the former owner has exited.
         if let Some(owner) = requested_owner
             && sermcp::lock_manager::steal_lock(host, &target, owner, lock_dir)
         {
             eprintln!(
                 "MCP server (pid {owner}) did not yield within \
-                 {POLITE_YIELD_SECS}s — taking over (human preemption is absolute)."
+                 {POLITE_YIELD_SECS}s and has exited — retrying the endpoint lock."
             );
         }
     }
@@ -2313,8 +2397,7 @@ async fn connect_serial_direct(
         };
     }
     if sermcp::lock_manager::endpoint_lock_owner(&lock_path) != Some(my_pid) {
-        // Lost the post-steal O_EXCL race to a fresh owner — do not fight it;
-        // the human reruns against whoever holds the endpoint now.
+        // The recorded owner must match the process that will open the port.
         return match last_holder.or(requested_owner) {
             Some(owner) => DirectTakeover::ForeignOwner(owner),
             None => DirectTakeover::Unreachable,
@@ -2382,14 +2465,20 @@ where
         Ok(g) => g,
         Err(e) => {
             eprintln!("Cannot enter raw mode: {e}");
-            sermcp::trace_chrome::exit_with_trace(1);
+            sermcp::trace_perfetto::exit_with_trace(1);
         }
     };
     let (events_tx, events_rx) = tokio::sync::mpsc::channel::<SessionEvent>(64);
     let (tx, tx_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-    let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+    // A PTY without TIOCSWINSZ reports Ok((0, 0)) — `unwrap_or` only covers
+    // the Err path, and a zero-sized grid panics the terminal core on first
+    // render. Clamp to a 1x1 minimum so scripted sessions still run.
+    let (cols, rows) = {
+        let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+        (cols.max(1), rows.max(1))
+    };
     let (prefs, prefs_error) = sermcp::serial_term::prefs::TerminalPrefs::load();
     if let Some(error) = prefs_error {
         eprintln!("warning: {error} — using the default terminal preferences");
@@ -2449,6 +2538,58 @@ where
     outcome
 }
 
+/// Direct sessions also report a failure in the final chunk, including when
+/// their async reader is cancelled before another storage-health poll.
+struct DirectLogCapture(sermcp::log_manager::LogManager);
+
+impl std::ops::Deref for DirectLogCapture {
+    type Target = sermcp::log_manager::LogManager;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for DirectLogCapture {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl Drop for DirectLogCapture {
+    fn drop(&mut self) {
+        self.0.close();
+        let status = self.0.persistence_status();
+        if status.pending_bytes != 0 || status.last_error.is_some() {
+            eprintln!(
+                "\r\n[dutabo] Log shutdown incomplete: {} bytes not confirmed durable; {}",
+                status.pending_bytes,
+                status
+                    .last_error
+                    .as_deref()
+                    .unwrap_or("writer backlog remains")
+            );
+        }
+    }
+}
+
+/// Apply the same storage backpressure as the managed engine. Report each
+/// outage once so a human session cannot silently continue without logging.
+fn retry_direct_log_storage(logs: &mut sermcp::log_manager::LogManager, paused: &mut bool) -> bool {
+    // Inspect the writer snapshot without waiting behind an in-flight fsync.
+    let ready = logs.poll_persistence();
+    if !ready && !*paused {
+        eprintln!(
+            "\r\n[dutabo] Serial capture paused: log persistence failed: {}. Restore storage to resume; upstream buffering is finite.",
+            logs.persistence_status().last_error.unwrap_or_default()
+        );
+    } else if ready && *paused {
+        eprintln!("\r\n[dutabo] Log persistence recovered; serial capture resumed.");
+    }
+    *paused = !ready;
+    ready
+}
+
 /// Direct ser2net TCP serial console for `dutabo serial` when no MCP server
 /// owns the endpoint. Telnet IAC framing and the ser2net connect banner are
 /// stripped client-side; the VT-core session is shared with the WS relay.
@@ -2458,15 +2599,17 @@ async fn serial_tcp_relay(
     stream: tokio::net::TcpStream,
     banner: &str,
     settings: SerialSettings,
-    mut logs: sermcp::log_manager::LogManager,
+    logs: sermcp::log_manager::LogManager,
 ) {
     use tokio::io::AsyncReadExt;
     use tokio::io::AsyncWriteExt;
 
+    let mut logs = DirectLogCapture(logs);
+
     // Keystrokes must not wait for TCP packet coalescing.
     let _ = stream.set_nodelay(true);
     let (mut read_half, write_half) = stream.into_split();
-    let mut log_wire = sermcp::serial_term::wire::WireDecoder::for_log(true);
+    let mut storage_paused = false;
 
     if !std::io::stdin().is_terminal() {
         eprintln!("{banner} (non-interactive, 30s timeout)");
@@ -2479,13 +2622,18 @@ async fn serial_tcp_relay(
             if remain.is_zero() {
                 break;
             }
+            if !retry_direct_log_storage(&mut logs, &mut storage_paused) {
+                tokio::time::sleep(remain.min(std::time::Duration::from_millis(100))).await;
+                continue;
+            }
             match tokio::time::timeout(remain, read_half.read(&mut buf)).await {
                 Err(_) => break,
                 Ok(Ok(0)) | Ok(Err(_)) => break,
                 Ok(Ok(n)) => {
-                    let mut payload = Vec::new();
-                    log_wire.decode(&buf[..n], &mut payload);
-                    logs.write_serial(&payload);
+                    sermcp::console::acknowledge_read(read_half.as_ref());
+                    // Preserve the transport evidence before display filtering,
+                    // including incomplete banner prefixes and binary bytes.
+                    logs.write_serial(&buf[..n]);
                     out.clear();
                     sanitizer.filter(&buf[..n], &mut out);
                     write_stdout(&out);
@@ -2506,6 +2654,10 @@ async fn serial_tcp_relay(
                 let mut read_half = read_half;
                 let mut buf = vec![0u8; 4096];
                 loop {
+                    if !retry_direct_log_storage(&mut logs, &mut storage_paused) {
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        continue;
+                    }
                     match read_half.read(&mut buf).await {
                         Ok(0) => {
                             let _ = events
@@ -2514,9 +2666,9 @@ async fn serial_tcp_relay(
                             break;
                         }
                         Ok(n) => {
-                            let mut payload = Vec::new();
-                            log_wire.decode(&buf[..n], &mut payload);
-                            logs.write_serial(&payload);
+                            sermcp::console::acknowledge_read(read_half.as_ref());
+                            sermcp::relay_trace!(bytes = n, "client_tcp_rx");
+                            logs.write_serial(&buf[..n]);
                             if events
                                 .send(SessionEvent::Rx(buf[..n].to_vec()))
                                 .await
@@ -2535,6 +2687,7 @@ async fn serial_tcp_relay(
             let writer = tokio::spawn(async move {
                 let mut write_half = write_half;
                 while let Some(bytes) = tx_rx.recv().await {
+                    sermcp::relay_trace!(bytes = bytes.len(), "client_tcp_tx");
                     if write_half.write_all(&bytes).await.is_err() {
                         break;
                     }
@@ -2622,11 +2775,33 @@ fn missing_server_message(
 
 // ── WebSocket serial relay (via MCP /serial/ws) ─────────────────────────
 
+fn serial_ws_request(
+    url: String,
+    project: Option<&Path>,
+    port: u16,
+) -> tokio_tungstenite::tungstenite::Result<
+    tokio_tungstenite::tungstenite::handshake::client::Request,
+> {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
+
+    let mut request = url.into_client_request()?;
+    if let Some(value) = control_header(project, port) {
+        request
+            .headers_mut()
+            .insert(sermcp::lifecycle::CONTROL_HEADER, value);
+    }
+    Ok(request)
+}
+
 /// MCP WebSocket serial relay. The server's console driver already removed
 /// telnet/RFC2217 framing before broadcasting, so payload arrives clean —
-/// the VT-core session runs without client-side framing decode. Non-TTY
-/// invocations keep the legacy sanitized passthrough (30s).
-async fn serial_ws_relay(mcp_port: u16, dut_name: &str, settings: SerialSettings) {
+/// the VT-core session runs without client-side framing decode.
+async fn serial_ws_relay(
+    mcp_port: u16,
+    dut_name: &str,
+    settings: SerialSettings,
+    project: Option<&Path>,
+) {
     use futures_util::StreamExt;
     use tokio_tungstenite::connect_async;
     use tokio_tungstenite::tungstenite::Message;
@@ -2638,13 +2813,22 @@ async fn serial_ws_relay(mcp_port: u16, dut_name: &str, settings: SerialSettings
     };
     let selector = sermcp::engine_registry::dut_query(dut_name);
     let url = format!("ws://127.0.0.1:{mcp_port}/serial/ws?{selector}{history_query}");
-    let (ws, _) = match connect_async(&url).await {
+    let result = match serial_ws_request(url, project, mcp_port) {
+        Ok(request) => connect_async(request).await,
+        Err(error) => Err(error),
+    };
+    let (ws, _) = match result {
         Ok(ws) => ws,
         Err(e) => {
             eprintln!("WS connect failed: {e}");
-            sermcp::trace_chrome::exit_with_trace(1);
+            sermcp::trace_perfetto::exit_with_trace(1);
         }
     };
+    // Keystrokes must not wait for TCP packet coalescing — same rule as the
+    // direct ser2net path (measured p90 216ms → 83ms on loopback without it).
+    if let tokio_tungstenite::MaybeTlsStream::Plain(stream) = ws.get_ref() {
+        let _ = stream.set_nodelay(true);
+    }
     let (ws_sink, mut ws_stream) = ws.split();
 
     if !std::io::stdin().is_terminal() {
@@ -2683,6 +2867,7 @@ async fn serial_ws_relay(mcp_port: u16, dut_name: &str, settings: SerialSettings
                 loop {
                     match ws_stream.next().await {
                         Some(Ok(Message::Binary(data))) => {
+                            sermcp::relay_trace!(bytes = data.len(), "client_ws_rx");
                             let event = if historical {
                                 SessionEvent::History(data.to_vec())
                             } else {
@@ -2728,6 +2913,7 @@ async fn serial_ws_relay(mcp_port: u16, dut_name: &str, settings: SerialSettings
                 // Serial bytes are binary: control keys, ESC and any
                 // non-UTF-8 payload must traverse transparently.
                 while let Some(bytes) = tx_rx.recv().await {
+                    sermcp::relay_trace!(bytes = bytes.len(), "client_ws_tx");
                     if sink.send(Message::Binary(bytes.into())).await.is_err() {
                         break;
                     }
@@ -2749,7 +2935,7 @@ async fn cmd_flash(
     let real = std::fs::canonicalize(image_path).unwrap_or_else(|_| PathBuf::from(image_path));
     if !real.exists() {
         eprintln!("Image not found: {}", real.display());
-        sermcp::trace_chrome::exit_with_trace(1);
+        sermcp::trace_perfetto::exit_with_trace(1);
     }
     println!(
         "Image: {} ({} bytes)",
@@ -2763,7 +2949,7 @@ async fn cmd_flash(
     };
     if !plan["success"].as_bool().unwrap_or(false) {
         eprintln!("{}", plan["error"].as_str().unwrap_or("unknown"));
-        sermcp::trace_chrome::exit_with_trace(1);
+        sermcp::trace_perfetto::exit_with_trace(1);
     }
 
     let dh = plan["dev_host"].as_str().unwrap_or("");
@@ -2783,7 +2969,7 @@ async fn cmd_flash(
 
     if dh.is_empty() {
         eprintln!("dev_host not configured");
-        sermcp::trace_chrome::exit_with_trace(1);
+        sermcp::trace_perfetto::exit_with_trace(1);
     }
 
     // Upload
@@ -2799,7 +2985,7 @@ async fn cmd_flash(
         .unwrap_or(false)
     {
         eprintln!("SCP failed");
-        sermcp::trace_chrome::exit_with_trace(1);
+        sermcp::trace_perfetto::exit_with_trace(1);
     }
 
     // Verify
@@ -2828,7 +3014,7 @@ async fn cmd_flash(
     .to_string();
     if lsha != rsha || lsha.is_empty() {
         eprintln!("SHA256 MISMATCH: local={lsha} remote={rsha}");
-        sermcp::trace_chrome::exit_with_trace(1);
+        sermcp::trace_perfetto::exit_with_trace(1);
     }
     println!("  OK");
 
@@ -2891,7 +3077,7 @@ async fn cmd_flash(
         println!("  Device in Loader mode — flashing...");
     } else {
         eprintln!("  Device not detected. Ensure USB is connected and try again.");
-        sermcp::trace_chrome::exit_with_trace(1);
+        sermcp::trace_perfetto::exit_with_trace(1);
     }
 
     let flash_cmd = format!("{tool} {fcmd}");
@@ -2902,11 +3088,11 @@ async fn cmd_flash(
         Ok(s) if s.success() => println!("  Done!"),
         Ok(s) => {
             eprintln!("  Failed (exit {s})");
-            sermcp::trace_chrome::exit_with_trace(1);
+            sermcp::trace_perfetto::exit_with_trace(1);
         }
         Err(e) => {
             eprintln!("  Error: {e}");
-            sermcp::trace_chrome::exit_with_trace(1);
+            sermcp::trace_perfetto::exit_with_trace(1);
         }
     }
 }

@@ -35,7 +35,6 @@ fn start_server(project: &Path, owner: &Child, http: bool) -> Guard {
         .current_dir(project)
         .env("TARGET_CONF", config)
         .env_remove("TARGET_DUT_NAME")
-        .env_remove("TARGET_DUT_ALIAS")
         .env("SERMCP_SESSION_PID", owner.id().to_string())
         .env("SERMCP_SESSION_START_TICKS", start_ticks(owner.id()))
         .stdin(Stdio::piped())
@@ -151,7 +150,10 @@ fn dutabo_stop_releases_project_and_prevents_automatic_restart() {
         ] {
             let response = client
                 .post(format!("http://127.0.0.1:{port}/project/stop"))
-                .json(&serde_json::json!({"config_path": config, "expected_pid": pid}))
+                .json(&serde_json::json!({
+                    "config_path": config,
+                    "expected_pid": pid,
+                }))
                 .send()
                 .await
                 .unwrap();
@@ -168,6 +170,12 @@ fn dutabo_stop_releases_project_and_prevents_automatic_restart() {
     assert_exits(&mut server.0);
     assert!(project.path().join(".dut-serial/stopped").exists());
     assert!(run("stop").status.success());
+    let refused = lifecycle_command(project.path(), &["start", "--agent"])
+        .output()
+        .unwrap();
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("dutabo resume"));
+    assert!(project.path().join(".dut-serial/stopped").exists());
     let refused = Command::new(env!("CARGO_BIN_EXE_sermcp"))
         .current_dir(project.path())
         .env("TARGET_CONF", project.path().join(".target.jsonc"))
@@ -198,6 +206,7 @@ fn persistent_start_ignores_agent_lifetime_and_reuses_service() {
     std::thread::sleep(Duration::from_secs(2));
     assert!(run("stop").status.success());
     assert_exits(&mut old.0);
+    assert!(project.path().join(".dut-serial/stopped").exists());
     let started = run("start");
     assert!(
         started.status.success(),
@@ -206,6 +215,7 @@ fn persistent_start_ignores_agent_lifetime_and_reuses_service() {
     );
     let pid_path = project.path().join(".dut-serial/mcp.pid");
     let pid = std::fs::read_to_string(&pid_path).unwrap();
+    assert!(!project.path().join(".dut-serial/stopped").exists());
     assert!(run("start").status.success());
     assert_eq!(std::fs::read_to_string(&pid_path).unwrap(), pid);
     let hook_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -219,7 +229,16 @@ fn persistent_start_ignores_agent_lifetime_and_reuses_service() {
 
     owner.0.kill().unwrap();
     owner.0.wait().unwrap();
-    std::thread::sleep(Duration::from_secs(4));
+    let challenger = Command::new(env!("CARGO_BIN_EXE_sermcp"))
+        .current_dir(project.path())
+        .env("TARGET_CONF", project.path().join(".target.jsonc"))
+        .args(["--http", "127.0.0.1:0"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+    assert!(!challenger.status.success());
+    assert_eq!(std::fs::read_to_string(&pid_path).unwrap(), pid);
     assert!(sermcp::lock_manager::process_alive(
         pid.trim().parse().unwrap()
     ));
@@ -236,51 +255,266 @@ fn persistent_start_ignores_agent_lifetime_and_reuses_service() {
     );
 }
 
-#[test]
-fn agent_start_rejects_only_the_same_host_and_port() {
+fn lifecycle_command(project: &Path, args: &[&str]) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_dutabo"));
+    command
+        .current_dir(project)
+        .env("TARGET_CONF", project.join(".target.jsonc"))
+        .args(args)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    command
+}
+
+fn assert_start_refused(child: &mut Child) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            assert!(
+                !status.success(),
+                "inhibited startup unexpectedly succeeded"
+            );
+            return;
+        }
+        assert!(Instant::now() < deadline, "inhibited startup did not exit");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn write_lifecycle_config(project: &Path) {
+    let serial = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = serial.local_addr().unwrap().port();
+    std::fs::write(
+        project.join(".target.jsonc"),
+        format!(r#"{{"dev_hosts":[{{"ip":"127.0.0.1","user":"root","duts":[{{"dut_name":"race-test","serial":{{"port":{port},"baudrate":115200}},"control":{{"dev_ctrl":"none"}}}}]}}]}}"#),
+    ).unwrap();
+}
+
+#[tokio::test]
+async fn agent_start_waiting_at_gate_cannot_clear_a_later_human_stop() {
     let project = tempfile::tempdir().unwrap();
-    let locks = tempfile::tempdir().unwrap();
-    let host = "127.0.0.2";
-    let port = "45671";
-    let lock_dir = locks.path().to_str().unwrap();
-    assert!(sermcp::lock_manager::acquire_lock(host, port, lock_dir).is_none());
-    for (candidate_host, candidate_port, conflict) in [
-        (host, port, true),
-        ("127.0.0.3", port, false),
-        (host, "45672", false),
-    ] {
-        let config = project.path().join(".target.jsonc");
-        std::fs::write(&config, serde_json::json!({"lock_dir": lock_dir,
-            "dev_hosts": [{"ip": candidate_host, "duts": [{"dut_name": "test", "serial": {"port": candidate_port, "baudrate": 115200}, "control": {"dev_ctrl": "none"}}]}]
-        }).to_string()).unwrap();
-        let mut server = Guard(
-            Command::new(env!("CARGO_BIN_EXE_sermcp"))
-                .current_dir(project.path())
-                .env("TARGET_CONF", config)
-                .args(["--http", "127.0.0.1:0"])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::piped())
-                .spawn()
-                .unwrap(),
-        );
-        std::thread::sleep(Duration::from_secs(1));
-        if conflict {
-            assert!(server.0.try_wait().unwrap().is_some_and(|s| !s.success()));
-            let mut error = String::new();
-            use std::io::Read;
-            server
-                .0
-                .stderr
-                .take()
-                .unwrap()
-                .read_to_string(&mut error)
-                .unwrap();
-            assert!(error.contains("Serial endpoint conflict"), "{error}");
-            assert!(error.contains("project") && error.contains("PID"));
-        } else {
-            assert!(server.0.try_wait().unwrap().is_none());
+    write_lifecycle_config(project.path());
+    let gate = sermcp::lifecycle::StartupGate::acquire(project.path())
+        .await
+        .unwrap();
+    let mut child = Guard(
+        lifecycle_command(project.path(), &["start", "--agent"])
+            .spawn()
+            .unwrap(),
+    );
+    // Observe that dutabo has taken the control lock and is waiting for
+    // startup admission, rather than relying on a timing-only race.
+    let control_path = project.path().join(".dut-serial/start.lock");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Ok(control) = std::fs::File::open(&control_path)
+            && control.try_lock().is_err()
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "agent did not reach the gate");
+        assert!(child.0.try_wait().unwrap().is_none());
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    gate.inhibit().unwrap();
+    drop(gate);
+    assert_start_refused(&mut child.0);
+    assert!(project.path().join(".dut-serial/stopped").exists());
+    assert!(!project.path().join(".dut-serial/mcp.pid").exists());
+}
+
+#[test]
+fn agent_start_preserves_inhibit_even_when_a_persistent_server_is_ready() {
+    let project = tempfile::tempdir().unwrap();
+    write_lifecycle_config(project.path());
+    let started = lifecycle_command(project.path(), &["start", "--agent"])
+        .output()
+        .unwrap();
+    assert!(
+        started.status.success(),
+        "{}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    let pid: u32 = std::fs::read_to_string(project.path().join(".dut-serial/mcp.pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    // A persistent child is detached from dutabo. Always clean it up even
+    // if a subsequent assertion fails.
+    struct Cleanup(u32, std::path::PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            if std::fs::read_to_string(self.1.join(".dut-serial/mcp.pid"))
+                .ok()
+                .is_none_or(|pid| pid.trim() != self.0.to_string())
+            {
+                return;
+            }
+            // SAFETY: SIGTERM addresses only the server PID captured by this test.
+            unsafe {
+                libc::kill(self.0 as i32, libc::SIGTERM);
+            }
         }
     }
-    sermcp::lock_manager::release_lock(host, port, lock_dir);
+    let _cleanup = Cleanup(pid, project.path().to_path_buf());
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let gate = sermcp::lifecycle::StartupGate::acquire(project.path())
+            .await
+            .unwrap();
+        gate.inhibit().unwrap();
+    });
+    let refused = lifecycle_command(project.path(), &["start", "--agent"])
+        .output()
+        .unwrap();
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("human"));
+    assert!(project.path().join(".dut-serial/stopped").exists());
+    assert_eq!(
+        std::fs::read_to_string(project.path().join(".dut-serial/mcp.pid"))
+            .unwrap()
+            .trim(),
+        pid.to_string()
+    );
+    // `resume --agent` stays rejected: an Agent must never clear the inhibit.
+    let refused = lifecycle_command(project.path(), &["resume", "--agent"])
+        .output()
+        .unwrap();
+    assert!(!refused.status.success());
+    assert!(project.path().join(".dut-serial/stopped").exists());
+    assert!(
+        lifecycle_command(project.path(), &["stop"])
+            .status()
+            .unwrap()
+            .success()
+    );
+}
+
+/// `dutabo stop --agent` stops the service and releases project ownership
+/// WITHOUT writing or clearing the startup inhibit: a human inhibit survives
+/// it, so Agent start stays refused until a human resumes.
+#[test]
+fn agent_stop_releases_ownership_without_touching_the_inhibit() {
+    let project = tempfile::tempdir().unwrap();
+    write_lifecycle_config(project.path());
+    let started = lifecycle_command(project.path(), &["start", "--agent"])
+        .output()
+        .unwrap();
+    assert!(
+        started.status.success(),
+        "{}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    let pid: u32 = std::fs::read_to_string(project.path().join(".dut-serial/mcp.pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    // A persistent child is detached from dutabo. Always clean it up even
+    // if a subsequent assertion fails.
+    struct Cleanup(u32);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            if sermcp::lock_manager::process_alive(self.0) {
+                // SAFETY: SIGTERM addresses only the server PID captured by this test.
+                unsafe {
+                    libc::kill(self.0 as i32, libc::SIGTERM);
+                }
+            }
+        }
+    }
+    let _cleanup = Cleanup(pid);
+    // A human inhibit must survive an Agent stop untouched.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let gate = sermcp::lifecycle::StartupGate::acquire(project.path())
+            .await
+            .unwrap();
+        gate.inhibit().unwrap();
+    });
+    let stopped = lifecycle_command(project.path(), &["stop", "--agent"])
+        .output()
+        .unwrap();
+    assert!(
+        stopped.status.success(),
+        "{}",
+        String::from_utf8_lossy(&stopped.stderr)
+    );
+    let deadline = Instant::now() + Duration::from_secs(6);
+    while sermcp::lock_manager::process_alive(pid) {
+        assert!(
+            Instant::now() < deadline,
+            "agent stop did not stop the service"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert!(project.path().join(".dut-serial/stopped").exists());
+    // The surviving inhibit still refuses Agent startup.
+    let refused = lifecycle_command(project.path(), &["start", "--agent"])
+        .output()
+        .unwrap();
+    assert!(!refused.status.success());
+    // A human resume re-enables startup and the Agent can take ownership again.
+    assert!(
+        lifecycle_command(project.path(), &["resume"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let restarted = lifecycle_command(project.path(), &["start", "--agent"])
+        .output()
+        .unwrap();
+    assert!(
+        restarted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&restarted.stderr)
+    );
+    let replacement: u32 = std::fs::read_to_string(project.path().join(".dut-serial/mcp.pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let _replacement_cleanup = Cleanup(replacement);
+    // The final human stop parks the replacement service with the inhibit.
+    assert!(
+        lifecycle_command(project.path(), &["stop"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(project.path().join(".dut-serial/stopped").exists());
+}
+
+#[tokio::test]
+async fn direct_server_rechecks_human_stop_after_waiting_for_startup_gate() {
+    let project = tempfile::tempdir().unwrap();
+    write_lifecycle_config(project.path());
+    let gate = sermcp::lifecycle::StartupGate::acquire(project.path())
+        .await
+        .unwrap();
+    let mut server = Guard(
+        Command::new(env!("CARGO_BIN_EXE_sermcp"))
+            .current_dir(project.path())
+            .env("TARGET_CONF", project.path().join(".target.jsonc"))
+            .args(["--http", "127.0.0.1:0", "--idle-timeout", "0"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(server.0.try_wait().unwrap().is_none());
+    assert!(!project.path().join(".dut-serial/mcp.pid").exists());
+    gate.inhibit().unwrap();
+    drop(gate);
+    assert_start_refused(&mut server.0);
+    assert!(!project.path().join(".dut-serial/mcp.pid").exists());
+    assert!(project.path().join(".dut-serial/stopped").exists());
 }

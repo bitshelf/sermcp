@@ -144,7 +144,7 @@ The engine is wrapped in `SharedEngine = Arc<Mutex<SerialEngine>>`. In HTTP mode
 ### Command Execution Flow
 
 ```
-MCP tool call "serial_send_command"
+MCP tool call "serial_exec"
   → engine.lock().await
   → commands.queue(command, timeout, tx)
   → console.write_all(marker_wrapped_cmd)
@@ -159,17 +159,23 @@ MCP tool call "serial_send_command"
 
 1. **Regex mode** (default): Compiled regexes for known SoC stages — SPL, TPL, BL31, OPTEE, DDR init, U-Boot, autoboot countdown, kernel, login prompt, panic/oops. Each stage can trigger an action (rotate log, send Ctrl-C for U-Boot interrupt).
 
-2. **StageLearner** (adaptive): Learns per-board fingerprints from a reference boot log via `serial_load_reference`. Uses 3-gram Jaccard (0.6) + Jaro-Winkler (0.4) similarity to classify lines without SOC-specific regex. Thresholds are configurable: `.target.toml` `[dut.monitor]` `learner_stage_threshold` (default 0.45) and `learner_crash_threshold` (default 0.50), falling back to `Cargo.toml` `[package.metadata.learn]`.
+2. **StageLearner** (adaptive): Learns per-board fingerprints from a reference boot log via `serial_load_reference`. Uses 3-gram Jaccard (0.6) + Jaro-Winkler (0.4) similarity to classify lines without SOC-specific regex. Thresholds are configurable: `.target.jsonc` `monitor.learner_stage_threshold` (default 0.45) and `monitor.learner_crash_threshold` (default 0.50), with compile-time defaults in `Cargo.toml` `[package.metadata.learn]`.
 
 ### Config: `.target.jsonc`
 
-The ONLY config format is `.target.jsonc` (`[[dev_hosts]]` with nested `duts[]`; a top-level section is the global fallback). Legacy single-board `[dev_host]` and flat `.target.conf` parsing were removed — unknown keys fail loudly via `deny_unknown_fields`. The `TARGET_CONF` env var (legacy name, live feature) overrides the config path and is how the Python hooks pin a project's `.target.jsonc` when spawning MCP servers.
+The ONLY config format is `.target.jsonc` (`dev_hosts[]` with nested `duts[]`; a top-level section is the global fallback). Unknown or removed keys fail loudly via `deny_unknown_fields` — there are no field aliases. The `TARGET_CONF` env var overrides the config path and is how the Python hooks pin a project's `.target.jsonc` when spawning MCP servers.
+
+### Lifecycle (start / stop / ownership)
+
+- One sermcp per project, enforced by kernel locks on the project directory; a second spawn refuses unless it can prove the holder abandoned the project (verified session-exit evidence).
+- Agent: `dutabo start --agent` (never clears the human stop inhibit) and `dutabo stop --agent` (stops the service without touching the inhibit). Hooks enforce both forms; bare `dutabo start`/`stop` are denied for Agent.
+- Human: `dutabo stop` stops the service and persists `.dut-serial/stopped`. The marker blocks Agent startup. Human `dutabo start` clears it and starts the service. Human `dutabo resume` clears it for a later start.
 
 ### Locking Strategy
 
 Two levels:
-1. **Project singleton**: `.dut-serial/mcp.pid` prevents multiple MCP processes in the same project. Automatic takeover requires evidence that the recorded supervised session exited and no live parent or hooks owner protects the holder. Missing supervision alone preserves the holder; a legitimately held project refuses the second spawn.
-2. **Host:port mutex**: FNV1A-hash-based lock files in `/tmp/sermcp/locks/` with O_EXCL atomic creation + zombie cleanup
+1. **Project singleton**: The kernel locks the canonical project directory. `.dut-serial/mcp.pid` identifies the holder for diagnostics and lifecycle requests. A supervised holder can be replaced after verified session exit if no live parent or hook owner protects it. Persistent holders require an explicit stop.
+2. **Host:port mutex**: The kernel locks endpoint files under `/tmp/sermcp/locks/` by default. The lock releases on descriptor close or process exit.
 
 ### Power Control (`dut-ctrl` sub-crate)
 
@@ -185,8 +191,8 @@ When a serial read error occurs (`Connection closed by ser2net`):
 ### Python Hooks (`hooks/claude/`)
 
 - `session-start.py` — detects project, auto-starts HTTP MCP on MD5-hash-based port (3001–3099)
-- `statusline.py` — reads MCP-written cache files; falls back to `target-state` with DUT alias
-- `pre-tool-use.py` — blocks raw `nc`/`tio`/`screen` serial access AND `dutabo serial` for Agent; guards one-sermcp-per-project (deny a spawn while a live server serves the project; `--idle-timeout 0` and cross-project `TARGET_CONF` always denied)
+- `statusline.py` — renders `.dut-serial/inventory.json` pre-formatted state text (file reads only)
+- `pre-tool-use.py` — blocks raw `nc`/`tio`/`screen` serial access AND `dutabo serial` for Agent; guards one-sermcp-per-project (deny a spawn while a live server serves the project; cross-project `TARGET_CONF` always denied); allows `dutabo start --agent` / `dutabo stop --agent`, denies bare `dutabo start`/`stop`
 - `user-prompt-submit.py` — multi-DUT alerts, auto-restart MCP
 - `session-stop.py` — cleanup
-- `lib.py` — shared: project discovery, `format_serial_state` (with DUT alias support)
+- `lib.py` — shared: project discovery, agent-session verification, HTTP MCP spawn

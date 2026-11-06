@@ -141,13 +141,12 @@ fn write_secure(path: &std::path::Path, content: &str) -> std::io::Result<()> {
 /// hang/heartbeat detection, and three-tier state visibility (internal, MCP-API, statusline).
 pub struct StateManager {
     current: TargetState,
+    /// State file for name-less engines (`<dut_dir>/target-state`); named
+    /// engines write `.dut-serial/<dut_name>/target-state` instead.
     state_file: PathBuf,
-    /// Project-local cache (fallback, read by Python hook)
+    /// Statusline cache for name-less engines; named engines write their
+    /// per-DUT name dir instead. Python hooks read inventory.json, not this.
     cache_file: PathBuf,
-    /// Legacy `/dev/shm/claude-status-*` cache path — D10: no longer written
-    /// (dead weight, no reader); kept only so `delete_shm_cache` can reap
-    /// residue left by older builds on Stopped.
-    shm_cache_file: PathBuf,
     /// Notification directory for Agent proactive alerts
     notify_dir: PathBuf,
     hang_timeout_secs: u64,
@@ -199,16 +198,6 @@ impl StateManager {
         let cache_file = dut_dir_path.join("statusline-cache");
         let notify_dir = dut_dir_path.join("notifications");
 
-        // /dev/shm cache: keyed by project path hash so multiple projects don't collide
-        let shm_dir = if std::path::Path::new("/dev/shm").is_dir() {
-            "/dev/shm"
-        } else {
-            "/tmp"
-        };
-        let project_hash = Self::project_hash(project_dir);
-        let shm_cache_file =
-            std::path::PathBuf::from(format!("{}/claude-status-{}", shm_dir, project_hash));
-
         std::fs::create_dir_all(&dut_dir_path).ok();
         std::fs::create_dir_all(&notify_dir).ok();
         // Per-DUT state files always live under the project runtime root. The
@@ -225,7 +214,6 @@ impl StateManager {
             current: TargetState::Stopped,
             state_file,
             cache_file,
-            shm_cache_file,
             notify_dir,
             hang_timeout_secs: hang_timeout,
             hysteresis,
@@ -253,17 +241,9 @@ impl StateManager {
         self.on_state_change = Some(Box::new(hook));
     }
 
-    /// Stable 8-char hex hash matching Python's get_session_id() (md5).
-    /// Both MCP and statusline hook use the same project_dir → same hash.
-    fn project_hash(project_dir: &Path) -> String {
-        use md5::{Digest, Md5};
-        let canonical = project_dir
-            .canonicalize()
-            .unwrap_or_else(|_| project_dir.to_path_buf());
-        let mut hasher = Md5::new();
-        hasher.update(canonical.to_string_lossy().as_bytes());
-        let digest = hasher.finalize();
-        crate::ports::md5_hex(&digest).chars().take(8).collect()
+    /// Preserve inventory notifications when an engine reloads its configuration.
+    pub(crate) fn transfer_state_change_hook(&mut self, destination: &mut Self) {
+        destination.on_state_change = self.on_state_change.take();
     }
 
     /// Write PID file with restricted permissions (0600).
@@ -383,14 +363,11 @@ impl StateManager {
             TargetState::Stopped => {
                 self.delete_state_file();
                 self.delete_cache_file();
-                self.delete_shm_cache();
                 // D11: the per-DUT name-dir files written on the
                 // Active/booting path are deleted too — nothing else reaps
                 // them, so a clean stop must leave no state residue.
                 if !self.dut_name.is_empty() {
                     let _ = std::fs::remove_file(self.per_dut_file("target-state"));
-                }
-                if !self.dut_name.is_empty() && self.dut_name != "default" {
                     let _ = std::fs::remove_file(self.per_dut_file("statusline-cache"));
                 }
             }
@@ -401,18 +378,15 @@ impl StateManager {
             | TargetState::Disconnected
             | TargetState::DutOff
             | TargetState::Dutabo => {
-                self.atomic_write(&self.state_file, new.as_str());
-                // Also write to per-DUT name directory when the name is configured
-                if !self.dut_name.is_empty() {
-                    let name_state_file = self.per_dut_file("target-state");
-                    self.atomic_write(&name_state_file, new.as_str());
-                }
                 let text = self.format_statusline(new);
-                self.atomic_write(&self.cache_file, &text);
-                // Sync to per-DUT name directory (preferred by statusline)
-                if !self.dut_name.is_empty() && self.dut_name != "default" {
-                    let name_cache = self.per_dut_file("statusline-cache");
-                    self.atomic_write(&name_cache, &text);
+                if !self.dut_name.is_empty() {
+                    // Named engines write ONLY their per-DUT name dir — the
+                    // single location `dut_state_file` resolves for them.
+                    self.atomic_write(&self.per_dut_file("target-state"), new.as_str());
+                    self.atomic_write(&self.per_dut_file("statusline-cache"), &text);
+                } else {
+                    self.atomic_write(&self.state_file, new.as_str());
+                    self.atomic_write(&self.cache_file, &text);
                 }
                 // Don't blindly sync to all per-DUT dirs — that would overwrite
                 // states written by other MCP servers (e.g. dutabo, disconnected).
@@ -433,8 +407,8 @@ impl StateManager {
         }
     }
 
-    /// `.dut-serial/<dut_name>/<file>` — the per-DUT state file path (callers
-    /// keep the guards: non-empty name, and `!= "default"` for statusline-cache).
+    /// `.dut-serial/<dut_name>/<file>` — the per-DUT state file path (the
+    /// single write location for named engines).
     fn per_dut_file(&self, file: &str) -> PathBuf {
         self.project_dir
             .join(".dut-serial")
@@ -446,7 +420,7 @@ impl StateManager {
     /// Format a statusline string with ANSI color. Uses the DUT name
     /// from .target.jsonc if available, otherwise "serial".
     pub(crate) fn format_statusline(&self, state: TargetState) -> String {
-        let label = if self.dut_name.is_empty() || self.dut_name == "default" {
+        let label = if self.dut_name.is_empty() {
             "serial"
         } else {
             &self.dut_name
@@ -474,13 +448,13 @@ impl StateManager {
     /// multiple MCP servers share the same serial port.
     pub(crate) fn write_dutabo_forced(&self) {
         let text = self.format_statusline(TargetState::Dutabo);
-        self.atomic_write(&self.cache_file, &text);
-        // Only write to the name-specific dir if we know which DUT
-        if !self.dut_name.is_empty() && self.dut_name != "default" {
+        if !self.dut_name.is_empty() {
             let name_cache = self.per_dut_file("statusline-cache");
             self.atomic_write(&name_cache, &text);
             let name_state = self.per_dut_file("target-state");
             self.atomic_write(&name_state, "dutabo");
+        } else {
+            self.atomic_write(&self.cache_file, &text);
         }
     }
 
@@ -686,10 +660,6 @@ impl StateManager {
 
     fn delete_cache_file(&self) {
         let _ = std::fs::remove_file(&self.cache_file);
-    }
-
-    fn delete_shm_cache(&self) {
-        let _ = std::fs::remove_file(&self.shm_cache_file);
     }
 }
 
@@ -1182,26 +1152,10 @@ mod tests {
     fn test_statusline_cache_write() {
         let (mut sm, tmp) = create_test_state_manager(60, 3);
         let cache_file = tmp.path().join(".dut-serial/statusline-cache");
-        let shm_file = std::path::PathBuf::from(format!(
-            "/dev/shm/claude-status-{}",
-            StateManager::project_hash(tmp.path())
-        ));
-        // Hermetic: residue from older versions must not mask the check.
-        if std::path::Path::new("/dev/shm").is_dir() {
-            let _ = std::fs::remove_file(&shm_file);
-        }
-
         sm.transition(TargetState::Active);
         assert!(cache_file.exists());
         let content = std::fs::read_to_string(&cache_file).unwrap();
         assert!(content.contains("serial:active"));
-        if std::path::Path::new("/dev/shm").is_dir() {
-            assert!(
-                !shm_file.exists(),
-                "claude-status-* shm cache is deleted (D10): nothing may be written"
-            );
-        }
-
         sm.transition(TargetState::DutOff);
         let content = std::fs::read_to_string(&cache_file).unwrap();
         assert!(content.contains("serial:DUT-off"));
@@ -1341,16 +1295,16 @@ mod tests {
         );
         assert!(dutoff.contains("\x1b[0m"), "Must have ANSI reset code");
 
-        // "default" name should use "serial" as label (backward compat)
+        // A configured DUT name (any spelling, including "default") is the label.
         let sm_default =
             StateManager::new(&std::env::temp_dir(), 60, 3, ".dut-serial", "default", 30);
         let text2 = sm_default.format_statusline(TargetState::Active);
         assert!(
-            text2.contains("serial"),
-            "Default name must use 'serial' label"
+            text2.contains("default:active"),
+            "A named DUT uses its own name as the label: {text2}"
         );
 
-        // Empty name should also use "serial"
+        // Empty name should use "serial"
         let sm_empty = StateManager::new(&std::env::temp_dir(), 60, 3, ".dut-serial", "", 30);
         let text3 = sm_empty.format_statusline(TargetState::Active);
         assert!(
