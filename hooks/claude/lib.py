@@ -1114,7 +1114,7 @@ if __name__ == "__main__":
 
     with tempfile.TemporaryDirectory() as td:
         proj = Path(td) / "proj"
-        dut_dir = proj / ".dut-serial" / "rk3576-myir"
+        dut_dir = proj / ".dut-serial" / "rk3576"
         dut_dir.mkdir(parents=True)
         (dut_dir / "mcp.pid").write_text(str(os.getpid()))
         (proj / ".dut-serial" / "inventory.json").write_text(

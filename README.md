@@ -125,9 +125,9 @@ HTTP 模式提供 `/mcp`（Streamable HTTP）、`/health`（健康检查）和 `
 curl http://127.0.0.1:3000/health
 ```
 
-同一项目只运行一个 MCP 进程，但它会同时连接 `.target.jsonc` 中的所有 DUT，分别维护串口连接、日志、状态和命令队列。`TARGET_DUT_NAME` 不会限制托管范围。多板调用先用 `serial_list_duts` 查看名称，然后在其他工具参数中传入 `dut`，例如 `serial_get_state({"dut":"rk3576-myir"})`；未指定或名称错误会报错。只有一块板时可以继续省略 `dut`。
+同一项目只运行一个 MCP 进程，但它会同时连接 `.target.jsonc` 中的所有 DUT，分别维护串口连接、日志、状态和命令队列。`TARGET_DUT_NAME` 不会限制托管范围。多板调用先用 `serial_list_duts` 查看名称，然后在其他工具参数中传入 `dut`，例如 `serial_get_state({"dut":"rk3576"})`；未指定或名称错误会报错。只有一块板时可以继续省略 `dut`。
 
-CLI 的 `dutabo -d rk3576-myir status`、`reboot`、`serial` 等操作会携带选中的名称。HTTP 支持 `/health?dut=rk3576-myir` 和 `/serial/ws?dut=rk3576-myir&history=1`；默认 `/health` 的 `duts` 数组包含所有目标，资源 URI 也带 `?dut=<名称>`。每块板都持续记录自己的日志，某块板断线或被人工接管不会暂停其他板。详细配置与调用示例见 [多 DUT 托管](docs/multi-dut.md)。
+CLI 的 `dutabo -d rk3576 status`、`serial` 等操作会携带选中的名称。HTTP 支持 `/health?dut=rk3576` 和 `/serial/ws?dut=rk3576&history=1`；默认 `/health` 的 `duts` 数组包含所有目标，资源 URI 也带 `?dut=<名称>`。每块板都持续记录自己的日志，某块板断线或被人工接管不会暂停其他板。详细配置与调用示例见 [多 DUT 托管](docs/multi-dut.md)。
 
 项目 hooks 可负责启动共享 HTTP 服务，端口以该项目的实际配置为准。详见 [Claude hooks](./hooks/claude/README.md) 和[项目集成说明](./docs/project-setup.md)。
 
@@ -141,7 +141,21 @@ dutabo state --dut rk3576
 dutabo serial --dut rk3576
 ```
 
-Agent 通过 MCP 的 `serial_get_state` 查看状态、`serial_send_command` 执行设备命令、`serial_get_logs` 读取日志；硬件控制按项目配置使用 `serial_reset` 等工具。
+Agent 通过 MCP 的 `serial_get_state` 查看状态、`serial_exec` 执行设备命令（shell/U-Boot 双模式）、`serial_get_logs` 读取日志；硬件控制按项目配置使用 `serial_reset` 等工具。
+
+### 项目服务生命周期（启动 / 停止 / 所有权）
+
+项目目录锁保证每个项目同一时刻只有一个 sermcp 实例。
+
+| 操作者 | 命令 | 行为 |
+| --- | --- | --- |
+| Agent | `dutabo start --agent` | 启动或复用后台常驻服务。人工停机期间，启动请求会被拒绝。 |
+| Agent | `dutabo stop --agent` | 停止服务并释放串口所有权，保留当前启动设置。 |
+| 人工 | `dutabo stop` | 停止服务，并写入 `.dut-serial/stopped` 禁止后续自动启动。 |
+| 人工 | `dutabo start` | 解除启动禁用，立即启动或复用后台常驻服务。 |
+| 人工 | `dutabo resume` | 解除启动禁用，留待后续启动。 |
+
+已启用的 Hooks 会拦截 Agent 执行裸 `dutabo start`、裸 `dutabo stop` 和 `dutabo resume`。服务本身也会检查停机标记。直接运行 `sermcp --http --persistent` 时，服务在前台运行。
 
 ### 日志位置
 
@@ -171,9 +185,43 @@ Agent 通过 MCP 的 `serial_get_state` 查看状态、`serial_send_command` 执
 
 ### 串口日志分段
 
-`current.serial.log` 保存当前启动周期的原始输出，`full.serial.log` 连续追加。收到下一次启动的 DDR/SPL 前缀时，前一个周期归档为 `boot-NNN_*.log`，前缀归入新的当前日志；文件名时间是归档时刻。连接时设备已运行的首段可能只有部分周期。`dutabo serial` 直接接管 ser2net 的路径也保存到该 DUT 的日志目录。`dutabo serial` 占用期间仍保存和分段，但不会执行 Agent 自动登录等动作。
+`current.full.log` 保存当前启动周期的原始输出，`full.full.log` 连续追加；对应的 `current.serial.log` 和 `full.serial.log` 自动去除已验证的心跳命令回显与响应。收到下一次启动的 DDR/SPL 前缀时，前一个周期归档为成对的 `boot-NNN_*.full.log` / `boot-NNN_*.serial.log`，前缀归入新的当前日志；文件名时间是归档时刻。连接时设备已运行的首段可能只有部分周期。`dutabo serial` 直接接管 ser2net 的路径也保存到该 DUT 的日志目录。`dutabo serial` 占用期间仍保存和分段，但不会执行 Agent 自动登录等动作。
 
 归档读取完整磁盘文件，不受 2 MiB 内存缓冲限制；MCP 重启继续追加当前文件。重置请求本身不切段，按实际收到的启动前缀划分；没有可识别前缀的启动无法保证自动分段。默认只保留最近 10 个归档，可用 `.target.jsonc` 的 `monitor.max_archived_logs` 调整；`full.serial.log` 不参与归档清理。
+
+### 项目心跳命令与日志清理
+
+心跳由 sermcp 自动发送，Agent 可调用 MCP 工具 `serial_set_heartbeat` 控制选定 DUT，例如 `{"command":["test -r /proc/uptime","cat /proc/uptime"],"interval_seconds":30,"dut":"board"}`。启用开关、命令和周期均按 **Agent > `.target.jsonc` > 源码默认值** 解析，配置周期使用 `monitor.heartbeat_interval_seconds`，缺省沿用 `hang_timeout`。省略字段保留当前设置，`command: null` 清除命令覆盖，空字符串或空列表选择内置遥测，`interval_seconds: 0` 恢复配置周期。周期范围为 1–86400 秒，脚本展开后最多 384 字节，禁止 NUL。
+
+使用 `{"pause_seconds":60,"dut":"board"}` 暂停 60 秒，`pause_seconds: 0` 清除临时暂停，时长由 Agent 指定。使用 `{"enabled":false,"dut":"board"}` 永久关闭心跳，`enabled: true` 重新开启，`reset_enabled: true` 清除 Agent 开关覆盖，继承 `.target.jsonc` 的 `monitor.heartbeat_enabled`（源码默认开启）。永久关闭在服务重启后继续生效。暂停到期后自动恢复，Agent 退出也会到期。DUT 的 MCP 控制请求和串口命令执行期间自动避让，结束后在串口静默达到周期要求时恢复。Agent 活动依据 sermcp 接收到的 DUT 操作判断。Agent 启用开关、命令和周期原子写入 `.target.jsonc` 中对应 DUT 的 `monitor.agent_heartbeat`，写入成功后立即应用，启动时自动加载。JSONC 注释和其他 DUT 配置保留。无需 Agent 按次触发心跳或重复配置。临时暂停仅在内存中生效，服务重启后解除，持久化启用开关继续决定是否发送。保存失败会返回错误并保留原生效设置，读取失败会记录错误并回退到配置或内置默认值，详情见 `heartbeat.control.settings_error`。`serial_get_state` 的 `heartbeat.control` 显示周期、暂停剩余秒数及控制请求状态，`serial_get_config` 返回有效命令和来源。MCP 初始化说明和工具描述会告知 Agent 此功能。
+
+在 `.target.jsonc` 顶层 `monitor` 设置项目默认命令，也可以在 `dev_hosts[].duts[].monitor` 中为单个 DUT 覆盖：
+
+```jsonc
+"monitor": {
+  "hang_timeout": 60,
+  "heartbeat_command": [
+    "test -r /proc/uptime",
+    "cat /proc/uptime"
+  ]
+}
+```
+
+只有识别到 shell、处于 active 状态、串口静默达到 `hang_timeout` 且没有正在执行的命令时才发送心跳；人工接管期间不发送。脚本应快速结束，响应窗口为 5 秒（超时不会终止 DUT 上的脚本）。自定义脚本依赖 DUT 的 `sh`、`printf`、`head`、`od`、`tr`。标准输出和标准错误合并封装，最多保留 4096 字节；shell 命令替换会去掉末尾换行。`serial_get_state` 的 `heartbeat.sample` 提供解码后的 `output`、`exit_code` 和 `output_truncated`，非零退出码显示为 `command_failed`。
+
+日常阅读 `*.serial.log` 即可避开心跳记录。需要排查心跳执行时，从原始日志筛选标记：
+
+```bash
+rg '__SMCMD[12]_|@@SMHB[12]:' .dut-serial/<dut_name>/logs/current.full.log
+```
+
+自定义心跳使用 `__SMCMD2_` / `@@SMHB2:`，内置遥测使用版本 1 标记，同一次请求使用相同 ID。原始响应中的输出为十六进制编码，避免多行输出干扰过滤。已有日志可以离线生成删除心跳后的副本，无需连接设备或加载配置：
+
+```bash
+dutabo filter-log INPUT.full.log OUTPUT.serial.log
+```
+
+输出文件必须尚不存在，原始文件保留。过滤器只删除完整匹配的命令回显和有效响应；提示符、普通日志、截断或混入其他串口内容的记录保留。不要用 `grep -v` 删除整行，以免丢掉同一行中的其他串口内容。
 
 ## 故障排除
 

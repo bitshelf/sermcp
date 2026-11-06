@@ -66,6 +66,12 @@ and this agent needs write access; it must never displace a live owner.
 `serial_flash_plan` only describes the planned operation; it does not flash the
 device. Use `image_type: "kernel"` for a kernel or boot image.
 
+For firmware writes, follow the project's established flashing workflow.
+Resolve the selected DUT, image format, flashing host, transport, and installed
+writer syntax from the project configuration and documentation before choosing
+the write command. Capture fresh serial logs afterward to verify boot and build
+identity.
+
 `serial_exec` is the single command entry: `mode=auto` (default) picks the
 protocol from the detected target state, so it works at a Linux shell prompt and
 at a U-Boot prompt alike. In shell mode treat the returned `output`,

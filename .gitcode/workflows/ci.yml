@@ -36,15 +36,15 @@ jobs:
         uses: checkout
 
       # The runner ships "latest stable", which the project outgrew once
-      # (Cargo.toml requires 1.98); assert instead of assuming.
+      # (Cargo.toml requires 1.100); assert instead of assuming.
       - name: Ensure Rust toolchain
         run: |
           set -euo pipefail
           rustc --version
           cargo --version
           have=$(rustc --version | sed -E 's/^rustc ([0-9]+\.[0-9]+).*/\1/')
-          if [ "$(printf '%s\n%s\n' 1.98 "${have}" | sort -V | head -1)" != "1.98" ]; then
-            echo "active toolchain ${have} is older than 1.98, updating stable"
+          if [ "$(printf '%s\n%s\n' 1.100 "${have}" | sort -V | head -1)" != "1.100" ]; then
+            echo "active toolchain ${have} is older than 1.100, updating stable"
             rustup update stable
           fi
           rustup component add rustfmt clippy

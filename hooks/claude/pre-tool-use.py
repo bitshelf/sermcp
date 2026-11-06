@@ -116,9 +116,8 @@ def _known_host_reason(command: str, ip: str, label: str) -> str:
     return (
         f"[CRITICAL] Dangerous operation ({label}) targeting Dev Host ({ip}) DENIED. "
         "The Dev Host is a PRODUCTION machine — NEVER modify it. "
-        "To flash a target board: the image must be UPLOADED to the Dev Host, "
-        "then upgrade_tool flashes the TARGET via USB OTG. "
-        "Use dutabo uf/dutabo flash-kernel, or rk-build skill scripts."
+        "Follow the project's flashing workflow with its configured target, image, "
+        "flashing host, transport, and writer. Verify the selected target before writing firmware."
     )
 
 
@@ -135,9 +134,8 @@ def _unavailable_reason(command: str, ip: str, label: str) -> str:
         "inventory unavailable (no live MCP server wrote .dut-serial/inventory.json, "
         "so dev-host IPs cannot be verified — refusing any dev-host-shaped command). "
         "The Dev Host is a PRODUCTION machine — NEVER modify it. "
-        "To flash a target board: the image must be UPLOADED to the Dev Host, "
-        "then upgrade_tool flashes the TARGET via USB OTG. "
-        "Use dutabo uf/dutabo flash-kernel, or rk-build skill scripts."
+        "Follow the project's flashing workflow with its configured target, image, "
+        "flashing host, transport, and writer. Verify the selected target before writing firmware."
     )
 
 
@@ -579,7 +577,7 @@ def _selftest() -> int:
     r = _dangerous_deny_reason(f'ssh root@{DEV} "reboot"', ips, True)
     check(
         "known-host dangerous ssh is denied (PRODUCTION wording)",
-        r is not None and "PRODUCTION" in r and "dutabo uf" in r,
+        r is not None and "PRODUCTION" in r and "project's flashing workflow" in r,
         f"got {r!r}",
     )
     check(
@@ -605,8 +603,8 @@ def _selftest() -> int:
         f"got {r!r}",
     )
     check(
-        "fail-closed reason still names MCP tools + PRODUCTION",
-        r is not None and "dutabo uf" in r and "PRODUCTION" in r,
+        "fail-closed reason names flashing workflow + PRODUCTION",
+        r is not None and "project's flashing workflow" in r and "PRODUCTION" in r,
         f"got {r!r}",
     )
     check(

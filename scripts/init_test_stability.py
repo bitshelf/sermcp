@@ -137,7 +137,7 @@ def inject(mcp, state, baud):
         mcp.call(TOOLS["reset"], {"wait_boot": False})
         time.sleep(5)
         mcp.call(TOOLS["uboot"], {"interrupt_char": "ctrl_c"})
-        r = mcp.call("serial_uboot_command", {"command": "reboot loader", "timeout": 5})
+        r = mcp.call("serial_exec", {"command": "reboot loader", "mode": "uboot", "timeout": 5})
         time.sleep(7)  # loader re-enumeration
         return True
     return False

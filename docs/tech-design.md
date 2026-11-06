@@ -230,7 +230,6 @@ CLI 运行于目根路径，读取 `.target.jsonc`：
 dutabo list [--json]
 dutabo status [--dut <board_name>] [--watch]
 dutabo serial [--dut <dut_name>]
-dutabo button <name> <press|release|pulse> [delay_ms]
 ```
 
 ### 不挤掉 Agent 连接

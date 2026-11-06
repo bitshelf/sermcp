@@ -4,7 +4,7 @@
 //
 // Structure: dev_hosts[] each NESTS its duts[]. A DUT inherits its parent
 // host's ip/user/pass — names are display-only; the host ip is the linking key.
-// Top-level sections (serial/target/uboot/relay/monitor/flash/control) are
+// Top-level sections (serial/target/uboot/relay/monitor/flash/download/control) are
 // GLOBAL fallbacks: a DUT value overrides; otherwise the global value wins.
 //   commented out = not set (built-in default)
 //   port 0 / "0"  = unset sentinel (validation error, as before)
@@ -38,17 +38,24 @@
             // "pattern": "Hit any key",    // required for pattern strategy; regex
           },
           "relay": {
-            "type": "ch340",               // ch340 | ch340-relay | usb-relay | external | external-dev-ctl | dev-ctl | none | disabled
+            "type": "ch340-relay",         // ch340-relay | none
             "port": 2000,
-            "reset_ch": 1,                 // aliases reset_channel/maskrom_channel/recovery_channel/power_channel also accepted
-            "maskrom_ch": 2,
-            "recovery_ch": 3,
+            "reset_ch": 1,
+            "download_ch": 2,
             "power_ch": 0,                 // 0 = inherit global (zero-guarded insertion)
             "reset_time_ms": 500,          // 0 = inherit
             "power_off_time_ms": 3000,     // clamped to >= 3000; 0 = inherit global
           },
           "monitor": {
             "hang_timeout": 60,
+            // Optional commands run in order, stopping on the first failure.
+            // Compiled script: at most 384 UTF-8 bytes including grouping, no NUL.
+            // Omit to inherit the global command; [] selects built-in telemetry.
+            // Echo/output are retained in *.full.log and filtered from *.serial.log.
+            // "heartbeat_command": [
+            //   "test -r /proc/uptime",
+            //   "cat /proc/uptime",
+            // ],
             "hang_hysteresis": 3,
             "max_archived_logs": 10,
             "max_log_file_size": 100,
@@ -58,8 +65,6 @@
             "crash_keywords": ["Kernel panic", "BUG:", "Oops:"],   // substrings, not regex
           },
           "flash": {
-            "tool": "upgrade_tool",
-            "upload_dir": "/tmp",
             "full_image_cmd": "uf {image}",
             "kernel_image_cmd": "di -k {image}",
           },
@@ -68,8 +73,8 @@
           "dut_name": "rk3576-2",
           "serial": { "port": "2003" },    // number or string both accepted
           "target": { "login_user": "ubuntu" },
-          "relay": { "type": "usb-relay", "port": 2011, "reset_ch": 1 },
-          "flash": { "tool": "upgrade_tool", "upload_dir": "/tmp", "full_image_cmd": "uf {image}" },
+          "relay": { "type": "ch340-relay", "port": 2011, "reset_ch": 1 },
+          "flash": { "full_image_cmd": "uf {image}" },
         },
       ],
     },
@@ -80,8 +85,8 @@
         {
           "dut_name": "rk3588",
           "serial": { "port": 2004 },
-          "relay": { "type": "external" },
-          "control": { "dev_ctl": "lab-pc-ctl --reset 1" },
+          "relay": { "type": "none" },
+          "control": { "dev_ctrl": "none" },
         },
       ],
     },
@@ -91,11 +96,9 @@
   // "serial":  { "port": 2000, "baudrate": 1500000, "rfc2217": false },
   // "target":  { "login_user": "root", "login_prompt": "" },
   // "uboot":   { "interrupt_char": "ctrl_c", "interrupt_strategy": "flood" },
-  // "relay":   { "type": "ch340", "reset_ch": 1, "power_off_time_ms": 3000 },
+  // "relay":   { "type": "ch340-relay", "reset_ch": 1, "power_off_time_ms": 3000 },
   // "monitor": { "hang_timeout": 60, "max_archived_logs": 10, "crash_keywords": ["Kernel panic"] },
-  // "flash":   { "tool": "upgrade_tool", "upload_dir": "/tmp" },
-  // "control": { "dev_ctl": "" },
-  // "reference_log": "",       // back-compat top-level key (overrides monitor.reference_log)
-  // "dut_dir": ".dut-serial",  // back-compat top-level key
+  // "download": { "loader_cmd": "reboot loader", "list_devices_cmd": "upgrade_tool ld" },
+  // "control": { "dev_ctrl": "none" },
   "lock_dir": "/tmp/sermcp/locks"   // top-level ONLY — never valid inside a dut
 }

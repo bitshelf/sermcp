@@ -71,6 +71,12 @@ agent needs write access; it must never displace a live owner.
 `serial_flash_plan` only describes the planned operation; it does not flash the
 device. Use `image_type: "kernel"` for a kernel or boot image.
 
+For firmware writes, follow the project's established flashing workflow.
+Resolve the selected DUT, image format, flashing host, transport, and installed
+writer syntax from the project configuration and documentation before choosing
+the write command. Capture fresh serial logs afterward to verify boot and build
+identity.
+
 For `serial_exec(mode=shell)`, treat the returned `output`, `exit_code`, and
 `timed_out` fields as the result. A queued write by itself does not prove that
 the device received or completed the command. Use `serial_send_raw` only when an

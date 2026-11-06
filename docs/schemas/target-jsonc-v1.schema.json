@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "dutabo Embedded Debug Target Configuration",
-  "description": "Schema for .target.jsonc control is filled with dev_ctrl; flash completes loader_cmd/list_devices_cmd which the runtime parses.",
+  "description": "Current .target.jsonc fields; obsolete aliases are rejected.",
   "type": "object",
   "additionalProperties": false,
 
@@ -13,7 +13,9 @@
     "monitor": { "$ref": "#/$defs/monitor" },
     "uboot": { "$ref": "#/$defs/uboot" },
     "flash": { "$ref": "#/$defs/flash" },
+    "download": { "$ref": "#/$defs/download" },
     "control": { "$ref": "#/$defs/control" },
+    "lock_dir": { "type": "string" },
     "loader": { "type": "string", "minLength": 1, "description": "Boot loader type: uboot (current) or uefi (not yet implemented)." }
   },
 
@@ -63,6 +65,7 @@
         "monitor": { "$ref": "#/$defs/monitor" },
         "uboot": { "$ref": "#/$defs/uboot" },
         "flash": { "$ref": "#/$defs/flash" },
+    "download": { "$ref": "#/$defs/download" },
         "control": { "$ref": "#/$defs/control" },
         "loader": { "type": "string", "minLength": 1, "description": "Boot loader type: uboot (current) or uefi (not yet implemented)." }
       },
@@ -90,15 +93,13 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "type": { "type": "string", "enum": ["ch340", "ch340-relay", "none", "disabled"] },
+        "type": { "type": "string", "enum": ["ch340-relay", "none"] },
         "ip": { "type": "string", "description": "Relay host address. Empty string explicitly falls back to the parent development host IP." },
         "port": { "$ref": "#/$defs/port" },
         "reset_ch": { "type": "integer", "minimum": 0 },
-        "maskrom_ch": { "type": "integer", "minimum": 0 },
-        "recovery_ch": { "type": "integer", "minimum": 0 },
+        "download_ch": { "type": "integer", "minimum": 0 },
         "power_ch": { "type": "integer", "minimum": 0, "description": "Supply power OFF/ON channel" },
         "power_key_ch": { "type": "integer", "minimum": 0, "description": "Sleep/wake power key channel" },
-        "power_key_channel": { "type": "integer", "minimum": 0 },
         "reset_time_ms": { "$ref": "#/$defs/inherit_ms" },
         "power_off_time_ms": { "$ref": "#/$defs/power_off_ms" }
       }
@@ -107,6 +108,14 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
+        "heartbeat_command": {
+          "oneOf": [
+            { "type": "string", "maxLength": 384 },
+            { "type": "array", "items": { "type": "string", "maxLength": 384 } }
+          ],
+          "description": "Idle POSIX-shell script or ordered commands (stop on first failure). Compiled script must fit 384 UTF-8 bytes including grouping, with no NUL. Empty string/array selects built-in telemetry."
+        },
+        "hang_hysteresis": { "type": "integer", "minimum": 0 },
         "hang_timeout": { "type": "integer", "minimum": 1, "description": "Hang detection timeout in seconds." },
         "boot_window_secs": { "type": "integer", "minimum": 1, "description": "Max seconds a booting state may last; on expiry the state moves to active even without boot-complete console evidence (default 30)." },
         "learner_stage_threshold": { "type": "number", "minimum": 0.0, "maximum": 1.0 },
@@ -147,12 +156,16 @@
       "additionalProperties": false,
       "properties": {
         "kernel_image_cmd": { "type": "string", "minLength": 1 },
-        "upload_dir": { "type": "string", "minLength": 1 },
         "full_image_cmd": { "type": "string", "minLength": 1 },
-        "tool": { "type": "string", "minLength": 1 },
-        "loader_bin": { "type": "string", "minLength": 1 },
-        "loader_cmd": { "type": "string", "minLength": 1, "description": "Flash loader command (still parsed by the runtime; hidden from the wizard)." },
-        "list_devices_cmd": { "type": "string", "minLength": 1, "description": "Command listing flashable devices before flashing (hidden from the wizard)." }
+        "loader_bin": { "type": "string", "minLength": 1 }
+      }
+    },
+    "download": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "loader_cmd": { "type": "string" },
+        "list_devices_cmd": { "type": "string" }
       }
     },
     "control": {
